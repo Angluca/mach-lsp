@@ -1442,7 +1442,8 @@ test "features: field_ref_span_at matches a member access of the keyed record" {
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
     # 8 of the declaring source. the buffer text "p.x" carries the member access.
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
@@ -1478,7 +1479,8 @@ test "features: field_ref_span_at peels a pointer receiver to the record" {
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 1::sess.ModuleId, 0::id.DeclId, type.TYPE_REC));
     val ptr: type.TypeId = unwrap_ok[type.TypeId, str](type.intern_pointer(?ti, recp));
@@ -1504,7 +1506,8 @@ test "features: field_ref_span_at matches a struct-literal field init" {
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 3::sess.ModuleId, 1::id.DeclId, type.TYPE_REC));
     var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" at offset 8
@@ -1535,7 +1538,8 @@ test "features: field_ref_span_at rejects a different record and a different fie
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 2::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
     var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" at offset 8
@@ -1575,7 +1579,8 @@ test "features: collect_field_sites gathers every site, the decl, and the doc co
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 0::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
 
@@ -1631,7 +1636,8 @@ test "features: collect_field_sites omits the doc component for references (want
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 0::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
     val declsrc: str = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; }";
@@ -1662,7 +1668,8 @@ test "features: collect_field_sites in a non-declaring module yields only body s
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     # the record is declared in module 0; this is a different (importing) module
     # whose only contribution is a member access on the imported record's value.
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
@@ -1691,7 +1698,8 @@ test "features: collect_field_sites adds the decl but no doc edit when the recor
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val recp: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 0::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
     var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" @8
