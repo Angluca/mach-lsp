@@ -1,4 +1,4 @@
-# mls.types: pure helpers over sema's typing output.
+# pure helpers over sema's typing output
 #
 # the feature layer reads per-expression types and the nominal back-link from a
 # record TypeId to its declaring module here, so the resolution rules live in one
@@ -34,10 +34,10 @@ use id:     mach.lang.fe.ast.id;
 use sema:   mach.lang.fe.sema;
 use intern: mach.lang.intern;
 
-# Nominal: the declaration site a record / union TypeId nominally refers to —
+# the declaration site a record / union TypeId nominally refers to —
 # the back-link a field feature follows from a value's type to the `rec` / `uni`
 # declaration whose fields it must walk. for a generic instance this is the
-# generic template's declaration (`target_origin` / `target_decl`).
+# generic template's declaration (`target_origin` / `target_decl`)
 # ---
 # origin: ModuleId of the declaring module
 # decl:   DeclId of the rec / uni declaration in `origin`'s Ast
@@ -48,9 +48,9 @@ pub rec Nominal {
     kind:   type.TypeKind;
 }
 
-# type_of: the semantic type of expression `eid` in `sr`, or TYPE_NIL when `sr`
+# the semantic type of expression `eid` in `sr`, or TYPE_NIL when `sr`
 # is nil or `eid` is out of range. the one read the feature layer makes against a
-# buffer's / module's SemaResult to learn an expression's type.
+# buffer's / module's SemaResult to learn an expression's type
 # ---
 # sr:  the module's / buffer's SemaResult, or nil
 # eid: the expression id to type
@@ -61,9 +61,9 @@ pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
     ret sr.expr_type[eid];
 }
 
-# decl_type_of: the declared (or inferred) type of decl `did` in `sr`, or
+# the declared (or inferred) type of decl `did` in `sr`, or
 # TYPE_NIL when `sr` is nil or `did` is out of range. the decl-keyed twin of
-# `type_of`, for typing a binding from its declaration rather than a use.
+# `type_of`, for typing a binding from its declaration rather than a use
 # ---
 # sr:  the module's / buffer's SemaResult, or nil
 # did: the declaration id to type
@@ -74,12 +74,12 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
     ret sr.decl_type[did];
 }
 
-# nominal_of: the declaration site a record / union TypeId nominally refers to,
+# the declaration site a record / union TypeId nominally refers to,
 # or none when `tid` is not a nominal type (a primitive, pointer, array, function,
 # generic parameter, or a sentinel). a pointer to a record is peeled to the record
 # first, so `*T` and `T` resolve to the same declaration — a field access through a
 # pointer reaches the same `rec` decl. a generic instance resolves to its template
-# declaration. this is the nominal back-link a field go-to-def / rename follows.
+# declaration. this is the nominal back-link a field go-to-def / rename follows
 # ---
 # ti:  the session's type interner
 # tid: the TypeId to resolve
@@ -111,10 +111,10 @@ pub fun nominal_of(ti: *type.TypeInterner, tid: type.TypeId) Option[Nominal] {
     ret none[Nominal]();
 }
 
-# make_sema_result: build a standalone SemaResult over `pa` with the given
+# build a standalone SemaResult over `pa` with the given
 # parallel-array lengths, every slot prefilled to TYPE_NIL. the test helper that
 # stands in for sema's own allocation so the pure accessors can be exercised
-# without running a whole analysis. released with `free_sema_result`.
+# without running a whole analysis. released with `free_sema_result`
 fun make_sema_result(pa: *Allocator, expr_n: u32, decl_n: u32) sema.SemaResult {
     var sr: sema.SemaResult;
     sr.alloc            = pa;
@@ -145,7 +145,7 @@ fun make_sema_result(pa: *Allocator, expr_n: u32, decl_n: u32) sema.SemaResult {
     ret sr;
 }
 
-# free_sema_result: release a SemaResult built by make_sema_result.
+# release a SemaResult built by make_sema_result
 fun free_sema_result(pa: *Allocator, sr: *sema.SemaResult) {
     if (sr.expr_type != nil && sr.expr_count > 0) {
         deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);

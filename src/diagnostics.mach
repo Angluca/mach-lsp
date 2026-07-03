@@ -1,4 +1,4 @@
-# mls.diagnostics: run the editor diagnostics slice and publish LSP diagnostics.
+# run the editor diagnostics slice and publish LSP diagnostics
 #
 # the diagnostics vertical slice end-to-end: feed a document's buffer to the
 # editor surface (`editor.diagnostics`), translate every reported
@@ -33,16 +33,16 @@ use json:      mls.json;
 use positions: mls.positions;
 use project:   mls.project;
 
-# LSP diagnostic severities (1 = Error … 4 = Hint).
+# LSP diagnostic severities (1 = Error … 4 = Hint)
 val LSP_ERROR:   i64 = 1;
 val LSP_WARNING: i64 = 2;
 val LSP_INFO:    i64 = 3;
 val LSP_HINT:    i64 = 4;
 
-# MAX_DIAGNOSTICS: cap on diagnostics published per document, to bound message size.
+# cap on diagnostics published per document, to bound message size
 val MAX_DIAGNOSTICS: usize = 200;
 
-# publish: analyze `uri`'s buffer and send its current diagnostics. a document
+# analyze `uri`'s buffer and send its current diagnostics. a document
 # governed by an already-loaded project root is analyzed dep-aware
 # (`project.diagnose_doc`) so its name-resolution diagnostics — including an
 # import of a module outside the project's dep closure — are surfaced, keeping
@@ -62,7 +62,7 @@ val MAX_DIAGNOSTICS: usize = 200;
 # DiagList `diagnose_doc` populated, so parse + resolve + type diagnostics publish
 # together. a loaded-but-un-sema'd root publishes parse + resolve only (instant);
 # the server re-publishes with types once a feature request sema's the closure (the
-# sema epoch) (#113).
+# sema epoch) (#113)
 # ---
 # w:       the workspace, for routing the document to its governing root
 # es:      editor session holding the buffer
@@ -153,7 +153,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
     json.free_str(quoted_uri, alloc);
 }
 
-# clear: publish an empty diagnostics array for `uri` (e.g. on close).
+# publish an empty diagnostics array for `uri` (e.g. on close)
 # ---
 # alloc: allocator for the message buffer
 # uri:   document URI to clear
@@ -183,8 +183,8 @@ pub fun clear(alloc: *Allocator, uri: str) {
     json.free_str(quoted_uri, alloc);
 }
 
-# build_entry: render one diagnostic as an LSP Diagnostic JSON object, resolving
-# its span to a 0-based range against the source map.
+# render one diagnostic as an LSP Diagnostic JSON object, resolving
+# its span to a 0-based range against the source map
 fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) str {
     var start_line: usize = 0;
     var start_char: usize = 0;
@@ -205,7 +205,7 @@ fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator)
     ret build_diagnostic_json(start_line, start_char, end_line, end_char, severity, d.message, alloc);
 }
 
-# map_severity: translate a compiler Severity to the LSP severity scale.
+# translate a compiler Severity to the LSP severity scale
 fun map_severity(sev: diag.Severity) i64 {
     if (sev == diag.SEVERITY_ERROR)   { ret LSP_ERROR; }
     if (sev == diag.SEVERITY_WARNING) { ret LSP_WARNING; }
@@ -213,8 +213,8 @@ fun map_severity(sev: diag.Severity) i64 {
     ret LSP_HINT;
 }
 
-# build_diagnostic_json: assemble one `{ range, severity, source, message }`
-# object from its parts.
+# assemble one `{ range, severity, source, message }`
+# object from its parts
 fun build_diagnostic_json(
     start_line: usize, start_char: usize,
     end_line: usize, end_char: usize,
@@ -265,13 +265,13 @@ fun build_diagnostic_json(
     ret buf::str;
 }
 
-# slen: length of `s`, treating nil as 0.
+# length of `s`, treating nil as 0
 fun slen(s: str) usize {
     if (s == nil) { ret 0; }
     ret str_len(s);
 }
 
-# append: copy `s` into `buf` at `offset`, returning the new offset.
+# copy `s` into `buf` at `offset`, returning the new offset
 fun append(buf: *u8, offset: usize, s: str) usize {
     if (s == nil) { ret offset; }
     val n: usize = str_len(s);
@@ -279,7 +279,7 @@ fun append(buf: *u8, offset: usize, s: str) usize {
     ret offset + n;
 }
 
-# free_entries: free an array of owned diagnostic JSON strings and the array.
+# free an array of owned diagnostic JSON strings and the array
 fun free_entries(entries: *str, count: usize, alloc: *Allocator) {
     if (entries == nil) { ret; }
     var i: usize = 0;
@@ -290,7 +290,7 @@ fun free_entries(entries: *str, count: usize, alloc: *Allocator) {
     deallocate[str](alloc, entries, count);
 }
 
-# free_parts: free the six fragment strings of one diagnostic object.
+# free the six fragment strings of one diagnostic object
 fun free_parts(sl: str, sc: str, el: str, ec: str, sev: str, qmsg: str, alloc: *Allocator) {
     json.free_str(sl, alloc);
     json.free_str(sc, alloc);
