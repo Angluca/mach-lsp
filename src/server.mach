@@ -26,17 +26,17 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
 use editor: mach.lang.editor;
 
-use transport: mls.transport;
-use json:      mls.json;
-use documents: mls.documents;
+use transport:   mls.transport;
+use json:        mls.json;
+use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
-use language:  mls.language;
-use project:   mls.project;
-use trace:     mls.trace;
+use language:    mls.language;
+use project:     mls.project;
+use trace:       mls.trace;
 
 # lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;

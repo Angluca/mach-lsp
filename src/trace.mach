@@ -18,7 +18,7 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 
-use os: std.system.os;
+use os:  std.system.os;
 use env: std.process.env;
 
 # fixed file the trace log is appended to

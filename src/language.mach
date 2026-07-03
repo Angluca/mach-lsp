@@ -253,9 +253,9 @@ fun doc_desc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) s
 # of `name: type` (or just `name` when the type is unavailable), followed by the
 # description prose as a paragraph when present. nil on allocation failure
 fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
-    val pre:  str = "```mach\n";
-    val post: str = "\n```";
-    val sep:  str = "\n\n";
+    val pre:   str = "```mach\n";
+    val post:  str = "\n```";
+    val sep:   str = "\n\n";
     val colon: str = ": ";
 
     var total: usize = str_len(pre) + str_len(name) + str_len(post);
@@ -713,10 +713,10 @@ fun make_field_target(an: *Analyzed, rs: project.RecordSite, field_name: token.S
 # are emitted). the active buffer is always `out[0]`; each other loaded module
 # that types a reference is another (owned `file://` URI freed by free_field_refs)
 rec FieldXRef {
-    a:        *ast.Ast;
-    sr:       *sema.SemaResult;
-    file:     *src.SourceFile;
-    uri:      str;
+    a:         *ast.Ast;
+    sr:        *sema.SemaResult;
+    file:      *src.SourceFile;
+    uri:       str;
     declaring: bool;
 }
 
