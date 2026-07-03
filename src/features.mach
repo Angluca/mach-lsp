@@ -811,15 +811,14 @@ pub fun field_decl_span(decl_a: *ast.Ast, decl_file: *src.SourceFile, fields_sta
 }
 
 # the name span of the rec / uni field whose own declaration
-# name covers `offset` in `decl_file`, or none. resolves the field's declaration
+# name covers `offset`, or none. resolves the field's declaration
 # site to itself (go-to-definition on a field where it is declared). scans the
 # field range `[fields_start, fields_start + fields_len)` in `decl_a.typed_names`
 # ---
 # decl_a:       the Ast holding the field declarations
-# decl_file:    the SourceFile backing `decl_a`
 # fields_start: start index of the field range in `decl_a.typed_names`
 # fields_len:   number of fields
-# offset:       byte offset into `decl_file`
+# offset:       byte offset into the declaring module's source
 # ret:          some(field name span) when the offset is on a field name, or none
 pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32, offset: usize) Option[token.Span] {
     var i: u32 = 0;
