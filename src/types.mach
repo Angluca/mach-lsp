@@ -172,7 +172,8 @@ test "types: type_of returns TYPE_NIL for an out-of-range expr id" {
 test "types: type_of reads the stored expression type" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
 
     var sr: sema.SemaResult = make_sema_result(?pa, 3, 0);
@@ -190,7 +191,8 @@ test "types: type_of reads the stored expression type" {
 test "types: decl_type_of reads the stored declaration type" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val u8t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_U8));
 
     var sr: sema.SemaResult = make_sema_result(?pa, 0, 2);
@@ -209,7 +211,8 @@ test "types: decl_type_of reads the stored declaration type" {
 test "types: nominal_of resolves a record TypeId to its declaration site" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
 
     val rec: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 7::sess.ModuleId, 3::id.DeclId, type.TYPE_REC));
@@ -232,7 +235,8 @@ test "types: nominal_of resolves a record TypeId to its declaration site" {
 test "types: nominal_of peels a pointer to the pointee record" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
 
     val rec: type.TypeId = unwrap_ok[type.TypeId, str](
         type.intern_nominal(?ti, intern.STR_NIL, 2::sess.ModuleId, 4::id.DeclId, type.TYPE_REC));
@@ -256,7 +260,8 @@ test "types: nominal_of peels a pointer to the pointee record" {
 test "types: nominal_of maps a generic instance to its template" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
 
     val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
     var args: [1]type.TypeId;
@@ -282,7 +287,8 @@ test "types: nominal_of maps a generic instance to its template" {
 test "types: nominal_of returns none for a primitive type" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
     val i32t: type.TypeId = unwrap[type.TypeId](type.prim(?ti, type.TYPE_I32));
 
     val ok: bool = is_none[Nominal](nominal_of(?ti, i32t));
@@ -294,7 +300,8 @@ test "types: nominal_of returns none for a primitive type" {
 test "types: nominal_of returns none for sentinel TypeIds" {
     var pa: Allocator;
     page.make(?pa);
-    var ti: type.TypeInterner = unwrap_ok[type.TypeInterner, str](type.init(?pa));
+    var ti: type.TypeInterner;
+    if (is_some[str](type.init(?ti, ?pa))) { ret 1; }
 
     var fail: bool = false;
     if (!is_none[Nominal](nominal_of(?ti, type.TYPE_NIL)))   { fail = true; }

@@ -191,10 +191,10 @@ fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator)
     var end_line: usize = 0;
     var end_char: usize = 0;
 
-    val so: Option[*src.SourceFile] = src.get(sources, d.file_id);
+    val so: Option[*src.SourceFile] = src.get(sources, d.loc.file_id);
     if (is_some[*src.SourceFile](so)) {
         val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
-        val r: positions.LspRange = positions.range_of(sf, d.span);
+        val r: positions.LspRange = positions.range_of(sf, d.loc.span);
         start_line = r.start_line;
         start_char = r.start_char;
         end_line = r.end_line;
