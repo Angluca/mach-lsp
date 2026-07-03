@@ -11,7 +11,7 @@
 #
 # scope: resolution is single-file (the editor resolves a buffer in isolation
 # with an empty dep set), so a reference to a locally declared symbol binds
-# fully — its decl is in this same Ast — while a reference imported through a
+# fully - its decl is in this same Ast - while a reference imported through a
 # `use` resolves to a symbol whose `decl` lives in a dependency Ast this server
 # never loaded. those are reported as cross-module: hover still renders the
 # name and kind, but definition / references that need the decl span are
@@ -102,7 +102,7 @@ pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: 
     }
 
     # the cursor may sit on a declaration's own name (the binding site), which
-    # is not an expr or type node — resolve it through the decl_symbol table
+    # is not an expr or type node - resolve it through the decl_symbol table
     # when the offset falls inside the decl's name span
     val did: id.DeclId = ast.offset_to_decl(a, offset);
     if (did != id.DECL_NIL) {
@@ -122,7 +122,7 @@ pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: 
             }
         }
 
-        # a function's parameter and generic binding names are not decls — they
+        # a function's parameter and generic binding names are not decls - they
         # bind SYM_PARAM / SYM_GENERIC symbols carrying (decl, slot). resolve a
         # cursor on one of those binding names through the symbol table
         val bo: Option[SymbolRef] = binding_ref_in_decl(a, rr, own, did, offset);
@@ -134,7 +134,7 @@ pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: 
 
 # a SymbolRef when `offset` falls on a function
 # parameter or generic binding name within decl `did`, or none. params and
-# generics carry no Decl node — their symbol is found by matching (decl, slot)
+# generics carry no Decl node - their symbol is found by matching (decl, slot)
 # in the symbol table
 fun binding_ref_in_decl(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, did: id.DeclId, offset: usize) Option[SymbolRef] {
     val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
@@ -242,7 +242,7 @@ pub fun symbol_is_local(rr: *res.ResolveResult, own: sess.ModuleId, sid: res.Sym
 }
 
 # the SymbolId in `rr` whose declaration is the module-scoped
-# pair (origin, decl) — the identity the same logical symbol shares across every
+# pair (origin, decl) - the identity the same logical symbol shares across every
 # module's resolve result, since an imported reference copies its referent's
 # origin ModuleId and DeclId. lets the workspace-wide references / rename walk
 # find a module's own id for a symbol declared elsewhere. param / generic
@@ -288,7 +288,7 @@ pub fun export_decl_of(rr: *res.ResolveResult, name: intern.StrId, kind: res.Sym
     ret id.DECL_NIL;
 }
 
-# the number of declarations at the buffer's module scope —
+# the number of declarations at the buffer's module scope -
 # the count documentSymbol enumerates. zero when the Ast has no root module
 # ---
 # a:   the buffer's parsed Ast
@@ -354,7 +354,7 @@ pub fun decl_name_span_of(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
 }
 
 # the span go-to-definition should land on for a local
-# symbol — the binding name. for a param / generic this is its binding site in
+# symbol - the binding name. for a param / generic this is its binding site in
 # the function signature; for every other symbol it is the decl's name. none
 # when the symbol has no addressable binding in this Ast
 # ---
@@ -380,7 +380,7 @@ pub fun decl_name_span(d: *decl.Decl) Option[token.Span] {
     ret none[token.Span]();
 }
 
-# the byte span of a local symbol's declaration header — the
+# the byte span of a local symbol's declaration header - the
 # text to render on hover. for a function with a body it runs from the decl
 # start up to (not into) the body block, so the parameter list and return type
 # show without the body; for every other decl it is the whole decl span. none
@@ -413,8 +413,8 @@ pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     ret some[token.Span](d.span);
 }
 
-# the `name: type` span of a parameter symbol — from its
-# binding name through the end of its type annotation — for hover. falls back
+# the `name: type` span of a parameter symbol - from its
+# binding name through the end of its type annotation - for hover. falls back
 # to just the name span when the type node is unavailable. none for a non-param
 fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
     val no: Option[token.Span] = binding_name_span(a, sym);
@@ -441,7 +441,7 @@ fun param_signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
 }
 
 # the first-class doc-block span the parser attached to a local
-# symbol's declaration (`Decl.doc`) — the `#`-comment run directly above the
+# symbol's declaration (`Decl.doc`) - the `#`-comment run directly above the
 # decl with its `#[...]` attribute lines excluded, or none. the attribute-aware
 # replacement for the old source line-scan: it carries no `#[attr]` bytes, so the
 # rendered doc never folds in attribute syntax. none for a param / generic (which
@@ -462,7 +462,7 @@ pub fun doc_span_of(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
 }
 
 # the description span of the component in the record / union doc
-# block `doc` whose component name matches the field name `field_name` — scanned
+# block `doc` whose component name matches the field name `field_name` - scanned
 # through `fe/doc.mach`'s component cursor, comparing each component's `name_span`
 # bytes against the field-name bytes. both spans index into the declaring module's
 # `source`, since the doc block and the field declaration share that file. none
@@ -595,7 +595,7 @@ pub fun type_ref_span(a: *ast.Ast, rr: *res.ResolveResult, tid: id.TypeId, targe
 # completion, i.e. a name a statement/expression position could reference. the
 # editor resolves a single file with no exposed scope chain, so completion
 # offers the file's module-level declarations, its `use` aliases and imports,
-# and the primitive type names — not lexically scoped locals, which need the
+# and the primitive type names - not lexically scoped locals, which need the
 # resolver's scope stack. duplicate-name symbols are deduped by the caller
 # ---
 # rr:  the ResolveResult holding the symbol table
@@ -681,8 +681,8 @@ pub fun import_ref_span(a: *ast.Ast, rr: *res.ResolveResult, did: id.DeclId, tar
 
 # true when the bytes of `span` in `file` exactly equal the
 # identifier `name`. the rename walk guards body references with it so a symbol
-# bound under an alias — whose references are spelled with the alias, not the
-# declared name — is not rewritten when the declaration is renamed
+# bound under an alias - whose references are spelled with the alias, not the
+# declared name - is not rewritten when the declaration is renamed
 # ---
 # file: the source file backing the span
 # span: byte span to compare
@@ -724,7 +724,7 @@ fun type_name_span(a: *ast.Ast, tid: id.TypeId) Option[token.Span] {
 # is SYMBOL_NIL for a MEMBER node), so this is the type-driven parallel to
 # `SymbolRef`: the feature layer resolves it to a field declaration through a
 # TypeId rather than the symbol table. `host` is the expression whose semantic
-# type names the record / union the field belongs to — the receiver for a member
+# type names the record / union the field belongs to - the receiver for a member
 # access `foo.bar`, the struct literal itself for `T{ bar: ... }` (whose inferred
 # type is the record). the caller types `host`, peels it to a record site, then
 # matches `name_span` against the site's fields
@@ -742,7 +742,7 @@ pub rec FieldRef {
 # this recovers the field name and the expression whose type names the field's
 # record directly from the syntax. it is consulted only when the symbol-table
 # pivot (`ref_at`) finds nothing, so an ordinary symbol still wins. pure over the
-# Ast — the actual field-decl lookup needs types and runs in the caller via
+# Ast - the actual field-decl lookup needs types and runs in the caller via
 # `field_decl_span`
 # ---
 # a:      the buffer's parsed Ast
@@ -785,7 +785,7 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) Option[FieldRef] {
 # the name span of the field declared in `decl_a` (its rec / uni
 # field range `[fields_start, fields_start + fields_len)` in `decl_a.typed_names`)
 # whose name bytes equal the referencing token `query` in `query_file`, or none
-# when no field matches. pure and session-free — the field-decl locator the
+# when no field matches. pure and session-free - the field-decl locator the
 # go-to-definition path drives once a value's type has been resolved to its record
 # site. comparing bytes across the two files lets the receiver and the declaration
 # live in different modules
@@ -831,7 +831,7 @@ pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32,
     ret none[token.Span]();
 }
 
-# the cross-module identity of a record / union field — the nominal
+# the cross-module identity of a record / union field - the nominal
 # declaration site of its record (`origin`, `decl`) paired with the field name as
 # bytes in the declaring module's source. the field-reference / field-rename walk
 # carries it across every loaded module: a member access or struct-literal init
@@ -862,7 +862,7 @@ pub rec FieldKey {
 #     peels to the keyed record, yields the matching init-name span.
 # the host type is read from `sr` (the module's SemaResult) and peeled through the
 # session type interner `ti`, so a field reached through `*T` or a generic instance
-# of the record matches the same key. pure over (`a`, `sr`, `ti`) — the caller
+# of the record matches the same key. pure over (`a`, `sr`, `ti`) - the caller
 # walks `[0, a.expr_len)` feeding the spans this returns to a sink
 # ---
 # a:    the module's parsed Ast
@@ -916,8 +916,8 @@ fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, k
 # write into `out` (up to `cap` spans) every site naming the
 # keyed field in module (`a`, `sr`) and return the count. the spans are, in walk
 # order: every member-access / struct-literal init whose host type peels to the
-# keyed record (`field_ref_span_at` over `[0, a.expr_len)`), and — when `declaring`
-# (this module declares the record) — the field declaration's own name span, then
+# keyed record (`field_ref_span_at` over `[0, a.expr_len)`), and - when `declaring`
+# (this module declares the record) - the field declaration's own name span, then
 # (when `want_doc` and the record's `doc` block carries a matching component) that
 # component's name token. this is the complete edit set a field rename applies to
 # one module and the location set references reports; it is pulled out of the JSON
@@ -956,12 +956,12 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInt
 }
 
 # the byte span to rewrite when a doc component's name is
-# renamed — the component in doc block `doc` (within `source`) whose name matches
+# renamed - the component in doc block `doc` (within `source`) whose name matches
 # the binding `query` (in `qf`), narrowed to the exact identifier token a rename
 # replaces. for a field or value parameter the component head is `# <name>:` and
 # the whole component `name_span` is the identifier, so it is returned as-is. for a
 # generic the component head keeps its syntactic `# [T]:` bracket form (see
-# `mach.lang.fe.doc`), so the returned span is the inner `T` only — the brackets
+# `mach.lang.fe.doc`), so the returned span is the inner `T` only - the brackets
 # are preserved. none when no component matches, or (for a generic) the matched
 # component carries no bracketed identifier. matching compares the inner identifier
 # against `query` so a `# [T]:` head matches the generic named `T`
@@ -984,7 +984,7 @@ pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFil
     ret none[token.Span]();
 }
 
-# the identifier token within a component name span — the whole
+# the identifier token within a component name span - the whole
 # span for a plain `name`, or the bracketed inner identifier for a generic's `[T]`
 # head. an empty span when a generic head has no `[...]` enclosed single-word
 # identifier. the narrowing `doc_component_name_span` applies so a generic rename
@@ -1012,7 +1012,7 @@ fun empty_span() token.Span {
 # true when span `sa` in `source` and span `sb` in `fb` cover
 # identical bytes. a cross-source compare where one side is a raw `str` (a doc
 # block lives in the declaring module's source) and the other a SourceFile (the
-# binding name) — bridging `same_source_span_equal` and `span_bytes_equal`
+# binding name) - bridging `same_source_span_equal` and `span_bytes_equal`
 fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
     if (sa.len != sb.len) { ret false; }
     val b: *u8 = fb.text::*u8;
@@ -1026,7 +1026,7 @@ fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: tok
 
 # true when the bytes of `sa` in `fa` exactly equal the bytes of
 # `sb` in `fb`. the cross-file identifier compare the field-decl locator matches a
-# field name against the referencing token with — the two may sit in different
+# field name against the referencing token with - the two may sit in different
 # source files (a field declared in a dependency, referenced in the buffer)
 # ---
 # fa: source file backing span `sa`
@@ -1282,7 +1282,7 @@ test "features: doc_span_of returns none for a param symbol" {
 
 test "features: field_doc_desc finds the matching component's description" {
     # the doc block and the rec body share one source, so the field-name query
-    # span and the component name span both point into `src` — the same-file
+    # span and the component name span both point into `src` - the same-file
     # match field_doc_desc performs in `field_hover_markdown`.
     #             0         1         2         3         4         5         6         7         8         9
     #             0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456
@@ -1317,7 +1317,7 @@ test "features: field_doc_desc returns none when no component matches" {
     var doc: token.Span;
     doc.offset = 0;
     doc.len    = 46;
-    # "z" field name at offset 55 — no matching component
+    # "z" field name at offset 55 - no matching component
     val ok: bool = is_none[token.Span](field_doc_desc(src, doc, name_span_in(55, 1)));
     if (!ok) { ret 1; }
     ret 0;
@@ -1328,7 +1328,7 @@ test "features: field_doc_desc returns none for a summary-only doc block" {
     var doc: token.Span;
     doc.offset = 0;
     doc.len    = 31;
-    # "x" field name at offset 40 — the block has no component lines
+    # "x" field name at offset 40 - the block has no component lines
     val ok: bool = is_none[token.Span](field_doc_desc(src, doc, name_span_in(40, 1)));
     if (!ok) { ret 1; }
     ret 0;
@@ -1465,7 +1465,7 @@ test "features: field_ref_span_at matches a member access of the keyed record" {
         val sp: token.Span = unwrap[token.Span](o);
         if (sp.offset != 2 || sp.len != 1) { fail = true; }
     }
-    # the receiver IDENT itself is not a member access — no field span.
+    # the receiver IDENT itself is not a member access - no field span.
     if (is_some[token.Span](field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key))) { fail = true; }
 
     free_sema(?pa, ?sr);
@@ -1683,7 +1683,7 @@ test "features: collect_field_sites in a non-declaring module yields only body s
 
     val key: FieldKey = fk(0, 4, ?declf, 8, 1);
     var out: [4]token.Span;
-    # declaring=false: no decl span, no doc — just the body site
+    # declaring=false: no decl span, no doc - just the body site
     val n: usize = collect_field_sites(?a, ?sr, ?ti, ?buf, key, false, true, "", empty_doc(), ?out[0], 4);
 
     free_sema(?pa, ?sr);

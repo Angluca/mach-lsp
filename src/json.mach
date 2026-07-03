@@ -190,8 +190,8 @@ pub fun extract_number_after(data: str, anchor: str, key: str, alloc: *Allocator
 
 # decode the string value of the `index`-th occurrence of
 # `key` in `data` (0-based), or nil when there are fewer than index+1
-# occurrences. lets a caller iterate a repeated key — e.g. every `"uri"` in a
-# `workspace/didChangeWatchedFiles` changes array — by bumping `index` until nil
+# occurrences. lets a caller iterate a repeated key - e.g. every `"uri"` in a
+# `workspace/didChangeWatchedFiles` changes array - by bumping `index` until nil
 # ---
 # data:  JSON text to scan
 # key:   quoted key to find, e.g. `"uri"`
@@ -211,7 +211,7 @@ pub fun extract_string_seq(data: str, key: str, index: u32, alloc: *Allocator) s
 
 # whether the boolean `key` inside the object value of
 # `anchor` is the literal `true`. the scan is scoped to the anchor's balanced
-# object, so an equally-named key in a later sibling object is never misread —
+# object, so an equally-named key in a later sibling object is never misread -
 # e.g. another capability's `dynamicRegistration` after an empty
 # `"didChangeWatchedFiles":{}`. false when the anchor is absent, its value is
 # not an object, or the key is absent / non-true, so a missing capability reads

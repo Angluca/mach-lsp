@@ -3,7 +3,7 @@
 # every message is a set of `Header: value\r\n` lines, a blank line, then a
 # body of exactly `Content-Length` bytes. this module reads one framed message
 # at a time from stdin and writes one framed message to stdout. it owns no
-# protocol semantics — the body is opaque JSON the server layer interprets.
+# protocol semantics - the body is opaque JSON the server layer interprets.
 
 use std.types.bool.bool;
 use std.types.bool.true;

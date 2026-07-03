@@ -5,19 +5,19 @@
 # SYMBOL_NIL and go-to-definition / references / hover cannot reach it. this
 # module closes that gap: for each project root open in the session it loads a
 # module graph from disk through the compiler's own `driver.build_project_union`
-# (manifest + lockfile + the `dep/` tree — the union of every declared target's
+# (manifest + lockfile + the `dep/` tree - the union of every declared target's
 # import closure, so modules reachable only via a non-default target are present),
 # snapshots every loaded module's
 # public surface into a `res.ResolveDeps`, and re-resolves an open buffer
-# against that dep set with `res.resolve` directly — the lower-level API the
+# against that dep set with `res.resolve` directly - the lower-level API the
 # editor's `resolve` wraps.
 #
 # multi-root by design: a `Workspace` holds one `Root` per distinct project
 # root open in the session, each with its own `driver.Project`, dep snapshot,
 # and synthetic buffer-id base. a document is routed to the root that governs
 # its path (the nearest ancestor `mach.toml`); a document that is a dependency
-# module of a root rooted elsewhere — already loaded, or an ancestor project
-# loaded on demand when the document's own root is nested under it — is routed
+# module of a root rooted elsewhere - already loaded, or an ancestor project
+# loaded on demand when the document's own root is nested under it - is routed
 # to that root read-only, rather than spun up as its own project; a document
 # under no `mach.toml` resolves single-file (empty dep set). the legacy "one
 # project per session" behaviour is just the one-Root case.
@@ -25,12 +25,12 @@
 # module-id namespacing: `driver.build_project_union` allocates project-local
 # module ids from 0 and writes them into the session's global module registries,
 # so a second build over the same session clobbers the first there. those clobbered
-# registries are never read for a lookup — every cross-module lookup (site_of,
+# registries are never read for a lookup - every cross-module lookup (site_of,
 # module_view, ...) reads the per-`Root` `driver.Project.modules` array, whose
 # ids are private to that project. the seam guarding that invariant is a
 # narrowed surface, not a language seal: no feature signature carries a
-# `*sess.Session` — feature code is handed only the per-root accessors plus the
-# two never-clobbered session services (`interner` / `sources`) — so reading a
+# `*sess.Session` - feature code is handed only the per-root accessors plus the
+# two never-clobbered session services (`interner` / `sources`) - so reading a
 # session module registry takes deliberately reaching through `Workspace.s` or
 # the vendored `EditorSession.s`, both of which stay readable because mach's
 # `pub` publishes whole recs (no field-level visibility). each `Root` is
@@ -48,14 +48,14 @@
 # cache stamps each entry with the generation of the root build it resolved
 # against (`Root.gen`, a fresh value per successful build; 0 reserved for a
 # single-file resolve), so a build's teardown makes every entry from it
-# structurally unhittable — no entry survives its root's reload as a stale hit —
+# structurally unhittable - no entry survives its root's reload as a stale hit -
 # while a freed root's entries are evicted per-root rather than by clearing the
 # whole cache.
 #
 # incremental rebuild (lsp #117): the free-and-reload is not a from-scratch
 # rebuild. mach 2.5.7's driver is query-engine-driven, and the session query DB
 # (Q_PARSE / Q_RESOLVE / Q_EXPORTS) lives on `Workspace.s` and SURVIVES
-# `driver.dnit_project` — only the per-build `driver.Project` arrays are freed.
+# `driver.dnit_project` - only the per-build `driver.Project` arrays are freed.
 # so the next `build_project_union` reuses every unchanged module's cached parse
 # and resolve and recomputes only the edited module plus the importers whose
 # public surface moved past the Q_EXPORTS firewall; an on-disk edit's cost is the
@@ -63,7 +63,7 @@
 # graph from a still-unsaved buffer's LIVE text (overriding the driver's per-module
 # disk read): the driver's `parse_module` unconditionally re-reads disk and
 # mirrors it into Q_FILE_TEXT, and the editor's buffers live in their own
-# (URI-keyed) FileId space disjoint from the project's (path-keyed) modules — so an
+# (URI-keyed) FileId space disjoint from the project's (path-keyed) modules - so an
 # unsaved edit reaches an open buffer's own analysis but not its importers'. closing
 # that gap needs a driver-side source-overlay API the vendored driver does not yet
 # expose (tracked as a mach follow-up); until then a cross-module feature reflects an
@@ -123,7 +123,7 @@ use json:      mls.json;
 use trace:     mls.trace;
 use mtypes:    mls.types;
 
-# where a resolved symbol's declaration lives — the Ast and SourceFile to
+# where a resolved symbol's declaration lives - the Ast and SourceFile to
 # read its spans from, and the document URI to report. for a buffer-local symbol
 # this is the request's own buffer; for a cross-module symbol it is the defining
 # dependency module's on-disk file
@@ -139,10 +139,10 @@ pub rec Site {
     owned: bool;
 }
 
-# one buffer's dep-aware resolve result — and, lazily, its sema result —
+# one buffer's dep-aware resolve result - and, lazily, its sema result -
 # stamped with the Ast it was resolved from and the generation of the root build
 # it resolved against. the editor replaces a buffer's `*ast.Ast` on every text
-# update (`drop_analysis`), so Ast pointer identity catches a text edit — the same
+# update (`drop_analysis`), so Ast pointer identity catches a text edit - the same
 # contract `editor.resolve` uses for its own cached result; `gen` catches a
 # cross-root or post-reload staleness, since a result resolved against one build
 # never matches a different build's stamp. the resolve result is populated on every
@@ -180,12 +180,12 @@ rec Cached {
 # man_mtime:      `mach.toml` mtime at the last load attempt, for the
 #                 conservative reload / retry check
 # lock_mtime:     `mach.lock` mtime at the last load attempt (0 when absent)
-# gen:            generation stamp of the current loaded build — a fresh value
+# gen:            generation stamp of the current loaded build - a fresh value
 #                 claimed on each successful load, 0 (reserved) while unloaded;
 #                 resolve cache entries carry it, so a reload or free makes the
 #                 prior build's entries unhittable and per-root evictable
 # vendored:       whether this root's own directory lies under some outer
-#                 project's declared vendor dir — i.e. the whole root is a
+#                 project's declared vendor dir - i.e. the whole root is a
 #                 vendored dependency project, so none of its files are the
 #                 editor's to rewrite, regardless of any loaded graph's closure.
 #                 intrinsic to the path (computed at load_root from the ancestor
@@ -218,7 +218,7 @@ pub rec Root {
 # s:            the compiler session. feature code must reach its safe services
 #               through `interner` / `sources` and never read this field: its
 #               per-build module registries are clobbered on every project load,
-#               and mach's whole-rec `pub` means the field cannot be sealed —
+#               and mach's whole-rec `pub` means the field cannot be sealed -
 #               keeping it out of feature paths is the contract
 # es:           borrowed editor session (buffer parsing)
 # alloc:        allocator for owned storage
@@ -238,7 +238,7 @@ pub rec Root {
 # sema_epoch:   monotonic counter bumped whenever a root's dep closure finishes
 #               sema (ensure_sema), so the server can tell a feature request
 #               triggered the lazy whole-closure typing and re-publish the open
-#               buffers WITH their semantic diagnostics — the type-diagnostics
+#               buffers WITH their semantic diagnostics - the type-diagnostics
 #               twin of load_epoch (#113)
 pub rec Workspace {
     s:            *sess.Session;
@@ -279,7 +279,7 @@ pub fun init(s: *sess.Session, es: *editor.EditorSession, alloc: *Allocator) Wor
     ret w;
 }
 
-# the session's shared string interner — the append-only symbol-name
+# the session's shared string interner - the append-only symbol-name
 # registry feature code resolves StrIds through. handed out instead of the whole
 # session so no feature signature carries one: the session's per-build module
 # registries are clobbered on every project load, and the interner and source
@@ -327,7 +327,7 @@ pub fun set_watch_active(w: *Workspace, on: bool) {
     w.watch_active = on;
 }
 
-# the workspace's current load epoch — a counter bumped on every
+# the workspace's current load epoch - a counter bumped on every
 # successful root build. the server snapshots it around a feature request; a
 # change means a lazy project load completed, so the open buffers it now governs
 # can have their diagnostics re-published with semantic (dep-aware) results
@@ -339,12 +339,12 @@ pub fun load_epoch(w: *Workspace) u32 {
     ret w.load_epoch;
 }
 
-# the workspace's current sema epoch — a counter bumped whenever a
+# the workspace's current sema epoch - a counter bumped whenever a
 # root's dep closure finishes typing (ensure_sema). the server snapshots it around
 # a feature request alongside the load epoch; a change means a type-aware feature
 # lazily sema'd a closure, so the open buffers it governs can be re-published with
-# their semantic diagnostics — which the load-free publish path could not produce
-# while the closure was still un-sema'd — without waiting for an edit (#113)
+# their semantic diagnostics - which the load-free publish path could not produce
+# while the closure was still un-sema'd - without waiting for an edit (#113)
 # ---
 # w:   the workspace
 # ret: the current sema epoch
@@ -354,7 +354,7 @@ pub fun sema_epoch(w: *Workspace) u32 {
 
 # whether `root`'s loaded dep closure has already been sema'd, so its
 # retained per-module typing exists. a load-free check: it never triggers a build
-# or ensure_sema. the diagnostics publish path gates buffer sema on this — only on
+# or ensure_sema. the diagnostics publish path gates buffer sema on this - only on
 # a ready root is sema_doc cheap and correct (one module against retained dep
 # typing); a loaded-but-un-sema'd root publishes parse + resolve only, keeping
 # open/edit instant (#96). false for a nil, unloaded, or un-sema'd root
@@ -412,7 +412,7 @@ pub fun resolve_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*res.Res
 }
 
 # re-resolve buffer `a` (FileId `fid`) against `root`'s dep set
-# unconditionally — the cache-miss core shared by `resolve_doc` (after its cache
+# unconditionally - the cache-miss core shared by `resolve_doc` (after its cache
 # check) and `diagnose_doc` (which forces a fresh parse to repopulate the session
 # DiagList). drops any prior cached result for `fid`, resolves with `res.resolve`,
 # and caches the new result. the resolve's diagnostics land on the session
@@ -463,12 +463,12 @@ fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Resu
     ret ok[*res.ResolveResult, str](slot);
 }
 
-# the buffer's SemaResult under `root` — its per-expression typing,
+# the buffer's SemaResult under `root` - its per-expression typing,
 # computed against the root's dep-closure typing. the type-aware twin of
 # `resolve_doc`: it first resolves the buffer (populating the resolve cache entry),
 # then, on a cache miss for the same Ast / build, lazily sema's the whole root
 # graph (`ensure_sema`) so every dependency's decl types are available, and finally
-# sema's the buffer itself against a SemaDeps spanning every sema'd root module —
+# sema's the buffer itself against a SemaDeps spanning every sema'd root module -
 # keyed on the same Ast-pointer / generation stamp the resolve cache uses, so an
 # unedited buffer reuses it. heavy on a cold root (the first call pays for the whole
 # dep closure), so it is reached only from a type-aware feature, never the
@@ -562,8 +562,8 @@ fun cache_slot(w: *Workspace, fid: src.FileId) *Cached {
 
 # parse and dep-aware-resolve the buffer governed by `root`,
 # returning the session DiagList populated with both its syntactic and its
-# name-resolution diagnostics. resolving against `root.deps` — the same dep set
-# go-to-definition uses — is what makes an import of a module outside the
+# name-resolution diagnostics. resolving against `root.deps` - the same dep set
+# go-to-definition uses - is what makes an import of a module outside the
 # project's dep closure surface its `imported module is not in the dep set`
 # diagnostic instead of binding silently to SYMBOL_NIL, so the published
 # diagnostics and what the features can resolve no longer disagree (#78). the
@@ -603,7 +603,7 @@ pub fun own_module(root: *Root, fid: src.FileId) sess.ModuleId {
     ret (base + fid::u32)::sess.ModuleId;
 }
 
-# the generation stamp a buffer's resolve carries under `root` — the
+# the generation stamp a buffer's resolve carries under `root` - the
 # root's current build generation, or the reserved 0 for a single-file document
 # (root nil). the single source of the stamp rule, shared by cache_put's write
 # and cache_hit's check so the two sides cannot drift
@@ -615,8 +615,8 @@ fun root_gen(root: *Root) u32 {
 # the root governing the document at `uri`, loading it on first use,
 # or nil when the document resolves single-file (no ancestor `mach.toml`, or a
 # remembered failed load). a document that is a dependency module of a root
-# rooted elsewhere — whether that root is already loaded, or is an ancestor
-# project loaded here on demand — is routed to that root read-only, rather than
+# rooted elsewhere - whether that root is already loaded, or is an ancestor
+# project loaded here on demand - is routed to that root read-only, rather than
 # spun up as its own project, regardless of document open order
 # ---
 # w:   the workspace
@@ -646,7 +646,7 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
 
     # fresh root: when an ancestor project declares this root as one of its dep
     # vendor dirs, load that project and prefer it when its graph holds the
-    # document — so a dependency source opened before any project document
+    # document - so a dependency source opened before any project document
     # still routes read-only instead of becoming its own renameable project
     val outer: *Root = ancestor_root(w, uri, doc_root, doc_root);
     if (outer != nil) { strutil.str_free(w.alloc, doc_root); ret outer; }
@@ -655,7 +655,7 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
 }
 
 # the root governing the document at `uri` ONLY when it is
-# already loaded — never triggering a build. unlike `root_for`, this neither
+# already loaded - never triggering a build. unlike `root_for`, this neither
 # loads a fresh root nor speculatively loads a vendoring ancestor nor reloads a
 # stale one; it returns nil when no loaded root holds the document. the
 # diagnostics publish path uses this so opening or editing a buffer publishes
@@ -672,7 +672,7 @@ pub fun root_for_loaded(w: *Workspace, uri: str) *Root {
     if (uri == nil) { ret nil; }
 
     # a loaded root rooted elsewhere holding the document governs it read-only,
-    # exactly as in root_for — checked without reloading
+    # exactly as in root_for - checked without reloading
     val twin: *Root = containing_root_loaded(w, uri);
     if (twin != nil) { ret twin; }
 
@@ -689,11 +689,11 @@ pub fun root_for_loaded(w: *Workspace, uri: str) *Root {
 # walks the chain of ancestor manifest dirs strictly above `dir` (`doc_root` on
 # the outer call), outermost first; an ancestor is only considered when its
 # manifest declares a dependency whose vendor dir encloses `doc_root`
-# (`vendors_enclosing`), so unrelated outer projects — a monorepo root, this repo
-# above its test fixtures — are never speculatively built. the outermost
+# (`vendors_enclosing`), so unrelated outer projects - a monorepo root, this repo
+# above its test fixtures - are never speculatively built. the outermost
 # considered ancestor whose loaded graph holds the document governs it; one that
 # loads but does not hold it stays loaded (it is a real project) and the walk
-# falls inward to the next vendoring ancestor — so a dependency nested inside
+# falls inward to the next vendoring ancestor - so a dependency nested inside
 # another dependency's tree reaches the outermost project that actually closes
 # over it, not merely its immediate parent. ancestors already tracked are
 # skipped: a loaded one was already offered by containing_root, and a failed one
@@ -722,7 +722,7 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
 }
 
 # whether the project at `root_path` declares a dependency
-# whose vendor dir encloses `dir` — i.e. `dir` equals or lies under
+# whose vendor dir encloses `dir` - i.e. `dir` equals or lies under
 # `<root>/<[project].dep>/<alias>` for some `[deps.<alias>]`, the same layout the
 # driver's dep resolution reads. one small manifest parse answers "could this
 # project's dependency tree contain that nested root?" without paying a full
@@ -730,10 +730,10 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
 # enclosure rather than equality is the speculative-build gate that lets a dep
 # nested inside another dep's tree reach the outermost vendoring project, not
 # merely its immediate parent, while still never building unrelated outer
-# projects — a monorepo root, this repo above its test fixtures — whose declared
+# projects - a monorepo root, this repo above its test fixtures - whose declared
 # vendor dirs enclose nothing the document sits in. a manifest that fails to read
 # or parse vendors nothing. the parsed table is leaked into the server's page
-# allocator — std.data.toml exposes no teardown, the same convention the driver's
+# allocator - std.data.toml exposes no teardown, the same convention the driver's
 # own manifest reads use
 fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
     val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, "mach.toml");
@@ -799,7 +799,7 @@ fun find_root(w: *Workspace, root_path: str) *Root {
 # `uri` as a module (matched on the normalized filesystem path), skipping the
 # document's own root at `doc_root` (which find_root handles, with its
 # outside-the-closure files resolving against its dep set). when several loaded
-# roots hold the document — an outer project and a dependency nested within it —
+# roots hold the document - an outer project and a dependency nested within it -
 # the outermost wins (the shortest root path, since every holder is an ancestor
 # of the document on one root-to-file chain and so they nest), so a dependency
 # module routes to the project that vendors it regardless of which root loaded
@@ -830,7 +830,7 @@ fun containing_root(w: *Workspace, uri: str, doc_root: str) *Root {
 }
 
 # the load-free counterpart of `containing_root` for the
-# diagnostics publish path — the outermost already-loaded root whose graph holds
+# diagnostics publish path - the outermost already-loaded root whose graph holds
 # the document at `uri`, without the per-candidate `maybe_reload` (which would
 # rebuild a stale root). selection is identical otherwise: the shortest holding
 # root path wins, so a vendored module routes to the project that vendors it. nil
@@ -856,7 +856,7 @@ fun containing_root_loaded(w: *Workspace, uri: str) *Root {
 }
 
 # claim a slot for `root_path` (taking ownership of the string) and
-# build its graph. the vendored flag is stamped once here — intrinsic to the
+# build its graph. the vendored flag is stamped once here - intrinsic to the
 # path, so every root-creating path (root_for's fresh-root load, ancestor_root's
 # speculative loads) gets it correct, and it survives in-place reloads (which keep
 # the slot). on failure the slot is kept as a remembered failed load and nil is
@@ -871,14 +871,14 @@ fun load_root(w: *Workspace, root_path: str) *Root {
 }
 
 # whether `root_path`'s own directory lies under some
-# strict-ancestor project's declared vendor dir — i.e. this root is a vendored
+# strict-ancestor project's declared vendor dir - i.e. this root is a vendored
 # dependency of an outer project. climbs the chain of ancestor manifest dirs
 # strictly above `root_path` (the same dirs ancestor_root walks), asking
 # vendors_enclosing of each; true on the first whose declared dep vendor dir
 # encloses `root_path`. this is a property of the path, not of how the root was
 # reached: a root materialized as an outer vendoring project for a deeper dep is
 # still flagged when it itself sits under a grandparent's vendor dir, which is
-# correct — its own sources remain a vendored dependency. a root with no such
+# correct - its own sources remain a vendored dependency. a root with no such
 # ancestor (a top-level project, even one that loads dep modules) is not vendored
 fun vendored_under_ancestor(w: *Workspace, root_path: str) bool {
     var cur: str = root_path;
@@ -1040,7 +1040,7 @@ fun free_mod_paths(w: *Workspace, r: *Root) {
 }
 
 # rebuild `r`'s graph when its manifest or lockfile changed on
-# disk since the last load attempt — the conservative fallback for clients that
+# disk since the last load attempt - the conservative fallback for clients that
 # do not deliver `workspace/didChangeWatchedFiles`, and the retry path for a
 # root whose previous load failed (a since-fixed manifest). skipped entirely
 # when file watching is active: the watcher already invalidates on those
@@ -1081,7 +1081,7 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
 }
 
 # whether `file_norm` (a normalized absolute path) lies within the
-# project rooted at `root_path` — equal to it or under it
+# project rooted at `root_path` - equal to it or under it
 fun root_covers(w: *Workspace, file_norm: str, root_path: str) bool {
     if (root_path == nil) { ret false; }
     val rn: str = normalize_path(w.alloc, root_path);
@@ -1235,7 +1235,7 @@ pub fun free_site(w: *Workspace, site: *Site) {
 }
 
 # a borrowed view of one loaded module for the workspace-wide
-# use-site walk — its parsed Ast, resolve side tables, and backing source file
+# use-site walk - its parsed Ast, resolve side tables, and backing source file
 # ---
 # a:    the module's parsed Ast (decl / expr / type ids index into it)
 # rr:   the module's ResolveResult side tables
@@ -1300,7 +1300,7 @@ pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[*sema
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
 # when `sr` is nil or `eid` is out of range. the narrow read the feature layer
-# makes to learn an expression's type — handed a SemaResult (from `sema_doc` or
+# makes to learn an expression's type - handed a SemaResult (from `sema_doc` or
 # `module_sema`), never the session. delegates to the pure helper so the rule lives
 # in one unit-testable place
 # ---
@@ -1322,7 +1322,7 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 }
 
 # the nominal back-link from a record / union TypeId to its declaring
-# site — what a field go-to-def / rename follows from a value's type to the `rec` /
+# site - what a field go-to-def / rename follows from a value's type to the `rec` /
 # `uni` declaration whose fields it must walk. carries the field range (uniform
 # across rec / uni, both being TypedName slices in `a.typed_names`) and the
 # module's Ast / source so field spans can be read directly
@@ -1345,13 +1345,13 @@ pub rec RecordSite {
 }
 
 # the declaring site a record / union TypeId nominally refers to,
-# resolved against the session's type interner and the root's loaded module array —
+# resolved against the session's type interner and the root's loaded module array -
 # the nominal back-link field features follow. peels a pointer to its pointee and
 # maps a generic instance to its template. none when `tid` is not a nominal type,
 # the declaring module is not a loaded project module, or the declaration is not a
 # rec / uni. the returned Ast / file pointers are owned by the loaded project /
 # session. a record declared in the active buffer (whose synthetic module id is not
-# in the loaded array) is not found here — use `record_decl_in`, which falls back to
+# in the loaded array) is not found here - use `record_decl_in`, which falls back to
 # the buffer's live Ast for that case
 # ---
 # w:    the workspace
@@ -1420,7 +1420,7 @@ fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) Option[mtypes.N
 
 # build a RecordSite for the rec / uni decl `decl` in `a` (backed
 # by `file`), or none when the decl is absent or not a rec / uni. the shared core
-# of `record_decl` / `record_decl_in` — both having chosen which Ast / file the
+# of `record_decl` / `record_decl_in` - both having chosen which Ast / file the
 # declaration lives in
 fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, a: *ast.Ast, file: *src.SourceFile) Option[RecordSite] {
     val d_opt: Option[*adecl.Decl] = ast.get_decl(a, decl);
@@ -1466,7 +1466,7 @@ pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 # matching is lexical (`.` / `..` collapse only): the std fs surface exposes
 # neither realpath nor inode identity, so a buffer opened through a symlinked or
 # differently-cased path does not match its twin and that file is walked as a
-# separate module — yielding duplicate locations / a duplicate WorkspaceEdit key
+# separate module - yielding duplicate locations / a duplicate WorkspaceEdit key
 # for the same physical file
 # ---
 # w:    the workspace
@@ -1511,7 +1511,7 @@ pub fun root_vendored(root: *Root) bool {
 }
 
 # whether loaded module `mid` in `root` belongs to the user's
-# own editable project rather than a vendored dependency — false outright when
+# own editable project rather than a vendored dependency - false outright when
 # the whole root is a vendored dependency project (root_vendored), otherwise true
 # iff the module's fully-qualified path's head segment is the project id. rename
 # gates cross-file edits on it so a dependency's declaration (e.g. a std symbol,
@@ -1537,8 +1537,8 @@ pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
     ret fqn[plen] == '.';
 }
 
-# the project root governing `uri` — the nearest ancestor of its
-# decoded filesystem path holding a `mach.toml` — as an owned string, or nil
+# the project root governing `uri` - the nearest ancestor of its
+# decoded filesystem path holding a `mach.toml` - as an owned string, or nil
 # for a non-file URI or a document outside any project
 fun document_root(w: *Workspace, uri: str) str {
     val path: str = uri_to_path(w.alloc, uri);
@@ -1671,14 +1671,14 @@ fun free_deps(w: *Workspace, deps: *res.ResolveDeps) {
 }
 
 # run the type checker over `root`'s loaded module graph, retaining
-# one SemaResult per module on the Root — the lazy core of the type-aware layer.
+# one SemaResult per module on the Root - the lazy core of the type-aware layer.
 # a no-op once it has run for the current build (sema_loaded) or for an unloaded
 # root. modules are sema'd in dependency (topological) order, each against a
 # SemaDeps assembled from the decl_type snapshots of the modules already sema'd in
 # this pass, exactly as the compiler's own build does; a module that did not
 # resolve is skipped, leaving a zeroed SemaResult that types to TYPE_NIL. the pass
 # is heavy (it walks the whole dep closure), so it runs only when a feature first
-# demands typing — never on the diagnostics publish hot path — and is cached until
+# demands typing - never on the diagnostics publish hot path - and is cached until
 # the build reloads. on completion it bumps the workspace sema epoch, the signal
 # the server uses to re-publish the open buffers with semantic diagnostics now
 # that the closure's retained typing exists (#113). allocation failure leaves the
@@ -1721,7 +1721,7 @@ pub fun ensure_sema(w: *Workspace, root: *Root) {
 
 # type-check one loaded module against the modules already sema'd
 # this pass, storing its SemaResult into `root.sema[mid]` and marking it ready. a
-# module that did not resolve (no resolve_result) is left zeroed and unready — its
+# module that did not resolve (no resolve_result) is left zeroed and unready - its
 # types stay TYPE_NIL and dependents simply do not see it among their deps. the
 # comptime context the driver populated for the module (`m.ctx`) drives array-length
 # and `$if`-gate evaluation, matching how the compiler sema's the same module. on
@@ -1742,12 +1742,12 @@ fun run_module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId, ready: *bool
     ready[mid::u32]     = true;
 }
 
-# assemble the SemaDeps for the module about to be analysed — one
+# assemble the SemaDeps for the module about to be analysed - one
 # ModuleSema entry per module already sema'd this pass (ready), each borrowing that
 # module's decl_type snapshot. cross-module symbol types are looked up by the
 # symbol's origin ModuleId, and a `fwd` re-export carries the originating
 # (transitive) module as the origin, so the snapshot must cover every ready module,
-# not only the direct dependencies — all of them are strictly earlier in topo order
+# not only the direct dependencies - all of them are strictly earlier in topo order
 # and thus already produced. mirrors the compiler's own build_sema_deps. writes the
 # assembled deps into `out`; false on allocation failure (the caller skips the
 # module). an empty set (no module ready yet) is a successful result
@@ -1797,7 +1797,7 @@ fun free_sema_deps(w: *Workspace, deps: *sema.SemaDeps) {
 }
 
 # zero a freshly allocated SemaResult array so an un-run or skipped
-# module's slot has nil arrays — a lookup against it types to TYPE_NIL, never a
+# module's slot has nil arrays - a lookup against it types to TYPE_NIL, never a
 # wild read. mirrors how the resolve cache zero-fills its gaps
 fun zero_sema(arr: *sema.SemaResult, n: u32) {
     var i: u32 = 0;
@@ -1830,7 +1830,7 @@ fun cache_hit(w: *Workspace, fid: src.FileId, a: *ast.Ast, root: *Root) *res.Res
 # store `rr` (resolved from Ast `a` against the build stamped `gen`,
 # or 0 for single-file) as the cached result for `fid`, growing the cache to
 # cover the FileId and zero-filling any gap. false when the grow allocation fails
-# — the caller owns `rr` and must free it
+# - the caller owns `rr` and must free it
 fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.Ast, gen: u32) bool {
     val needed: u32 = fid::u32 + 1;
     if (needed > w.cache_len) {
@@ -1859,7 +1859,7 @@ fun cache_put(w: *Workspace, fid: src.FileId, rr: *res.ResolveResult, a: *ast.As
 }
 
 # free a cache slot's owned ResolveResult and SemaResult and zero
-# the slot — the one teardown for a Cached entry, shared by every reclamation path.
+# the slot - the one teardown for a Cached entry, shared by every reclamation path.
 # the sema result (populated lazily by sema_doc, nil otherwise) is torn down first.
 # callers guard `c.rr != nil`
 fun release_entry(w: *Workspace, c: *Cached) {
@@ -1890,7 +1890,7 @@ pub fun free_cached(w: *Workspace, fid: src.FileId) {
 
 # release every cached result resolved against root `r`'s current
 # build (matched by generation), reclaiming the entries a graph teardown
-# invalidates. a no-op for an unloaded slot (gen 0, no build of its own — and
+# invalidates. a no-op for an unloaded slot (gen 0, no build of its own - and
 # never the single-file entries that also carry gen 0, since those belong to no
 # root). called by free_root_graph at every reload / free, replacing the blanket
 # whole-cache clear
@@ -2203,7 +2203,7 @@ test "project incremental: an on-disk dep edit reloads correctly (matches fresh)
 
     val main_text: str = "use proj.leaf.fa;\nuse proj.other.fb;\nfun main() i32 { ret fa() + fb(); }\n";
     val leaf_v1:   str = "pub fun fa() i32 { ret 1; }\n";
-    # pub-surface change: prepend a new pub function, shifting fa's DeclId — a change
+    # pub-surface change: prepend a new pub function, shifting fa's DeclId - a change
     # the importer's binding genuinely depends on
     val leaf_v2:   str = "pub fun fz() i32 { ret 0; }\npub fun fa() i32 { ret 1; }\n";
 

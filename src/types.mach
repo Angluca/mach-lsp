@@ -2,7 +2,7 @@
 #
 # the feature layer reads per-expression types and the nominal back-link from a
 # record TypeId to its declaring module here, so the resolution rules live in one
-# place — and, being free of any session / project state, are unit-testable in
+# place - and, being free of any session / project state, are unit-testable in
 # isolation. `project.mach` re-exports these through its own narrowed accessors so
 # no feature signature carries a `*sess.Session`.
 
@@ -34,7 +34,7 @@ use id:     mach.lang.fe.ast.id;
 use sema:   mach.lang.fe.sema;
 use intern: mach.lang.intern;
 
-# the declaration site a record / union TypeId nominally refers to —
+# the declaration site a record / union TypeId nominally refers to -
 # the back-link a field feature follows from a value's type to the `rec` / `uni`
 # declaration whose fields it must walk. for a generic instance this is the
 # generic template's declaration (`target_origin` / `target_decl`)
@@ -77,7 +77,7 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 # the declaration site a record / union TypeId nominally refers to,
 # or none when `tid` is not a nominal type (a primitive, pointer, array, function,
 # generic parameter, or a sentinel). a pointer to a record is peeled to the record
-# first, so `*T` and `T` resolve to the same declaration — a field access through a
+# first, so `*T` and `T` resolve to the same declaration - a field access through a
 # pointer reaches the same `rec` decl. a generic instance resolves to its template
 # declaration. this is the nominal back-link a field go-to-def / rename follows
 # ---

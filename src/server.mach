@@ -376,7 +376,7 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
 # by a loaded project root. run after a feature request triggers a lazy load (#96)
 # or the first whole-closure sema (#113): the buffers under the freshly-loaded root
 # were published parse-only on open, so a load upgrades them to dep-aware
-# resolution diagnostics — including any out-of-closure import the load now flags —
+# resolution diagnostics - including any out-of-closure import the load now flags -
 # and a completed sema further layers their type diagnostics, all without the user
 # touching the file. the publish path is load-free, so a buffer under no loaded
 # root simply re-publishes its parse-only diagnostics (unchanged), and nothing new

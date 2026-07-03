@@ -2,8 +2,8 @@
 #
 # the LSP addresses text by 0-based (line, character); the compiler addresses
 # it by byte offset (and reports 1-based line/col via `source.position`). the
-# language features pivot on byte offset — `ast.offset_to_*` takes an offset
-# and the resolve side tables index by node id — so every request first maps
+# language features pivot on byte offset - `ast.offset_to_*` takes an offset
+# and the resolve side tables index by node id - so every request first maps
 # the incoming LSP position to an offset, and every response maps a `token.Span`
 # back to an LSP range. these helpers are the single conversion point.
 #
@@ -162,7 +162,7 @@ fun u8_seq_len(b: u8) usize {
     ret 4;
 }
 
-# the UTF-16 code units the codepoint led by `b` encodes to — 2 for a
+# the UTF-16 code units the codepoint led by `b` encodes to - 2 for a
 # 4-byte sequence (a surrogate pair), 1 otherwise
 fun u16_units(b: u8) usize {
     if (b >= 0xF0) { ret 2; }

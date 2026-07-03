@@ -6,7 +6,7 @@
 # replaces the buffer text in place; `didClose` retires the entry. each entry
 # keeps its own owned URI copy so it survives the request that created it.
 #
-# the editor session is borrowed from the server and reused across documents —
+# the editor session is borrowed from the server and reused across documents -
 # it owns the per-buffer analysis and the underlying session owns the source
 # text, so this registry stores only the URI/FileId association.
 
@@ -149,7 +149,7 @@ pub fun close(st: *Store, uri: str) {
 }
 
 # the number of Document slots in the store. paired with `at` to
-# walk every live document — the re-publish-after-load sweep iterates
+# walk every live document - the re-publish-after-load sweep iterates
 # [0, slot_count) and skips slots whose `in_use` is false
 # ---
 # st:  the store
@@ -159,7 +159,7 @@ pub fun slot_count(st: *Store) usize {
 }
 
 # the Document in slot `idx`, or nil when out of range. the slot may be
-# retired (`in_use` false) — callers check that. for the open-document sweep
+# retired (`in_use` false) - callers check that. for the open-document sweep
 # that re-publishes diagnostics once a project finishes loading
 # ---
 # st:  the store

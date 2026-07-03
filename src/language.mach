@@ -15,7 +15,7 @@
 # through a shared use-site index (`build_refs` over `project.module_view`):
 # references reports every use-site across all modules; rename rewrites the
 # declaration plus every importer (body references and `use` path leaves), but
-# only for symbols declared in the user's own project — a dependency's
+# only for symbols declared in the user's own project - a dependency's
 # declaration is not the editor's to rewrite. completion offers the file's
 # module-level names, `use` aliases, and the primitive types (see
 # `features.completion_candidate`).
@@ -96,7 +96,7 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
-        # field name yields no SymbolRef — fall through to the type-driven field
+        # field name yields no SymbolRef - fall through to the type-driven field
         # hover before giving up.
         if (field_hover(ws, alloc, ?an, offset, id_raw)) { ret; }
         reply_null(alloc, id_raw); ret;
@@ -139,8 +139,8 @@ fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span
 # when the symbol-table pivot finds nothing at `offset`. types the referencing
 # expression (a member access `foo.bar` or a struct-literal field name
 # `T{ bar: ... }`), peels it to its record site, and renders the field's name,
-# its declared type, and — when the record's doc block carries a matching
-# `# <name>: <desc>` component — that description. cross-module aware: the record
+# its declared type, and - when the record's doc block carries a matching
+# `# <name>: <desc>` component - that description. cross-module aware: the record
 # may be declared in a dependency module, in which case its Ast / file / doc all
 # come from the loaded module. emits the hover over the cursor's field-name span
 # and returns true when a field was rendered; returns false (without replying) so
@@ -249,7 +249,7 @@ fun doc_desc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) s
     ret buf::str;
 }
 
-# assemble the field hover Markdown — a fenced `mach` block
+# assemble the field hover Markdown - a fenced `mach` block
 # of `name: type` (or just `name` when the type is unavailable), followed by the
 # description prose as a paragraph when present. nil on allocation failure
 fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
@@ -282,8 +282,8 @@ fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
 }
 
 # a fenced `mach` code block rendering the symbol at hover. it
-# shows the declaration header as written — read from the buffer for a local
-# symbol, from the defining dependency module's file for a cross-module one —
+# shows the declaration header as written - read from the buffer for a local
+# symbol, from the defining dependency module's file for a cross-module one -
 # falling back to the symbol kind and name when no decl header is available. the
 # decl's doc comment, if any, follows the block as prose, read from the same
 # Site so a cross-module symbol's docs render too
@@ -335,7 +335,7 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
 # paragraph; when a `# ---` component block follows, a thematic break (`---`
 # fenced by blank lines so CommonMark reads a horizontal rule, not a setext
 # heading) precedes each `# <name>: <desc>` component rendered as a
-# `- **name** — desc` list item. because `Decl.doc` excludes the decl's `#[...]`
+# `- **name** - desc` list item. because `Decl.doc` excludes the decl's `#[...]`
 # attribute lines, no attribute syntax can leak into the rendering. one
 # `doc_render` walk both sizes and fills the buffer, so the two passes cannot
 # diverge and the allocation is str_len + 1 as `json.free_str` expects. nil on an
@@ -475,7 +475,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
-        # field name yields no SymbolRef — fall through to the type-driven field
+        # field name yields no SymbolRef - fall through to the type-driven field
         # path before giving up.
         if (field_definition(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
         reply_null(alloc, id_raw); ret;
@@ -560,7 +560,7 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     ret false;
 }
 
-# a field declaration the cursor sits on at its own definition site —
+# a field declaration the cursor sits on at its own definition site -
 # the field name span resolves to itself for go-to-definition
 # ---
 # name: byte span of the field name in the buffer
@@ -636,8 +636,8 @@ fun reply_result(alloc: *Allocator, id_raw: str, result: str) {
 # of a SymbolRef for the field references / rename / prepareRename paths. carries
 # the field's cross-module identity (`key`), the record's declaring site (`rs`,
 # for the field-declaration span and its doc block), and whether that site is the
-# active buffer (so the declaring module's edits — the field decl name and the doc
-# component — are placed in the buffer's URI rather than a loaded module's)
+# active buffer (so the declaring module's edits - the field decl name and the doc
+# component - are placed in the buffer's URI rather than a loaded module's)
 # ---
 # key:            the field's cross-module identity
 # rs:             the record's declaring site (field range, Ast, file, doc)
@@ -707,7 +707,7 @@ fun make_field_target(an: *Analyzed, rs: project.RecordSite, field_name: token.S
     ret t;
 }
 
-# one module contributing field references — its Ast, SemaResult (for
+# one module contributing field references - its Ast, SemaResult (for
 # typing each host expression), source file, document URI, and whether it is the
 # record's declaring module (so its field-declaration name span and doc component
 # are emitted). the active buffer is always `out[0]`; each other loaded module
@@ -725,7 +725,7 @@ rec FieldXRef {
 # each subsequent entry is a loaded module whose SemaResult types at least one
 # reference to the field, skipping the buffer's on-disk twin so its live edits are
 # not double-counted. every module is walked (a field is reachable wherever its
-# record is imported), so this is not gated on project ownership — the rename gate
+# record is imported), so this is not gated on project ownership - the rename gate
 # is applied separately by the caller
 # ---
 # ws:    the workspace
@@ -783,7 +783,7 @@ fun free_field_refs(ws: *project.Workspace, refs: *FieldXRef, n: usize) {
 }
 
 # feed every site naming the keyed field in module `s` to the
-# sink — every member access / struct-literal init whose host type peels to the
+# sink - every member access / struct-literal init whose host type peels to the
 # keyed record, plus (when `s` is the record's declaring module) the field
 # declaration's own name span and, for rename, the matching `# <field>:` doc
 # component name token. the span set is computed by the pure
@@ -834,7 +834,7 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
 }
 
 # the type-driven rename path for a record / union field. refuses
-# (returns false without replying — the caller emits an empty edit) when the
+# (returns false without replying - the caller emits an empty edit) when the
 # field's record is declared in a vendored dependency: such a declaration is not
 # the editor's to rewrite. otherwise resolves the field, walks every loaded
 # module, and emits a WorkspaceEdit replacing every member-access / struct-literal
@@ -861,7 +861,7 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: 
     ret true;
 }
 
-# whether the field's record is the editor's to rewrite —
+# whether the field's record is the editor's to rewrite -
 # the same gate the symbol rename `renameable` applies, keyed on the record's
 # declaring module. a record declared in a loaded module keys directly on
 # `is_project_module`; a record declared in the active buffer keys on the buffer's
@@ -1021,7 +1021,7 @@ fun field_rename_group_json(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarge
 }
 
 # answer textDocument/references with every Location resolving to
-# the symbol at the cursor — its declaration plus every use-site across the
+# the symbol at the cursor - its declaration plus every use-site across the
 # loaded project graph (the requesting buffer and every other module that
 # references the symbol). empty when the position is not on a resolved symbol
 pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
@@ -1036,7 +1036,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
-        # field name yields no SymbolRef — fall through to the type-driven field
+        # field name yields no SymbolRef - fall through to the type-driven field
         # references before giving up.
         if (field_references(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
         reply_empty_array(alloc, id_raw); ret;
@@ -1066,13 +1066,13 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 
 # answer textDocument/rename with a WorkspaceEdit replacing every
 # reference to the symbol at the cursor with the requested new name, across the
-# whole project graph — the declaring file plus every module that imports or
+# whole project graph - the declaring file plus every module that imports or
 # uses it (including each importer's `use` path leaf). confined to symbols
 # declared in the user's own project: a dependency's declaration is not the
 # editor's to rewrite (whether referenced cross-module or opened as the buffer
 # itself), so those yield an empty edit. an empty edit is also returned when a
 # module-scope pub symbol's cross-file identity cannot be recovered from its
-# stale on-disk twin — a buffer-local edit there would be a partial rename
+# stale on-disk twin - a buffer-local edit there would be a partial rename
 pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
     val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
     if (id_raw == nil) { ret; }
@@ -1087,7 +1087,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) {
-        # a cursor on a field name yields no SymbolRef — fall through to the
+        # a cursor on a field name yields no SymbolRef - fall through to the
         # type-driven field rename, which gates on the record's ownership.
         if (field_rename(ws, alloc, ?an, uri, offset, id_raw, new_name)) { json.free_str(new_name, alloc); ret; }
         reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret;
@@ -1177,7 +1177,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
 
     val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
     if (!is_some[features.SymbolRef](ro)) {
-        # a cursor on a field name yields no SymbolRef — accept it when it resolves
+        # a cursor on a field name yields no SymbolRef - accept it when it resolves
         # to a field of a project-owned record (the same gate field rename uses)
         var name_span: token.Span;
         if (field_prepare_span(ws, ?an, uri, offset, ?name_span)) {
@@ -1249,9 +1249,9 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
 # whether the symbol at the cursor may be renamed. a cross-module
 # symbol must be declared in a project-owned module, and a buffer-local symbol
 # is only renameable when the buffer itself is the editor's to rewrite: its
-# on-disk twin (when the buffer is a loaded module's file — e.g. a dependency
+# on-disk twin (when the buffer is a loaded module's file - e.g. a dependency
 # source opened via go-to-definition, whose symbols all resolve buffer-locally)
-# must also be project-owned. a buffer with no twin renames buffer-local — unless
+# must also be project-owned. a buffer with no twin renames buffer-local - unless
 # its governing root is a vendored dependency project, whose every file is
 # read-only even outside that root's own graph closure (a vendored dep source the
 # outer project never imports still routes to its own vendored root)
@@ -1262,7 +1262,7 @@ fun renameable(ws: *project.Workspace, root: *project.Root, uri: str, sym: *res.
     ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
 }
 
-# one file contributing references to a target symbol — its Ast, resolve
+# one file contributing references to a target symbol - its Ast, resolve
 # tables, source file, document URI, and the local SymbolId every reference in
 # it resolves to. the active buffer is always the first XRef (live resolve,
 # borrowed URI); each other loaded module that references the symbol is another
@@ -1283,7 +1283,7 @@ rec XRef {
 # BRIDGE_OK:     a canonical (origin, decl) identity resolved; the graph walk
 #                ran and cross-file results are included.
 # BRIDGE_FAILED: the symbol is a module-scope pub declaration but its identity
-#                could not be recovered from the on-disk twin — e.g. unsaved
+#                could not be recovered from the on-disk twin - e.g. unsaved
 #                edits renamed the declaration, so the stale twin does not
 #                export the name. rename must refuse rather than emit the
 #                compile-breaking partial edit a buffer-local fallback would be.
@@ -1300,7 +1300,7 @@ val BRIDGE_FAILED: i64 = 2;
 # passes false to include dependency modules. the canonical identity is read
 # directly for a cross-module reference; for a buffer-local symbol it is bridged
 # through the buffer's on-disk twin, but only when the symbol is a module-scope
-# pub declaration — a block-local binding that shadows a pub symbol's name, or a
+# pub declaration - a block-local binding that shadows a pub symbol's name, or a
 # non-pub declaration, has no importers and must not bridge to one. the bridge
 # outcome is reported in `status` (see BRIDGE_*) so rename can refuse on a
 # failed bridge instead of degrading to a partial buffer-local edit
@@ -1466,7 +1466,7 @@ fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
     k.count = k.count + 1;
 }
 
-# feed every reference to `s.target` in source `s` to the sink — the
+# feed every reference to `s.target` in source `s` to the sink - the
 # declaration name, `use` / `fwd` import-path leaves, and the body (expr / type)
 # use-sites, plus the active buffer's param / generic binding when `include_bind`
 # and its owning decl's matching doc-component name token when `include_doc`. body
