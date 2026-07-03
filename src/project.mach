@@ -433,10 +433,10 @@ fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Resu
     var ctx: comptime.ComptimeCtx;
     if (root != nil) {
         deps = ?root.deps;
-        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
     }
     or {
-        ctx = comptime.init(w.alloc, 0, 0, 0, comptime.MODE_DEBUG, 8, intern.STR_NIL, intern.STR_NIL);
+        ctx = comptime.init(w.alloc, 0, 0, 0, comptime.MODE_DEBUG, 0, 8, intern.STR_NIL, intern.STR_NIL);
     }
 
     val own: sess.ModuleId = own_module(root, fid);
@@ -503,7 +503,7 @@ pub fun sema_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*sema.SemaR
     build_full_sema_deps(w, root, ?deps);
 
     val own: sess.ModuleId = own_module(root, fid);
-    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
     val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, a, rr, ?deps, ?ctx, own);
     comptime.dnit(?ctx);
     free_sema_deps(w, ?deps);
