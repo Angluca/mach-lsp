@@ -2057,6 +2057,34 @@ fun normalize_path(alloc: *Allocator, path: str) str {
 
 # a `file://` URI for an already-normalized absolute path, owned by
 # the caller, or nil on allocation failure
+# a `file://` URI for a SourceFile's `path`, owned by the caller, or
+# nil on allocation failure.
+#
+# the two path spaces a SourceFile can come from are distinguished by the scheme,
+# not by a flag: an editor buffer is registered under its URI (`editor.open` takes
+# the uri as the path), so it already carries `file://` and is copied through,
+# while an on-disk project module carries a filesystem path and gains the scheme.
+# this is what a diagnostic's secondary location needs, since `related` may point
+# into either space - a "previous definition here" in the buffer, or in the
+# dependency module the buffer imports
+# ---
+# alloc: allocator backing the returned URI
+# path:  a SourceFile path
+# ret:   an owned URI, or nil
+pub fun uri_of_path(alloc: *Allocator, path: str) str {
+    if (path == nil) { ret nil; }
+    if (str_starts_with(path, "file://")) {
+        val dr: Result[str, str] = strutil.str_dup(alloc, path);
+        if (is_err[str, str](dr)) { ret nil; }
+        ret unwrap_ok[str, str](dr);
+    }
+    val norm: str = normalize_path(alloc, path);
+    if (norm == nil) { ret nil; }
+    val u: str = norm_uri(alloc, norm);
+    strutil.str_free(alloc, norm);
+    ret u;
+}
+
 fun norm_uri(alloc: *Allocator, norm: str) str {
     val scheme: str = "file://";
     val plen: usize = str_len(norm);
