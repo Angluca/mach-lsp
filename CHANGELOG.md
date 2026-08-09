@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `u8` char literal into `usize` / `i64` arithmetic. Sema types that
   expression at the wider operand and lowering typed it at the literal's own
   width, so mach 4.18 refuses it in its IR verifier (`a conversion's result
-  width contradicts its opcode`) - the compiler's own defect, but the source was
-  relying on the two passes disagreeing. The width the arithmetic happens at is
+  width contradicts its opcode`) - the compiler's own defect (mach#2949), but the
+  source was relying on the two passes disagreeing. The width the arithmetic happens at is
   now stated: `'0'::usize` / `'0'::i64`.
 - hover: a seeded vector type name (`res.SYM_VECTOR`) rendered as `symbol`
   rather than `type`. Pre-existing, unrelated to the pin advance - `kind_label`
@@ -48,8 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$project.version` - the *embedding* project's version - so compiled into
   mls it reports mls's version rather than mach's. Since mach is 4.x and mls is
   0.x, essentially any project adopting the key is refused. The fix belongs
-  upstream: mach must carry its own version independently of whoever compiles
-  the frontend. mls therefore does not declare the key on itself.
+  upstream (mach#2950): mach must carry its own version independently of whoever
+  compiles the frontend. mls therefore does not declare the key on itself.
 
 ## [0.10.0] - 2026-08-07
 
