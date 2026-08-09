@@ -27,9 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mach#2777 made `lp64` mean what it says - soft float, every float in an
   integer register - where it had always emitted hard-float code. The old
   spelling still builds and would have silently changed the emitted calls.
-- manifest: declares `[project] mach = "4.18.0"` (mach#2714), so a toolchain
-  older than the vendored frontend is named as such when the manifest is read
-  rather than failing later against source it cannot parse.
 
 ### Fixed
 - json / transport: the decimal formatters wrote `('0' + (v % 10))::u8`, mixing
@@ -42,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - hover: a seeded vector type name (`res.SYM_VECTOR`) rendered as `symbol`
   rather than `type`. Pre-existing, unrelated to the pin advance - `kind_label`
   enumerated symbol kinds 0..11 and fell through on 12.
+
+### Known issues
+- project: a manifest declaring `[project] mach = "..."` (mach#2714, new in
+  4.15) **fails to load in the editor**, disabling every cross-module feature
+  with `this project requires mach <X> or newer; running 0.10.0`. The vendored
+  frontend reads its own toolchain version from `MACH_VERSION`, which is
+  `$project.version` - the *embedding* project's version - so compiled into
+  mls it reports mls's version rather than mach's. Since mach is 4.x and mls is
+  0.x, essentially any project adopting the key is refused. The fix belongs
+  upstream: mach must carry its own version independently of whoever compiles
+  the frontend. mls therefore does not declare the key on itself.
 
 ## [0.10.0] - 2026-08-07
 
