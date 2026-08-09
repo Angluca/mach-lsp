@@ -517,6 +517,7 @@ pub fun kind_label(kind: res.SymKind) str {
     if (kind == res.SYM_IMPORTED) { ret "import"; }
     if (kind == res.SYM_TEST)     { ret "test"; }
     if (kind == res.SYM_PRIM)     { ret "type"; }
+    if (kind == res.SYM_VECTOR)   { ret "type"; }
     ret "symbol";
 }
 

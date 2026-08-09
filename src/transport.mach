@@ -247,7 +247,7 @@ fun usize_to_buf(buf: *u8, buf_cap: usize, value: usize) usize {
     var pos: usize = buf_cap;
     for (v > 0 && pos > 0) {
         pos = pos - 1;
-        buf[pos] = ('0' + (v % 10))::u8;
+        buf[pos] = ('0'::usize + (v % 10))::u8;
         v = v / 10;
     }
     ret buf_cap - pos;

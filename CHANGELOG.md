@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- deps: **advanced the vendored mach pin `v4.7.1` → `v4.18.0`** and mach-std
+  `0.22.0` → `0.26.0`. The server analyzes buffers with the vendored compiler
+  frontend, so the pin *is* the language version the editor understands: frozen
+  at 4.7.1 it reported everything added since - `#[packed]`, a declaration-scope
+  `$if` measuring a layout, `$size_of` / `$align_of` / `$length_of` folding in a
+  comptime gate, the `#[handle]` / `#[op]` target-owned type and operation
+  declarations, riscv32 and the `ilp32` ABI family - as an error against source
+  the installed compiler accepts.
+- deps: repairs the one frontend API drift the advance surfaces. `comptime.init`
+  takes the target's `vector_bits` between `pointer_width` and the compiler
+  name, and the target's operation / type-constructor table now reaches the
+  front end as data on the comptime context (mach#2888), so a buffer resolving
+  under a project seeds `set_target_defs` from its own target the way the
+  compiler's own driver does. Without it a `#[handle]` or `#[op]` declaration
+  resolves against no definitions at all.
+- manifest: `linux-riscv64` moves from `abi = "lp64"` to `abi = "lp64d"`.
+  mach#2777 made `lp64` mean what it says - soft float, every float in an
+  integer register - where it had always emitted hard-float code. The old
+  spelling still builds and would have silently changed the emitted calls.
+- manifest: declares `[project] mach = "4.18.0"` (mach#2714), so a toolchain
+  older than the vendored frontend is named as such when the manifest is read
+  rather than failing later against source it cannot parse.
+
+### Fixed
+- json / transport: the decimal formatters wrote `('0' + (v % 10))::u8`, mixing
+  a `u8` char literal into `usize` / `i64` arithmetic. Sema types that
+  expression at the wider operand and lowering typed it at the literal's own
+  width, so mach 4.18 refuses it in its IR verifier (`a conversion's result
+  width contradicts its opcode`) - the compiler's own defect, but the source was
+  relying on the two passes disagreeing. The width the arithmetic happens at is
+  now stated: `'0'::usize` / `'0'::i64`.
+- hover: a seeded vector type name (`res.SYM_VECTOR`) rendered as `symbol`
+  rather than `type`. Pre-existing, unrelated to the pin advance - `kind_label`
+  enumerated symbol kinds 0..11 and fell through on 12.
+
 ## [0.10.0] - 2026-08-07
 
 ### Added
