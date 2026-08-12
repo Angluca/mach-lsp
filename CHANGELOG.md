@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- project: replaced the shared-session, manually re-resolved graph with one
+  stable compiler Session and retained `analyze_project` snapshot per root.
+  Open document text is mirrored as filesystem overlays with explicit input and
+  snapshot revisions; resolve, sema, generics, diagnostics, target/profile,
+  `$project`, `$bin`, aliases, and dependency exports now come from compiler-owned
+  ModuleEntries. Source content fingerprints, acknowledged watcher registration,
+  `didSave`, and failed-snapshot retry keep snapshots current. (#141)
+- documents: now own URI, canonical path, live text, LSP version, and a monotonic
+  mutation revision independently of the editor fallback. Published diagnostics
+  carry the matching document version.
 - deps: **advanced the vendored mach pin `v4.7.1` → `v4.18.0`** and mach-std
   `0.22.0` → `0.26.0`. The server analyzes buffers with the vendored compiler
   frontend, so the pin *is* the language version the editor understands: frozen
