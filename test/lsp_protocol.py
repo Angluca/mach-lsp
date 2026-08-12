@@ -126,6 +126,10 @@ class LspSession:
         self._send({"jsonrpc": "2.0", "id": request.get("id"),
                     "error": {"code": code, "message": message}})
 
+    def respond_result(self, request: dict[str, Any], result: Any = None) -> None:
+        """Acknowledge one server-initiated request."""
+        self._send({"jsonrpc": "2.0", "id": request.get("id"), "result": result})
+
     def wait_for(
         self,
         predicate: Callable[[dict[str, Any]], bool],
@@ -275,14 +279,15 @@ need = []
     import_line = (f"use {alias}: {project_id}.defs;\n"
                    f"use {project_id}.defs.answer;\n"
                    f"use {project_id}.defs.Box;\n"
-                   f"use {project_id}.defs.take;")
+                   f"use {project_id}.defs.take;\n"
+                   f"use {project_id}.defs.watched;")
     answer_expr = "answer"
     text = f"""{import_line}
 
 pub fun main() i32 {{
     var b: Box[i32];
     b.v = {value};
-    ret take[i32](b) + {answer_expr} + {alias}.answer;
+    ret take[i32](b) + {answer_expr} + {alias}.answer + watched;
 }}
 """
     main = source / "main.mach"
@@ -292,6 +297,7 @@ pub fun main() i32 {{
         f'''$if ($project.target.os != "linux") {{ $error("wrong selected target"); }}
 $if ($bin.name != "app") {{ $error("wrong selected artifact"); }}
 pub val answer: i32 = {value};
+pub val watched: i32 = {value};
 pub rec Box[T] {{ v: T; }}
 pub fun take[T](b: Box[T]) i32 {{ ret 7; }}
 ''',
@@ -336,9 +342,15 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
     with tempfile.TemporaryDirectory(prefix="mls-protocol-") as directory:
         root = Path(directory).resolve()
         alpha = write_project(root, "alpha", 11)
+        alpha_manifest_path = alpha[0].parents[1] / "mach.toml"
+        alpha_manifest_path.write_text(
+            alpha_manifest_path.read_text(encoding="utf-8").replace('src = "src"', 'src = "./src"'),
+            encoding="utf-8",
+        )
         beta = write_project(root, "beta", 22)
         shared_left = write_project(root / "left", "shared", 31)
         shared_right = write_project(root / "right", "shared", 41)
+        nested = write_project(alpha[0].parent / "nested", "nested", 51)
         scratch_uri = (root / "scratch.mach").as_uri()
         session = LspSession(server, root, timeout)
         finished = False
@@ -401,6 +413,14 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             assert_definition(session, *alpha)
             assert_definition(session, *beta)
             assert_definition(session, *alpha)
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": nested[0].as_uri(), "languageId": "mach",
+                                  "version": 1, "text": nested[2]}},
+            )
+            assert_diagnostics(session.diagnostics(nested[0].as_uri()), False, 1)
+            assert_definition(session, *nested)
+            assert_definition(session, *alpha)
             for main, _, text in (shared_left, shared_right):
                 session.notify(
                     "textDocument/didOpen",
@@ -411,6 +431,16 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             assert_definition(session, *shared_left)
             assert_definition(session, *shared_right)
             assert_definition(session, *shared_left)
+            shared_left_v2 = shared_left[2] + "\n"
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": shared_left[0].as_uri(), "version": 2},
+                 "contentChanges": [{"text": shared_left_v2}]},
+            )
+            session.diagnostics(shared_left[0].as_uri())
+            assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
+            assert_definition(session, *shared_right)
+            assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
 
             # A rejected dynamic registration must leave manifest fingerprint
             # fallback active: a broken manifest disables the snapshot, and a
@@ -492,10 +522,57 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             for main, _, _ in (shared_left, shared_right):
                 session.notify("textDocument/didClose", {"textDocument": {"uri": main.as_uri()}})
             session.notify("textDocument/didClose", {"textDocument": {"uri": alpha_def.as_uri()}})
+            session.notify("textDocument/didClose", {"textDocument": {"uri": nested[0].as_uri()}})
 
             telemetry = session.finish()
             finished = True
             return telemetry, session.timings
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_active_watcher_fallback(server: Path, timeout: float) -> None:
+    """Prove a missed source event is recovered even after watcher ACK."""
+    with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "watch", 9)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request(
+                "initialize",
+                {"rootUri": root.as_uri(), "capabilities": {"workspace": {
+                    "didChangeWatchedFiles": {"dynamicRegistration": True}}}},
+            )
+            session.notify("initialized", {})
+            registration = session.wait_for(
+                lambda item: item.get("method") == "client/registerCapability",
+                "watch registration",
+            )
+            session.respond_result(registration)
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri())
+            assert_definition(session, main, defs, text)
+
+            changed = defs.read_text(encoding="utf-8").replace(
+                "pub val watched: i32", "pub val watched: i64")
+            defs.write_text(changed, encoding="utf-8")
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
+            hover = session.request(
+                "textDocument/hover",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": line, "character": lines[line].index("watched") + 1}},
+            )
+            require("i64" in json.dumps(hover.get("result")),
+                    f"active watcher suppressed source fingerprint fallback: {hover!r}")
+            session.finish()
+            finished = True
         finally:
             if not finished:
                 session.abort()
@@ -593,6 +670,7 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        run_active_watcher_fallback(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)

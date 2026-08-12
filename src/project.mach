@@ -702,7 +702,7 @@ fun sync_overlays(w: *Workspace, r: *Root) Result[bool, str] {
     var i: usize = 0;
     for (i < n) {
         val d: *documents.Document = documents.at(w.docs, i);
-        if (d != nil && d.in_use && d.path != nil) {
+        if (d != nil && d.in_use && d.path != nil && document_belongs(w, r, d.path)) {
             val sr: Result[bool, str] = sess.set_overlay(r.s, d.path, d.text);
             if (is_err[bool, str](sr)) { ret sr; }
             if (d.revision > latest) { latest = d.revision; }
@@ -744,7 +744,8 @@ fun collect_extra_roots(w: *Workspace, r: *Root, m: *manifest.Manifest, out: **i
     var i: usize = 0;
     for (i < n) {
         val d: *documents.Document = documents.at(w.docs, i);
-        if (d != nil && d.in_use && d.path != nil && is_under(d.path, src_norm)) {
+        if (d != nil && d.in_use && d.path != nil && is_under(d.path, src_norm)
+            && document_own_root(w, r, d.path)) {
             # Also mirror under the driver's exact `<root>/<manifest src>/<rel>`
             # spelling. Manifests may use `./src`; overlays are exact path keys.
             val raw_src_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, r.path, unwrap[str](so));
@@ -833,22 +834,25 @@ fun build_mod_paths(w: *Workspace, r: *Root) {
         deallocate[str](w.alloc, unwrap_ok[*str, str](arr_r), n::usize);
         ret;
     }
-    r.mod_paths      = unwrap_ok[*str, str](arr_r);
-    r.mod_fingerprints = unwrap_ok[*SourceFingerprint, str](mt_r);
-    r.mod_path_count = n;
+    val paths: *str = unwrap_ok[*str, str](arr_r);
+    val fingerprints: *SourceFingerprint = unwrap_ok[*SourceFingerprint, str](mt_r);
 
     var i: u32 = 0;
     for (i < n) {
-        r.mod_paths[i] = nil;
-        r.mod_fingerprints[i].mtime = 0;
-        r.mod_fingerprints[i].size = 0;
+        paths[i] = nil;
+        fingerprints[i].mtime = 0;
+        fingerprints[i].size = 0;
         val fo: Option[*src.SourceFile] = src.get(?r.s.sources, (?r.p.modules[i]).file_id);
         if (is_some[*src.SourceFile](fo)) {
-            r.mod_paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
-            if (r.mod_paths[i] != nil) { r.mod_fingerprints[i] = file_fingerprint(r.mod_paths[i]); }
+            paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
+            if (paths[i] != nil) { fingerprints[i] = file_fingerprint(paths[i]); }
         }
         i = i + 1;
     }
+    free_mod_paths(w, r);
+    r.mod_paths = paths;
+    r.mod_fingerprints = fingerprints;
+    r.mod_path_count = n;
 }
 
 # release the per-module normalized path snapshot
@@ -909,7 +913,7 @@ pub fun document_changed(w: *Workspace, d: *documents.Document) Result[bool, str
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.path != nil && r.s != nil) {
+        if (r.path != nil && r.s != nil && document_belongs(w, r, d.path)) {
             r.input_revision = d.revision;
         }
         i = i + 1;
@@ -924,7 +928,7 @@ pub fun document_closed(w: *Workspace, d: *documents.Document) {
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.path != nil && r.s != nil) {
+        if (r.path != nil && r.s != nil && document_belongs(w, r, d.path)) {
             sess.clear_overlay(r.s, d.path);
             r.input_revision = d.revision;
         }
@@ -980,10 +984,24 @@ fun is_under(file: str, dir: str) bool {
     ret file[dl] == '/';
 }
 
+fun document_own_root(w: *Workspace, r: *Root, path: str) bool {
+    val own: str = project_root_for(w.alloc, path);
+    if (own == nil) { ret false; }
+    val matches: bool = str_equals(own, r.path);
+    strutil.str_free(w.alloc, own);
+    ret matches;
+}
+
+fun document_belongs(w: *Workspace, r: *Root, path: str) bool {
+    if (document_own_root(w, r, path)) { ret true; }
+    ret is_some[sess.ModuleId](module_for_norm(r, path));
+}
+
 # release a root's graph, dep snapshot, and owned path, resetting
 # the slot for reuse
 fun free_root(w: *Workspace, r: *Root) {
     free_root_graph(w, r);
+    free_mod_paths(w, r);
     if (r.s != nil) {
         sess.dnit(r.s);
         deallocate[sess.Session](w.alloc, r.s, 1);
@@ -999,7 +1017,6 @@ fun free_root(w: *Workspace, r: *Root) {
 # reclaims them rather than leaving them for the whole-cache sweep), and the
 # generation is cleared so a later build claims a fresh, non-matching one
 fun free_root_graph(w: *Workspace, r: *Root) {
-    free_mod_paths(w, r);
     if (r.loaded) {
         driver.dnit_project(?r.p);
         r.loaded = false;
