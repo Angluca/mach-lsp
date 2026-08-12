@@ -86,6 +86,7 @@ pub rec Site {
 rec SourceFingerprint {
     mtime: i64;
     size:  usize;
+    hash:  u64;
 }
 
 # one project root and its compiler-owned semantic snapshot
@@ -842,10 +843,11 @@ fun build_mod_paths(w: *Workspace, r: *Root) {
         paths[i] = nil;
         fingerprints[i].mtime = 0;
         fingerprints[i].size = 0;
+        fingerprints[i].hash = 0;
         val fo: Option[*src.SourceFile] = src.get(?r.s.sources, (?r.p.modules[i]).file_id);
         if (is_some[*src.SourceFile](fo)) {
             paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
-            if (paths[i] != nil) { fingerprints[i] = file_fingerprint(paths[i]); }
+            if (paths[i] != nil) { fingerprints[i] = file_fingerprint(w.alloc, paths[i]); }
         }
         i = i + 1;
     }
@@ -883,8 +885,9 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     var i: u32 = 0;
     for (!changed && r.loaded && i < r.mod_path_count) {
         if (r.mod_paths[i] != nil) {
-            val fp: SourceFingerprint = file_fingerprint(r.mod_paths[i]);
-            if (fp.mtime != r.mod_fingerprints[i].mtime || fp.size != r.mod_fingerprints[i].size) { changed = true; }
+            val fp: SourceFingerprint = file_fingerprint(w.alloc, r.mod_paths[i]);
+            if (fp.mtime != r.mod_fingerprints[i].mtime || fp.size != r.mod_fingerprints[i].size
+                || fp.hash != r.mod_fingerprints[i].hash) { changed = true; }
         }
         i = i + 1;
     }
@@ -1054,15 +1057,25 @@ fun join_mtime(alloc: *Allocator, dir: str, name: str) i64 {
     ret m;
 }
 
-fun file_fingerprint(path: str) SourceFingerprint {
+fun file_fingerprint(alloc: *Allocator, path: str) SourceFingerprint {
     var fp: SourceFingerprint;
     fp.mtime = 0;
     fp.size = 0;
+    fp.hash = 0;
     val fi_r: Result[fs.Metadata, str] = fs.metadata(path);
     if (is_err[fs.Metadata, str](fi_r)) { ret fp; }
     var fi: fs.Metadata = unwrap_ok[fs.Metadata, str](fi_r);
     fp.mtime = chrono.time_unix_nsec(fi.modified);
     fp.size = fi.size;
+    val text_r: Result[str, str] = fs.read_string(alloc, path);
+    if (!is_err[str, str](text_r)) {
+        val text: str = unwrap_ok[str, str](text_r);
+        var h: u64 = 14695981039346656037;
+        var i: usize = 0;
+        for (i < str_len(text)) { h = (h ^ text[i]::u64) * 1099511628211; i = i + 1; }
+        fp.hash = h;
+        strutil.str_free(alloc, text);
+    }
     ret fp;
 }
 
