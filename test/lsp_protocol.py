@@ -464,8 +464,7 @@ def main() -> int:
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
         require(suppressed_status == 1, f"suppressed SIGPIPE: expected exit 1, got {suppressed_status}")
-        if os.name != "posix" or closed_stdout_status != -signal.SIGPIPE:
-            require(closed_stdout_status == 1, f"closed stdout reader: expected exit 1, got {closed_stdout_status}")
+        require(closed_stdout_status == 1, f"closed stdout reader: expected exit 1, got {closed_stdout_status}")
     except Exception as error:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
@@ -473,10 +472,7 @@ def main() -> int:
     print("  clean EOF after shutdown: exit 0")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
-    if os.name == "posix" and closed_stdout_status == -signal.SIGPIPE:
-        print("  closed stdout reader: SIGPIPE (blocked by mach-std#468)")
-    else:
-        print("  closed stdout reader: exit 1")
+    print("  closed stdout reader: exit 1")
     for label, duration in timings:
         print(f"  {label}: {duration:.3f}s")
     return 0

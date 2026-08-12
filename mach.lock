@@ -3,9 +3,9 @@
 [dep.mach-std]
 url = "https://github.com/briar-systems/mach-std"
 ref = "branch/main"
-commit = "f6967775d79eb780207140596581abbf7bf78be3"
+commit = "43e8cb7af860b21ff8ce22a61d1335ecb5f5ea05"
 
 [dep.mach]
 url = "https://github.com/briar-systems/mach"
 ref = "branch/dev"
-commit = "291c5975d95914779bb56b1f55ede1677ff2a992"
+commit = "66a56e1c95a17af8e88fc8d828a709acb094abc2"
