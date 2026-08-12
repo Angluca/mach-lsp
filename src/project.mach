@@ -105,6 +105,7 @@ rec SourceFingerprint {
 # snapshot_revision: input revision captured by p
 # attempted_revision:last input revision analyzed, including a failed attempt
 # dirty:             explicit watcher/save invalidation requiring one attempt
+# last_disk_scan_ns: last fallback fingerprint scan time
 pub rec Root {
     path:           str;
     loaded:         bool;
@@ -120,6 +121,7 @@ pub rec Root {
     snapshot_revision: u64;
     attempted_revision: u64;
     dirty:           bool;
+    last_disk_scan_ns: i64;
 }
 
 # project roots and the standalone-editor fallback
@@ -128,7 +130,6 @@ pub rec Root {
 # alloc:        workspace allocator
 # roots:        movable Root slots; each Root.s itself has a stable allocation
 # root_cap:     roots allocation length
-# watch_active: confirmed client watcher state
 # load_epoch:   successful snapshot build counter
 # sema_epoch:   semantic snapshot build counter
 # docs:         borrowed live document store
@@ -137,7 +138,6 @@ pub rec Workspace {
     alloc:        *Allocator;
     roots:        *Root;
     root_cap:     u32;
-    watch_active: bool;
     load_epoch:   u32;
     sema_epoch:   u32;
     docs:         *documents.Store;
@@ -154,7 +154,6 @@ pub fun init(s: *sess.Session, alloc: *Allocator) Workspace {
     w.alloc         = alloc;
     w.roots         = nil;
     w.root_cap      = 0;
-    w.watch_active  = false;
     w.load_epoch    = 0;
     w.sema_epoch    = 0;
     w.docs          = nil;
@@ -180,17 +179,6 @@ pub fun type_interner(w: *Workspace, root: *Root) *type.TypeInterner {
     ret ?w.s.types;
 }
 
-# record that the client delivers
-# workspace/didChangeWatchedFiles for the registered manifest / lockfile /
-# source globs, so invalidation is event-driven and the per-request
-# manifest-mtime fallback check is skipped
-# ---
-# w:  the workspace
-# on: whether file watching is active
-pub fun set_watch_active(w: *Workspace, on: bool) {
-    w.watch_active = on;
-}
-
 # the workspace's current load epoch - a counter bumped on every
 # successful root build. the server snapshots it around a feature request; a
 # change means a lazy project load completed, so the open buffers it now governs
@@ -203,12 +191,8 @@ pub fun load_epoch(w: *Workspace) u32 {
     ret w.load_epoch;
 }
 
-# the workspace's current sema epoch - a counter bumped whenever a
-# root's dep closure finishes typing (ensure_sema). the server snapshots it around
-# a feature request alongside the load epoch; a change means a type-aware feature
-# lazily sema'd a closure, so the open buffers it governs can be re-published with
-# their semantic diagnostics - which the load-free publish path could not produce
-# while the closure was still un-sema'd - without waiting for an edit (#113)
+# the workspace's semantic snapshot epoch, bumped with each successful retained
+# frontend analysis
 # ---
 # w:   the workspace
 # ret: the current sema epoch
@@ -319,7 +303,18 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
     val above: *Root = ancestor_root(w, uri, doc_root, anc);
     if (above != nil) { strutil.str_free(w.alloc, anc); ret above; }
 
-    if (find_root(w, anc) != nil || !vendors_enclosing(w, anc, doc_root)) {
+    val tracked: *Root = find_root(w, anc);
+    if (tracked != nil) {
+        maybe_reload(w, tracked);
+        refresh_inputs(w, tracked);
+        if (tracked.loaded && is_some[sess.ModuleId](module_for_uri(w, tracked, uri))) {
+            strutil.str_free(w.alloc, anc);
+            ret tracked;
+        }
+        strutil.str_free(w.alloc, anc);
+        ret nil;
+    }
+    if (!vendors_enclosing(w, anc, doc_root)) {
         strutil.str_free(w.alloc, anc);
         ret nil;
     }
@@ -332,7 +327,7 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
 
 # whether the project at `root_path` declares a dependency
 # whose vendor dir encloses `dir` - i.e. `dir` equals or lies under
-# `<root>/<[project].dep>/<alias>` for some `[deps.<alias>]`, the same layout the
+# `<root>/<[project].dep>/<alias>` for some `[dep.<alias>]`, the same layout the
 # driver's dep resolution reads. one small manifest parse answers "could this
 # project's dependency tree contain that nested root?" without paying a full
 # graph build; the loaded graph remains the authority on actual containment.
@@ -538,6 +533,7 @@ fun reset_slot(r: *Root) {
     r.snapshot_revision = 0;
     r.attempted_revision = 0;
     r.dirty = false;
+    r.last_disk_scan_ns = 0;
 }
 
 # a reusable dead slot, growing the array when every slot is
@@ -571,16 +567,8 @@ fun alloc_slot(w: *Workspace) *Root {
     ret ?w.roots[old_cap];
 }
 
-# run build_project_union for `r.path` and snapshot the dep set into
-# `r` (the union of every declared target's closure, so cross-file features cover
-# modules reachable only via a non-default target).
-# the manifest / lockfile mtimes are recorded at the start of the attempt
-# whether it succeeds or fails, so maybe_reload retries a failed root once those
-# files change instead of pinning the failure for the session. a failure is
-# surfaced (trace log + window/showMessage); on success the root claims a fresh
-# generation stamp, so any result resolved before the load (against the empty dep
-# set and the pre-load own_base, stamped a different generation) misses the cache
-# rather than being served stale
+# compose the selected primary artifact request and retain the compiler-owned
+# load/resolve/sema snapshot for `r.path`
 fun try_load(w: *Workspace, r: *Root) bool {
     record_mtimes(w, r);
     r.dirty = false;
@@ -658,10 +646,16 @@ fun try_load(w: *Workspace, r: *Root) bool {
 
     r.p        = unwrap_ok[driver.Project, outcome.Fail](pr);
     r.loaded   = true;
+    val bpr: Result[bool, str] = build_mod_paths(w, r);
+    if (is_err[bool, str](bpr)) {
+        driver.dnit_project(?r.p);
+        r.loaded = false;
+        report_load_failure(w, r.path, unwrap_err[bool, str](bpr));
+        ret false;
+    }
     r.snapshot_revision = r.input_revision;
     w.load_epoch = w.load_epoch + 1;
     w.sema_epoch = w.sema_epoch + 1;
-    build_mod_paths(w, r);
     ret true;
 }
 
@@ -704,7 +698,7 @@ fun sync_overlays(w: *Workspace, r: *Root) Result[bool, str] {
     for (i < n) {
         val d: *documents.Document = documents.at(w.docs, i);
         if (d != nil && d.in_use && d.path != nil && document_belongs(w, r, d.path)) {
-            val sr: Result[bool, str] = sess.set_overlay(r.s, d.path, d.text);
+            val sr: Result[bool, str] = set_document_overlay(w, r, d);
             if (is_err[bool, str](sr)) { ret sr; }
             if (d.revision > latest) { latest = d.revision; }
         }
@@ -712,6 +706,62 @@ fun sync_overlays(w: *Workspace, r: *Root) Result[bool, str] {
     }
     r.input_revision = latest;
     ret ok[bool, str](true);
+}
+
+# install an open document under both its canonical path and the exact raw
+# `<project root>/<manifest src>/<relative module>` spelling the compiler driver
+# currently constructs. The second key covers `src = "./src"` in project and
+# dependency manifests until Mach #2998 centralizes normalization upstream.
+fun set_document_overlay(w: *Workspace, r: *Root, d: *documents.Document) Result[bool, str] {
+    val nr: Result[bool, str] = sess.set_overlay(r.s, d.path, d.text);
+    if (is_err[bool, str](nr)) { ret nr; }
+    val own: str = project_root_for(w.alloc, d.path);
+    if (own == nil) { ret ok[bool, str](true); }
+    val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, own, "mach.toml");
+    if (is_err[pathlib.Path, str](mp_r)) {
+        strutil.str_free(w.alloc, own);
+        ret err[bool, str](unwrap_err[pathlib.Path, str](mp_r));
+    }
+    val mp: str = unwrap_ok[pathlib.Path, str](mp_r);
+    val text_r: Result[str, str] = fs.read_string(w.alloc, mp);
+    strutil.str_free(w.alloc, mp);
+    if (is_err[str, str](text_r)) {
+        strutil.str_free(w.alloc, own);
+        ret err[bool, str](unwrap_err[str, str](text_r));
+    }
+    val text: str = unwrap_ok[str, str](text_r);
+    val table_r: Result[toml.Table, str] = toml.parse(w.alloc, text);
+    strutil.str_free(w.alloc, text);
+    if (is_err[toml.Table, str](table_r)) {
+        strutil.str_free(w.alloc, own);
+        ret err[bool, str](unwrap_err[toml.Table, str](table_r));
+    }
+    var table: toml.Table = unwrap_ok[toml.Table, str](table_r);
+    val src_dir: str = toml.get_str(?table, "project.src");
+    if (src_dir == nil) { strutil.str_free(w.alloc, own); ret ok[bool, str](true); }
+    val raw_src_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, own, src_dir);
+    strutil.str_free(w.alloc, own);
+    if (is_err[pathlib.Path, str](raw_src_r)) { ret err[bool, str](unwrap_err[pathlib.Path, str](raw_src_r)); }
+    val raw_src: str = unwrap_ok[pathlib.Path, str](raw_src_r);
+    val src_norm: str = normalize_path(w.alloc, raw_src);
+    if (src_norm == nil) {
+        strutil.str_free(w.alloc, raw_src);
+        ret err[bool, str]("project: failed to normalize document source directory");
+    }
+    if (!is_under(d.path, src_norm) || str_len(d.path) <= str_len(src_norm)) {
+        strutil.str_free(w.alloc, src_norm);
+        strutil.str_free(w.alloc, raw_src);
+        ret ok[bool, str](true);
+    }
+    val raw_path_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, raw_src,
+        (d.path::usize + str_len(src_norm) + 1)::str);
+    strutil.str_free(w.alloc, src_norm);
+    strutil.str_free(w.alloc, raw_src);
+    if (is_err[pathlib.Path, str](raw_path_r)) { ret err[bool, str](unwrap_err[pathlib.Path, str](raw_path_r)); }
+    val raw_path: str = unwrap_ok[pathlib.Path, str](raw_path_r);
+    val rr: Result[bool, str] = sess.set_overlay(r.s, raw_path, d.text);
+    strutil.str_free(w.alloc, raw_path);
+    ret rr;
 }
 
 # build compiler-owned extra roots for open files under this project's source
@@ -747,31 +797,6 @@ fun collect_extra_roots(w: *Workspace, r: *Root, m: *manifest.Manifest, out: **i
         val d: *documents.Document = documents.at(w.docs, i);
         if (d != nil && d.in_use && d.path != nil && is_under(d.path, src_norm)
             && document_own_root(w, r, d.path)) {
-            # Also mirror under the driver's exact `<root>/<manifest src>/<rel>`
-            # spelling. Manifests may use `./src`; overlays are exact path keys.
-            val raw_src_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, r.path, unwrap[str](so));
-            if (is_err[pathlib.Path, str](raw_src_r)) {
-                strutil.str_free(w.alloc, src_norm);
-                deallocate[intern.StrId](w.alloc, roots, n);
-                ret err[u32, str](unwrap_err[pathlib.Path, str](raw_src_r));
-            }
-            val raw_src: str = unwrap_ok[pathlib.Path, str](raw_src_r);
-            val raw_path_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, raw_src,
-                (d.path::usize + str_len(src_norm) + 1)::str);
-            strutil.str_free(w.alloc, raw_src);
-            if (is_err[pathlib.Path, str](raw_path_r)) {
-                strutil.str_free(w.alloc, src_norm);
-                deallocate[intern.StrId](w.alloc, roots, n);
-                ret err[u32, str](unwrap_err[pathlib.Path, str](raw_path_r));
-            }
-            val raw_path: str = unwrap_ok[pathlib.Path, str](raw_path_r);
-            val orr: Result[bool, str] = sess.set_overlay(r.s, raw_path, d.text);
-            strutil.str_free(w.alloc, raw_path);
-            if (is_err[bool, str](orr)) {
-                strutil.str_free(w.alloc, src_norm);
-                deallocate[intern.StrId](w.alloc, roots, n);
-                ret err[u32, str](unwrap_err[bool, str](orr));
-            }
             val fr: Result[intern.StrId, str] = document_fqn(r, unwrap[str](io), src_norm, d.path);
             if (is_err[intern.StrId, str](fr)) {
                 strutil.str_free(w.alloc, src_norm);
@@ -816,24 +841,20 @@ fun document_fqn(r: *Root, id_text: str, src_dir: str, path: str) Result[intern.
     ret ir;
 }
 
-# hand out a fresh generation stamp. each successful build claims one,
-# so a cache entry's generation identifies its exact build and a reloaded or
-# freed root's stale entries can never match a later build. 0 is the reserved
-# unloaded / single-file sentinel and is skipped if the sequence ever wraps
 # snapshot every loaded module's normalized source path into
 # `r.mod_paths`, indexed by module id, so the per-request uri -> module lookups
-# are allocation-free string compares. a source that cannot be read or
-# normalized leaves a nil entry, making that module unmatchable by uri (the
-# same outcome the per-request normalization had)
-fun build_mod_paths(w: *Workspace, r: *Root) {
+# are allocation-free string compares. replacement is transactional: a failed
+# allocation or normalization rejects the new Project and preserves the last
+# successful path/fingerprint set for disk-change retry detection.
+fun build_mod_paths(w: *Workspace, r: *Root) Result[bool, str] {
     val n: u32 = r.p.module_len;
-    if (n == 0) { ret; }
+    if (n == 0) { free_mod_paths(w, r); ret ok[bool, str](true); }
     val arr_r: Result[*str, str] = allocate[str](w.alloc, n::usize);
-    if (is_err[*str, str](arr_r)) { ret; }
+    if (is_err[*str, str](arr_r)) { ret err[bool, str](unwrap_err[*str, str](arr_r)); }
     val mt_r: Result[*SourceFingerprint, str] = allocate[SourceFingerprint](w.alloc, n::usize);
     if (is_err[*SourceFingerprint, str](mt_r)) {
         deallocate[str](w.alloc, unwrap_ok[*str, str](arr_r), n::usize);
-        ret;
+        ret err[bool, str](unwrap_err[*SourceFingerprint, str](mt_r));
     }
     val paths: *str = unwrap_ok[*str, str](arr_r);
     val fingerprints: *SourceFingerprint = unwrap_ok[*SourceFingerprint, str](mt_r);
@@ -845,28 +866,39 @@ fun build_mod_paths(w: *Workspace, r: *Root) {
         fingerprints[i].size = 0;
         fingerprints[i].hash = 0;
         val fo: Option[*src.SourceFile] = src.get(?r.s.sources, (?r.p.modules[i]).file_id);
-        if (is_some[*src.SourceFile](fo)) {
-            paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
-            if (paths[i] != nil) { fingerprints[i] = file_fingerprint(w.alloc, paths[i]); }
+        if (!is_some[*src.SourceFile](fo)) {
+            free_path_snapshot(w.alloc, paths, fingerprints, n, i);
+            ret err[bool, str]("project: loaded module source is unavailable");
         }
+        paths[i] = normalize_path(w.alloc, unwrap[*src.SourceFile](fo).path);
+        if (paths[i] == nil) {
+            free_path_snapshot(w.alloc, paths, fingerprints, n, i);
+            ret err[bool, str]("project: failed to normalize loaded module path");
+        }
+        fingerprints[i] = file_fingerprint(w.alloc, paths[i]);
         i = i + 1;
     }
     free_mod_paths(w, r);
     r.mod_paths = paths;
     r.mod_fingerprints = fingerprints;
     r.mod_path_count = n;
+    ret ok[bool, str](true);
+}
+
+fun free_path_snapshot(alloc: *Allocator, paths: *str, fingerprints: *SourceFingerprint, cap: u32, initialized: u32) {
+    var i: u32 = 0;
+    for (i < initialized) {
+        if (paths[i] != nil) { strutil.str_free(alloc, paths[i]); }
+        i = i + 1;
+    }
+    deallocate[str](alloc, paths, cap::usize);
+    deallocate[SourceFingerprint](alloc, fingerprints, cap::usize);
 }
 
 # release the per-module normalized path snapshot
 fun free_mod_paths(w: *Workspace, r: *Root) {
     if (r.mod_paths == nil) { ret; }
-    var i: u32 = 0;
-    for (i < r.mod_path_count) {
-        if (r.mod_paths[i] != nil) { strutil.str_free(w.alloc, r.mod_paths[i]); }
-        i = i + 1;
-    }
-    deallocate[str](w.alloc, r.mod_paths, r.mod_path_count::usize);
-    if (r.mod_fingerprints != nil) { deallocate[SourceFingerprint](w.alloc, r.mod_fingerprints, r.mod_path_count::usize); }
+    free_path_snapshot(w.alloc, r.mod_paths, r.mod_fingerprints, r.mod_path_count, r.mod_path_count);
     r.mod_paths      = nil;
     r.mod_fingerprints = nil;
     r.mod_path_count = 0;
@@ -878,12 +910,15 @@ fun free_mod_paths(w: *Workspace, r: *Root) {
 # root whose previous load failed. watcher delivery improves latency but does
 # not disable this correctness fallback. a no-op when nothing changed
 fun maybe_reload(w: *Workspace, r: *Root) {
+    val now: i64 = chrono.time_unix_nsec(chrono.monotonic());
+    if (!r.dirty && r.last_disk_scan_ns != 0 && now - r.last_disk_scan_ns < 250000000) { ret; }
+    r.last_disk_scan_ns = now;
     var man:  i64 = 0;
     var lock: i64 = 0;
     stat_mtimes(w, r.path, ?man, ?lock);
     var changed: bool = man != r.man_mtime || lock != r.lock_mtime;
     var i: u32 = 0;
-    for (!changed && r.loaded && i < r.mod_path_count) {
+    for (!changed && i < r.mod_path_count) {
         if (r.mod_paths[i] != nil) {
             val fp: SourceFingerprint = file_fingerprint(w.alloc, r.mod_paths[i]);
             if (fp.mtime != r.mod_fingerprints[i].mtime || fp.size != r.mod_fingerprints[i].size
@@ -996,12 +1031,26 @@ fun document_own_root(w: *Workspace, r: *Root, path: str) bool {
 }
 
 fun document_belongs(w: *Workspace, r: *Root, path: str) bool {
-    if (document_own_root(w, r, path)) { ret true; }
-    ret is_some[sess.ModuleId](module_for_norm(r, path));
+    val own: str = project_root_for(w.alloc, path);
+    if (own != nil && str_equals(own, r.path)) {
+        strutil.str_free(w.alloc, own);
+        ret true;
+    }
+    if (is_some[sess.ModuleId](module_for_norm(r, path))) {
+        if (own != nil) { strutil.str_free(w.alloc, own); }
+        ret true;
+    }
+    # Before the first successful graph there are no retained module paths to
+    # identify an open vendored dependency. Its declaring ancestor is the only
+    # additional root allowed to mirror it; unrelated nested projects remain
+    # isolated.
+    var vendored: bool = false;
+    if (own != nil && r.mod_path_count == 0) { vendored = vendors_enclosing(w, r.path, own); }
+    if (own != nil) { strutil.str_free(w.alloc, own); }
+    ret vendored;
 }
 
-# release a root's graph, dep snapshot, and owned path, resetting
-# the slot for reuse
+# release a root's retained Project, source index, Session, and owned path
 fun free_root(w: *Workspace, r: *Root) {
     free_root_graph(w, r);
     free_mod_paths(w, r);
@@ -1014,11 +1063,8 @@ fun free_root(w: *Workspace, r: *Root) {
     reset_slot(r);
 }
 
-# release a root's dep snapshot, module-path snapshot, and
-# loaded project, leaving the slot tracked with its path so it can reload in
-# place. the build's cached resolve results are evicted first (so a teardown
-# reclaims them rather than leaving them for the whole-cache sweep), and the
-# generation is cleared so a later build claims a fresh, non-matching one
+# release the retained Project while preserving the root, Session, and last
+# successful source index so a failed rebuild can detect a later disk repair
 fun free_root_graph(w: *Workspace, r: *Root) {
     if (r.loaded) {
         driver.dnit_project(?r.p);
@@ -1243,13 +1289,7 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
     ret some[ModuleView](v);
 }
 
-# loaded module `mid`'s SemaResult in `root`, lazily running the
-# type checker over the whole graph on first demand (ensure_sema) and retaining
-# every module's result on the root. none when there is no project, the id is out
-# of range, or the module did not resolve / could not be typed (its retained slot
-# stays zeroed). this is the type-aware twin of `module_view`: a workspace-wide
-# type query (e.g. a field rename's cross-module walk) reads each module's typing
-# through it. the returned pointer is owned by the root
+# loaded module `mid`'s compiler-owned SemaResult
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
@@ -1263,8 +1303,8 @@ pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[*sema
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
 # when `sr` is nil or `eid` is out of range. the narrow read the feature layer
-# makes to learn an expression's type - handed a SemaResult (from `sema_doc` or
-# `module_sema`), never the session. delegates to the pure helper so the rule lives
+# makes to learn an expression's type - handed a retained SemaResult, never the
+# session. delegates to the pure helper so the rule lives
 # in one unit-testable place
 # ---
 # sr:  a buffer's / module's SemaResult, or nil
@@ -1423,9 +1463,8 @@ pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 }
 
 # the loaded module in `root` whose source file is the document
-# at `uri` (matched on the normalized filesystem path), or none. lets the
-# workspace walk skip the active buffer's on-disk twin, whose live edits the
-# buffer's own resolve already covers, so its references are not counted twice.
+# at `uri` (matched on the normalized filesystem path), or none. This is the
+# canonical document-to-ModuleEntry identity used for routing and views.
 # matching is lexical (`.` / `..` collapse only): the std fs surface exposes
 # neither realpath nor inode identity, so a buffer opened through a symlinked or
 # differently-cased path does not match its twin and that file is walked as a
@@ -1449,7 +1488,7 @@ pub fun module_for_uri(w: *Workspace, root: *Root, uri: str) Option[sess.ModuleI
 # equals `norm`, or none. the allocation-free core of module_for_uri, also used
 # where one normalized document path is matched against several roots
 fun module_for_norm(root: *Root, norm: str) Option[sess.ModuleId] {
-    if (root == nil || !root.loaded || norm == nil) { ret none[sess.ModuleId](); }
+    if (root == nil || norm == nil) { ret none[sess.ModuleId](); }
     var i: u32 = 0;
     for (i < root.mod_path_count) {
         if (root.mod_paths[i] != nil && str_equals(root.mod_paths[i], norm)) {
@@ -1460,25 +1499,9 @@ fun module_for_norm(root: *Root, norm: str) Option[sess.ModuleId] {
     ret none[sess.ModuleId]();
 }
 
-# whether `root`'s whole tree is a vendored dependency project
-# (its directory lies under an outer project's declared vendor dir), so none of
-# its files are the editor's to rewrite. nil root is not vendored. the per-root
-# read-only signal the rename gate consults for a buffer with no loaded twin,
-# where the per-module is_project_module check has nothing to key on
-# ---
-# root: the root governing the request, or nil
-# ret:  true when the root is a vendored dependency project
-pub fun root_vendored(root: *Root) bool {
-    if (root == nil) { ret false; }
-    ret root.vendored;
-}
-
 # whether loaded module `mid` in `root` belongs to the user's
-# own editable project rather than a vendored dependency - false outright when
-# the whole root is a vendored dependency project (root_vendored), otherwise true
-# iff the module's fully-qualified path's head segment is the project id. rename
-# gates cross-file edits on it so a dependency's declaration (e.g. a std symbol,
-# or any file of a vendored project) is never rewritten
+# own editable project rather than a vendored dependency. False when the whole
+# root is vendored; otherwise true iff the module FQN begins with the project id.
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
@@ -1714,18 +1737,8 @@ fun normalize_path(alloc: *Allocator, path: str) str {
     ret buf::str;
 }
 
-# a `file://` URI for an already-normalized absolute path, owned by
-# the caller, or nil on allocation failure
 # a `file://` URI for a SourceFile's `path`, owned by the caller, or
 # nil on allocation failure.
-#
-# the two path spaces a SourceFile can come from are distinguished by the scheme,
-# not by a flag: an editor buffer is registered under its URI (`editor.open` takes
-# the uri as the path), so it already carries `file://` and is copied through,
-# while an on-disk project module carries a filesystem path and gains the scheme.
-# this is what a diagnostic's secondary location needs, since `related` may point
-# into either space - a "previous definition here" in the buffer, or in the
-# dependency module the buffer imports
 # ---
 # alloc: allocator backing the returned URI
 # path:  a SourceFile path

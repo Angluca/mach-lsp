@@ -294,11 +294,9 @@ fun handle_response(srv: *Server, body: str) {
     if (er != nil) {
         json.free_str(er, srv.alloc);
         srv.watch_state = WATCH_FALLBACK;
-        project.set_watch_active(?srv.ws, false);
         ret;
     }
     srv.watch_state = WATCH_ACTIVE;
-    project.set_watch_active(?srv.ws, true);
 }
 
 fun handle_did_save(srv: *Server, body: str) {
@@ -405,11 +403,8 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
-    # a feature request resolves dep-aware via project.root_for, which loads the
-    # governing project lazily on first use; a type-aware feature additionally
-    # sema's the closure lazily (ensure_sema). snapshot both the load epoch and the
-    # sema epoch so a load (#96) or a first sema (#113) triggered here re-publishes
-    # the now-loaded / now-typed buffers' diagnostics
+    # snapshot compiler epochs so a feature-triggered rebuild republishes the
+    # now-current diagnostics for every affected open document
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
@@ -418,7 +413,7 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 3) { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
