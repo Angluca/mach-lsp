@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- transport: distinguishes clean EOF from malformed/error input, caps LSP
+  headers at 8 KiB and bodies at 16 MiB with overflow-safe `Content-Length`
+  parsing, and surfaces response-write failures to the server loop. Portable
+  POSIX SIGPIPE suppression remains blocked on briar-systems/mach-std#468. (#149)
+
 ## [0.10.0] - 2026-08-07
 
 ### Added
