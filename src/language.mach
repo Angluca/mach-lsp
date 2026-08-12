@@ -67,7 +67,7 @@ use project:   mls.project;
 # ---
 # interner: the session's string interner, for resolving symbol-name StrIds
 # file:     the document's SourceFile (text + line index for offset/position)
-# fid:      the document's FileId (for the type-aware field path's sema_doc)
+# sr:       compiler-owned semantic result for this exact module snapshot
 # a:        the buffer's parsed Ast
 # rr:       the buffer's ResolveResult side tables
 # own:      this buffer's module id (Symbol.origin equals it for local symbols)
@@ -75,7 +75,7 @@ use project:   mls.project;
 rec Analyzed {
     interner: *intern.Interner;
     file:     *src.SourceFile;
-    fid:      src.FileId;
+    sr:       *sema.SemaResult;
     a:        *ast.Ast;
     rr:       *res.ResolveResult;
     own:      sess.ModuleId;
@@ -159,9 +159,8 @@ fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, offset
     if (!is_some[features.FieldRef](fo)) { ret false; }
     val fr: features.FieldRef = unwrap[features.FieldRef](fo);
 
-    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-    if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
-    val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+    val sr: *sema.SemaResult = an.sr;
+    if (sr == nil) { ret false; }
 
     val tid: type.TypeId = project.type_of(sr, fr.host);
     val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
@@ -531,9 +530,8 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     if (is_some[features.FieldRef](fo)) {
         val fr: features.FieldRef = unwrap[features.FieldRef](fo);
 
-        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-        if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
-        val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+        val sr: *sema.SemaResult = an.sr;
+        if (sr == nil) { ret false; }
 
         val tid: type.TypeId = project.type_of(sr, fr.host);
         val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
@@ -667,9 +665,8 @@ fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
     if (is_some[features.FieldRef](fo)) {
         val fr: features.FieldRef = unwrap[features.FieldRef](fo);
-        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-        if (is_err[*sema.SemaResult, str](sr_r)) { ret none[FieldTarget](); }
-        val tid: type.TypeId = project.type_of(unwrap_ok[*sema.SemaResult, str](sr_r), fr.host);
+        if (an.sr == nil) { ret none[FieldTarget](); }
+        val tid: type.TypeId = project.type_of(an.sr, fr.host);
         val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
         if (!is_some[project.RecordSite](rso)) { ret none[FieldTarget](); }
         val rs: project.RecordSite = unwrap[project.RecordSite](rso);
@@ -736,10 +733,9 @@ rec FieldXRef {
 # cap:   capacity of `out` (module_count + 1)
 # ret:   number of populated entries (>= 1), or 0 when the buffer cannot be typed
 fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
-    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-    if (is_err[*sema.SemaResult, str](sr_r)) { ret 0; }
+    if (an.sr == nil) { ret 0; }
     out[0].a         = an.a;
-    out[0].sr        = unwrap_ok[*sema.SemaResult, str](sr_r);
+    out[0].sr        = an.sr;
     out[0].file      = an.file;
     out[0].uri       = uri;
     out[0].declaring = t.decl_in_buffer;
@@ -827,7 +823,7 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
     if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); ret false; }
 
-    emit_field_locations(ws, alloc, id_raw, refs, n, t);
+    emit_field_locations(ws, an.root, alloc, id_raw, refs, n, t);
     free_field_refs(ws, refs, n);
     deallocate[FieldXRef](alloc, refs, cap);
     ret true;
@@ -855,7 +851,7 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: 
     val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
     if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); reply_empty_edit(alloc, id_raw); ret true; }
 
-    emit_field_rename(ws, alloc, id_raw, refs, n, t, new_name);
+    emit_field_rename(ws, an.root, alloc, id_raw, refs, n, t, new_name);
     free_field_refs(ws, refs, n);
     deallocate[FieldXRef](alloc, refs, cap);
     ret true;
@@ -895,8 +891,8 @@ fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: 
 # send a Location[] of every field site across `refs` (each
 # module's member-access / struct-literal sites plus the field declaration). takes
 # ownership of `id_raw` and frees it
-fun emit_field_locations(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
-    val ti: *type.TypeInterner = project.type_interner(ws);
+fun emit_field_locations(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
+    val ti: *type.TypeInterner = project.type_interner(ws, root);
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
@@ -932,8 +928,8 @@ fun emit_field_locations(ws: *project.Workspace, alloc: *Allocator, id_raw: str,
 # member-access / struct-literal sites; the declaring module's entry also rewrites
 # the field declaration and the record's matching doc component. takes ownership of
 # `id_raw` and frees it
-fun emit_field_rename(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
-    val ti: *type.TypeInterner = project.type_interner(ws);
+fun emit_field_rename(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
+    val ti: *type.TypeInterner = project.type_interner(ws, root);
     val qname: str = json.quote(new_name, alloc);
     if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
 
@@ -1388,20 +1384,34 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val root: *project.Root = project.root_for(ws, uri);
-    val rr_r: Result[*res.ResolveResult, str] = project.resolve_doc(ws, root, doc.file_id);
-    if (is_err[*res.ResolveResult, str](rr_r)) { ret false; }
-    out.rr = unwrap_ok[*res.ResolveResult, str](rr_r);
-    out.a  = editor.ast_of(es, doc.file_id);
-    if (out.a == nil) { ret false; }
+    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        out.rr       = v.rr;
+        out.a        = v.a;
+        out.sr       = v.sr;
+        out.interner = v.interner;
+        out.file     = v.file;
+        out.root     = v.root;
+        out.own      = v.module;
+        ret true;
+    }
+    if (project.has_project(ws, uri)) { ret false; }
 
-    val fo: Option[*src.SourceFile] = src.get(project.sources(ws), doc.file_id);
+    val rr: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+    if (is_err[*res.ResolveResult, str](rr)) { ret false; }
+    out.rr = unwrap_ok[*res.ResolveResult, str](rr);
+    out.a = editor.ast_of(es, doc.file_id);
+    if (out.a == nil) { ret false; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret false; }
-    out.interner = project.interner(ws);
-    out.file     = unwrap[*src.SourceFile](fo);
-    out.fid      = doc.file_id;
-    out.root     = root;
-    out.own      = project.own_module(root, doc.file_id);
+    out.sr = nil;
+    val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
+    if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
+    out.interner = ?es.s.interner;
+    out.file = unwrap[*src.SourceFile](fo);
+    out.root = nil;
+    out.own = doc.file_id::sess.ModuleId;
     ret true;
 }
 
@@ -2070,4 +2080,3 @@ fun free4(a: str, b: str, c: str, d: str, alloc: *Allocator) {
     json.free_str(c, alloc);
     json.free_str(d, alloc);
 }
-
