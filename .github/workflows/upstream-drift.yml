@@ -8,9 +8,9 @@ on:
 permissions:
   contents: read
 
-# this workflow runs only from the default branch, so a failure is an upstream
-# warning rather than a required pull-request check. ci.yml remains the pinned,
-# authoritative merge gate.
+# this workflow has no pull-request trigger, so a failure is an upstream warning
+# rather than a required merge check. ci.yml remains the pinned, authoritative
+# gate.
 jobs:
   live-mach:
     runs-on: ubuntu-latest
@@ -31,20 +31,46 @@ jobs:
           mach info
 
       # mach develops frontend APIs on dev and promotes them to main for
-      # releases. retarget only this disposable checkout so drift is caught
+      # releases. force only this disposable checkout to dev so drift is caught
       # before release without changing the committed pin used by ci.yml.
       - name: Resolve live upstream branches
         run: |
           python3 - <<'PY'
+          import re
+          import tomllib
           from pathlib import Path
 
           path = Path("mach.toml")
           text = path.read_text()
-          pinned = '[dep.mach]\ngit = "https://github.com/briar-systems/mach"\nref = "branch/main"'
-          live = pinned.replace('branch/main', 'branch/dev')
-          if text.count(pinned) != 1:
-              raise SystemExit("mach dependency stanza no longer matches the drift workflow")
-          path.write_text(text.replace(pinned, live))
+          try:
+              manifest = tomllib.loads(text)
+          except tomllib.TOMLDecodeError as error:
+              raise SystemExit(f"invalid mach.toml: {error}") from error
+
+          dependencies = manifest.get("dep")
+          dependency = dependencies.get("mach") if isinstance(dependencies, dict) else None
+          if not isinstance(dependency, dict):
+              raise SystemExit("mach.toml must contain exactly one [dep.mach] stanza")
+          if dependency.get("ref") not in {"branch/main", "branch/dev"}:
+              raise SystemExit("[dep.mach].ref must be branch/main or branch/dev")
+
+          lines = text.splitlines(keepends=True)
+          header = re.compile(r'^\s*\[\s*dep\s*\.\s*mach\s*\]\s*(?:#.*)?$')
+          starts = [index for index, line in enumerate(lines) if header.match(line.rstrip("\r\n"))]
+          if len(starts) != 1:
+              raise SystemExit("mach.toml must contain exactly one [dep.mach] stanza")
+
+          start = starts[0] + 1
+          end = next((index for index in range(start, len(lines)) if lines[index].lstrip().startswith("[")), len(lines))
+          ref = re.compile(r'^(\s*ref\s*=\s*)(["\'])(branch/(?:main|dev))\2(\s*(?:#.*)?)(\r?\n)?$')
+          matches = [index for index in range(start, end) if ref.match(lines[index])]
+          if len(matches) != 1:
+              raise SystemExit("[dep.mach] must contain one simple main/dev ref assignment")
+
+          index = matches[0]
+          match = ref.match(lines[index])
+          lines[index] = f'{match.group(1)}{match.group(2)}branch/dev{match.group(2)}{match.group(4)}{match.group(5) or ""}'
+          path.write_text("".join(lines))
           PY
           mach dep pull
           mach dep update --all
