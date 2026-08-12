@@ -406,6 +406,7 @@ def run_transport_regressions(server: Path, timeout: float) -> None:
     """Exercise malformed/truncated and resource-bounded input framing."""
     cases = (
         (b"X-Header: value\r\n\r\n", "missing Content-Length"),
+        (b"Content-Length: 4\r\n", "truncated header"),
         (b"Content-Length: 12junk\r\n\r\n", "malformed Content-Length"),
         (b"Content-Length: 4\r\nContent-Length: 4\r\n\r\nnull", "duplicate Content-Length"),
         (b"Content-Length: 20\r\n\r\n{}", "truncated body"),
@@ -470,7 +471,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  clean EOF after shutdown: exit 0")
-    print("  malformed/oversized frames: 7 rejected with exit 1")
+    print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     if os.name == "posix" and closed_stdout_status == -signal.SIGPIPE:
         print("  closed stdout reader: SIGPIPE (blocked by mach-std#468)")

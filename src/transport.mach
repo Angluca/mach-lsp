@@ -275,8 +275,11 @@ fun usize_to_buf(buf: *u8, cap: usize, value: usize) usize {
 }
 
 test "mls.transport.parse_content_length:bounded_strict_decimal" {
-    val valid: str = "content-type: application/vscode-jsonrpc; charset=utf-8\r\nCONTENT-LENGTH: 42\r\n\r\n";
+    val valid: str = "content-type: application/vscode-jsonrpc; charset=utf-8\r\nCoNtEnT-LeNgTh:\t 42\r\n\r\n";
     if (parse_content_length(valid::*u8, str_len(valid)) != 42) { ret 1; }
+
+    val boundary: str = "Content-Length: 16777216\r\n\r\n";
+    if (parse_content_length(boundary::*u8, str_len(boundary)) != BODY_MAX::i64) { ret 1; }
 
     val duplicate: str = "Content-Length: 4\r\ncontent-length: 4\r\n\r\n";
     if (parse_content_length(duplicate::*u8, str_len(duplicate)) >= 0) { ret 1; }
