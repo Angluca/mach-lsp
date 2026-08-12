@@ -107,13 +107,15 @@ pub fun run(srv: *Server) i64 {
 
     for (srv.status != STATUS_EXITED) {
         var msg: transport.Message;
-        val ok: bool = transport.read_message(?msg, srv.alloc);
-        if (!ok) {
-            if (srv.status == STATUS_SHUTTING_DOWN) {
+        val read_status: transport.ReadStatus = transport.read_message(?msg, srv.alloc);
+        if (read_status != transport.READ_OK) {
+            if (read_status == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) {
                 srv.status = STATUS_EXITED;
                 brk;
             }
-            trace.log("transport: read failed\n");
+            if (read_status == transport.READ_EOF) { trace.log("transport: input closed before shutdown\n"); }
+            or (read_status == transport.READ_MALFORMED) { trace.log("transport: malformed input frame\n"); }
+            or { trace.log("transport: input error\n"); }
             srv.exit_code = 1;
             srv.status = STATUS_EXITED;
             brk;
@@ -125,6 +127,11 @@ pub fun run(srv: *Server) i64 {
 
         dispatch(srv, ?msg);
         transport.message_free(?msg, srv.alloc);
+        if (transport.write_failed()) {
+            trace.log("transport: output failed\n");
+            srv.exit_code = 1;
+            srv.status = STATUS_EXITED;
+        }
     }
 
     trace.log("=== mach-lsp exiting ===\n");
