@@ -121,6 +121,11 @@ class LspSession:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
 
+    def respond_error(self, request: dict[str, Any], code: int, message: str) -> None:
+        """Reject one server-initiated request."""
+        self._send({"jsonrpc": "2.0", "id": request.get("id"),
+                    "error": {"code": code, "message": message}})
+
     def wait_for(
         self,
         predicate: Callable[[dict[str, Any]], bool],
@@ -215,11 +220,13 @@ def assert_range(value: Any, label: str) -> None:
     assert_position(value.get("end"), f"{label}.end")
 
 
-def assert_diagnostics(message: dict[str, Any], nonempty: bool) -> None:
+def assert_diagnostics(message: dict[str, Any], nonempty: bool, version: int | None = None) -> None:
     """Check publishDiagnostics and the shape of every entry."""
     params = message.get("params")
     require(isinstance(params, dict), "diagnostics params are missing")
     diagnostics = params.get("diagnostics")
+    require(params.get("version") == version if version is not None else "version" not in params,
+            f"unexpected diagnostics version: {params.get('version')!r}")
     require(isinstance(diagnostics, list), "diagnostics is not an array")
     require(bool(diagnostics) == nonempty, f"unexpected diagnostics: {diagnostics!r}")
     for index, diagnostic in enumerate(diagnostics):
@@ -264,23 +271,39 @@ need = []
 """,
         encoding="utf-8",
     )
-    text = f"""use {project_id}.defs.answer;
+    alias = "vals" if project_id == "beta" else "rootmod"
+    import_line = (f"use {alias}: {project_id}.defs;\n"
+                   f"use {project_id}.defs.answer;\n"
+                   f"use {project_id}.defs.Box;\n"
+                   f"use {project_id}.defs.take;")
+    answer_expr = "answer"
+    text = f"""{import_line}
 
 pub fun main() i32 {{
-    ret answer;
+    var b: Box[i32];
+    b.v = {value};
+    ret take[i32](b) + {answer_expr} + {alias}.answer;
 }}
 """
     main = source / "main.mach"
     definition = source / "defs.mach"
     main.write_text(text, encoding="utf-8")
-    definition.write_text(f"pub val answer: i32 = {value};\n", encoding="utf-8")
+    definition.write_text(
+        f'''$if ($project.target.os != "linux") {{ $error("wrong selected target"); }}
+$if ($bin.name != "app") {{ $error("wrong selected artifact"); }}
+pub val answer: i32 = {value};
+pub rec Box[T] {{ v: T; }}
+pub fun take[T](b: Box[T]) i32 {{ ret 7; }}
+''',
+        encoding="utf-8",
+    )
     return main, definition, text
 
 
 def assert_definition(session: LspSession, main: Path, definition: Path, text: str) -> None:
     """Check that `answer` resolves into the expected project root."""
     lines = text.splitlines()
-    line = next(index for index, value in enumerate(lines) if "ret answer" in value)
+    line = next(index for index, value in enumerate(lines) if " + answer + " in value)
     response = session.request(
         "textDocument/definition",
         {
@@ -294,19 +317,37 @@ def assert_definition(session: LspSession, main: Path, definition: Path, text: s
     assert_range(result.get("range"), "definition.range")
 
 
+def definition(session: LspSession, path: Path, text: str, name: str) -> dict[str, Any]:
+    """Request a definition at the last occurrence of name."""
+    lines = text.splitlines()
+    line = next(index for index in range(len(lines) - 1, -1, -1) if name in lines[index])
+    response = session.request(
+        "textDocument/definition",
+        {"textDocument": {"uri": path.as_uri()},
+         "position": {"line": line, "character": lines[line].index(name) + 1}},
+    )
+    result = response.get("result")
+    require(isinstance(result, dict), f"definition for {name} is not a Location: {result!r}")
+    return result
+
+
 def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], list[tuple[str, float]]]:
     """Run lifecycle, diagnostics, synchronization, and multi-root coverage."""
     with tempfile.TemporaryDirectory(prefix="mls-protocol-") as directory:
         root = Path(directory).resolve()
         alpha = write_project(root, "alpha", 11)
         beta = write_project(root, "beta", 22)
+        shared_left = write_project(root / "left", "shared", 31)
+        shared_right = write_project(root / "right", "shared", 41)
         scratch_uri = (root / "scratch.mach").as_uri()
         session = LspSession(server, root, timeout)
         finished = False
         try:
             response = session.request(
                 "initialize",
-                {"processId": os.getpid(), "rootUri": root.as_uri(), "capabilities": {}},
+                {"processId": os.getpid(), "rootUri": root.as_uri(),
+                 "capabilities": {"workspace": {"didChangeWatchedFiles": {
+                     "dynamicRegistration": True}}}},
             )
             result = response.get("result")
             require(isinstance(result, dict), f"invalid initialize result: {result!r}")
@@ -314,6 +355,11 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             require(isinstance(capabilities, dict), "initialize capabilities are missing")
             require(capabilities.get("textDocumentSync") == 1, "full-text sync is not advertised")
             session.notify("initialized", {})
+            registration = session.wait_for(
+                lambda item: item.get("method") == "client/registerCapability",
+                "dynamic watcher registration",
+            )
+            session.respond_error(registration, -32601, "watch registration rejected")
 
             session.notify(
                 "textDocument/didOpen",
@@ -326,7 +372,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                     }
                 },
             )
-            assert_diagnostics(session.diagnostics(scratch_uri), True)
+            assert_diagnostics(session.diagnostics(scratch_uri), True, 1)
             session.notify(
                 "textDocument/didChange",
                 {
@@ -334,7 +380,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                     "contentChanges": [{"text": "pub fun fixed() i32 { ret 0; }\n"}],
                 },
             )
-            assert_diagnostics(session.diagnostics(scratch_uri), False)
+            assert_diagnostics(session.diagnostics(scratch_uri), False, 2)
             session.notify("textDocument/didClose", {"textDocument": {"uri": scratch_uri}})
             assert_diagnostics(session.diagnostics(scratch_uri), False)
 
@@ -350,13 +396,102 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                         }
                     },
                 )
-                assert_diagnostics(session.diagnostics(main.as_uri()), False)
+                assert_diagnostics(session.diagnostics(main.as_uri()), False, 1)
 
             assert_definition(session, *alpha)
             assert_definition(session, *beta)
             assert_definition(session, *alpha)
+            for main, _, text in (shared_left, shared_right):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                      "version": 1, "text": text}},
+                )
+                assert_diagnostics(session.diagnostics(main.as_uri()), False, 1)
+            assert_definition(session, *shared_left)
+            assert_definition(session, *shared_right)
+            assert_definition(session, *shared_left)
+
+            # A rejected dynamic registration must leave manifest fingerprint
+            # fallback active: a broken manifest disables the snapshot, and a
+            # restored one is retried without a watcher notification.
+            alpha_manifest = alpha[0].parents[1] / "mach.toml"
+            manifest_text = alpha_manifest.read_text(encoding="utf-8")
+            alpha_manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            broken = session.request(
+                "textDocument/definition",
+                {"textDocument": {"uri": alpha[0].as_uri()},
+                 "position": {"line": 3, "character": 9}},
+            )
+            require(broken.get("result") is None,
+                    f"watcher rejection disabled manifest fallback: {broken!r}")
+            alpha_manifest.write_text(manifest_text, encoding="utf-8")
+            assert_definition(session, *alpha)
+
+            # An unsaved export change in one module must be visible from another
+            # open module through the retained compiler snapshot, not editor fallback.
+            alpha_main, alpha_def, alpha_text = alpha
+            defs_v1 = alpha_def.read_text(encoding="utf-8")
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": alpha_def.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": defs_v1}},
+            )
+            session.diagnostics(alpha_def.as_uri())
+            defs_v2 = defs_v1 + "pub val live: i32 = 33;\n"
+            main_v2 = alpha_text.replace(" + answer + ", " + answer + live + ").replace(
+                "use alpha.defs.answer;", "use alpha.defs.answer;\nuse alpha.defs.live;")
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": alpha_def.as_uri(), "version": 2},
+                 "contentChanges": [{"text": defs_v2}]},
+            )
+            session.diagnostics(alpha_def.as_uri())
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": alpha_main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": main_v2}]},
+            )
+            session.diagnostics(alpha_main.as_uri())
+            live_result = definition(session, alpha_main, main_v2, "live")
+            require(live_result.get("uri") == alpha_def.as_uri(),
+                    f"unsaved imported export did not resolve: {live_result!r}")
+
+            # Standalone buffers retain the upstream editor feature path.
+            standalone = root / "standalone.mach"
+            standalone_text = "pub val item: i32 = 1;\npub fun get() i32 { ret item; }\n"
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": standalone.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": standalone_text}},
+            )
+            session.diagnostics(standalone.as_uri())
+            stand_def = definition(session, standalone, standalone_text, "item")
+            require(stand_def.get("uri") == standalone.as_uri(),
+                    f"standalone definition failed: {stand_def!r}")
+            symbol_response = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": standalone.as_uri()}},
+            )
+            require(isinstance(symbol_response.get("result"), list) and symbol_response["result"],
+                    f"standalone document symbols failed: {symbol_response!r}")
+            completion = session.request(
+                "textDocument/completion",
+                {"textDocument": {"uri": standalone.as_uri()},
+                 "position": {"line": 1, "character": 30}},
+            )
+            completion_result = completion.get("result")
+            require(isinstance(completion_result, dict)
+                    and isinstance(completion_result.get("items"), list)
+                    and completion_result["items"],
+                    f"standalone completion failed: {completion!r}")
+            session.notify("textDocument/didClose", {"textDocument": {"uri": standalone.as_uri()}})
+            assert_diagnostics(session.diagnostics(standalone.as_uri()), False)
+
             for main, _, _ in (alpha, beta):
                 session.notify("textDocument/didClose", {"textDocument": {"uri": main.as_uri()}})
+            for main, _, _ in (shared_left, shared_right):
+                session.notify("textDocument/didClose", {"textDocument": {"uri": main.as_uri()}})
+            session.notify("textDocument/didClose", {"textDocument": {"uri": alpha_def.as_uri()}})
 
             telemetry = session.finish()
             finished = True
