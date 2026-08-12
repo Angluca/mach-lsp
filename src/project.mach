@@ -702,7 +702,7 @@ fun sync_overlays(w: *Workspace, r: *Root) Result[bool, str] {
     var i: usize = 0;
     for (i < n) {
         val d: *documents.Document = documents.at(w.docs, i);
-        if (d != nil && d.in_use && d.path != nil && root_covers(w, d.path, r.path)) {
+        if (d != nil && d.in_use && d.path != nil) {
             val sr: Result[bool, str] = sess.set_overlay(r.s, d.path, d.text);
             if (is_err[bool, str](sr)) { ret sr; }
             if (d.revision > latest) { latest = d.revision; }
@@ -909,7 +909,7 @@ pub fun document_changed(w: *Workspace, d: *documents.Document) Result[bool, str
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.path != nil && r.s != nil && root_covers(w, d.path, r.path)) {
+        if (r.path != nil && r.s != nil) {
             r.input_revision = d.revision;
         }
         i = i + 1;
@@ -924,7 +924,7 @@ pub fun document_closed(w: *Workspace, d: *documents.Document) {
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.path != nil && r.s != nil && root_covers(w, d.path, r.path)) {
+        if (r.path != nil && r.s != nil) {
             sess.clear_overlay(r.s, d.path);
             r.input_revision = d.revision;
         }
@@ -948,7 +948,8 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
-        if (r.path != nil && root_covers(w, norm, r.path)) {
+        if (r.path != nil && (root_covers(w, norm, r.path)
+            || is_some[sess.ModuleId](module_for_norm(r, norm)))) {
             free_root_graph(w, r);
             r.man_mtime = 0 - 1;
             r.lock_mtime = 0 - 1;
