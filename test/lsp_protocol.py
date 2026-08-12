@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+HEADER_MAX = 8 * 1024
+BODY_MAX = 16 * 1024 * 1024
 
 
 class ProtocolError(RuntimeError):
@@ -155,11 +159,12 @@ class LspSession:
             f"diagnostics for {uri}",
         )
 
-    def finish(self) -> tuple[int, float, int]:
+    def finish(self, send_exit: bool = True) -> tuple[int, float, int]:
         """Perform shutdown/exit and return process telemetry."""
         response = self.request("shutdown")
         require(response.get("result", object()) is None, f"invalid shutdown response: {response!r}")
-        self.notify("exit")
+        if send_exit:
+            self.notify("exit")
         self.proc.stdin.close()
         try:
             code = self.proc.wait(timeout=self.timeout)
@@ -362,6 +367,84 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 session.abort()
 
 
+def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> None:
+    """Require one malformed or oversized frame to terminate with status 1."""
+    with tempfile.TemporaryDirectory(prefix="mls-protocol-bad-") as directory:
+        try:
+            result = subprocess.run(
+                [str(server)],
+                cwd=directory,
+                input=frame,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ProtocolError(f"{label}: server did not terminate") from error
+    require(result.returncode == 1, f"{label}: expected exit 1, got {result.returncode}")
+    require(result.stdout == b"", f"{label}: server emitted a partial response")
+
+
+def run_clean_eof(server: Path, timeout: float) -> None:
+    """A clean EOF after shutdown is not a malformed-frame failure."""
+    with tempfile.TemporaryDirectory(prefix="mls-protocol-eof-") as directory:
+        root = Path(directory).resolve()
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            exit_code, _, _ = session.finish(send_exit=False)
+            require(exit_code == 0, f"clean EOF after shutdown exited {exit_code}")
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_transport_regressions(server: Path, timeout: float) -> None:
+    """Exercise malformed/truncated and resource-bounded input framing."""
+    cases = (
+        (b"X-Header: value\r\n\r\n", "missing Content-Length"),
+        (b"Content-Length: 12junk\r\n\r\n", "malformed Content-Length"),
+        (b"Content-Length: 4\r\nContent-Length: 4\r\n\r\nnull", "duplicate Content-Length"),
+        (b"Content-Length: 20\r\n\r\n{}", "truncated body"),
+        (f"Content-Length: {BODY_MAX + 1}\r\n\r\n".encode(), "oversized body"),
+        (b"Content-Length: 999999999999999999999999999999999999\r\n\r\n", "overflowing length"),
+        (b"X-Fill: " + (b"x" * HEADER_MAX), "oversized header"),
+    )
+    for frame, label in cases:
+        run_bad_frame(server, frame, timeout, label)
+
+
+def probe_closed_stdout(server: Path, timeout: float, restore_signals: bool) -> int:
+    """Close the client read end, trigger output, and return the process status."""
+    with tempfile.TemporaryDirectory(prefix="mls-protocol-pipe-") as directory:
+        read_fd, write_fd = os.pipe()
+        proc = subprocess.Popen(
+            [str(server)],
+            cwd=directory,
+            stdin=subprocess.PIPE,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            restore_signals=restore_signals,
+        )
+        os.close(write_fd)
+        os.close(read_fd)
+        assert proc.stdin is not None
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode()
+        try:
+            proc.stdin.write(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
+            proc.stdin.flush()
+            proc.stdin.close()
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            proc.kill()
+            proc.wait()
+            raise ProtocolError("closed stdout reader: server did not terminate") from error
+
+
 def main() -> int:
     """Run the suite and print request timing plus process-exit telemetry."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -375,10 +458,24 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        run_clean_eof(server, args.timeout)
+        run_transport_regressions(server, args.timeout)
+        closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
+        suppressed_status = probe_closed_stdout(server, args.timeout, False)
+        require(suppressed_status == 1, f"suppressed SIGPIPE: expected exit 1, got {suppressed_status}")
+        if os.name != "posix" or closed_stdout_status != -signal.SIGPIPE:
+            require(closed_stdout_status == 1, f"closed stdout reader: expected exit 1, got {closed_stdout_status}")
     except Exception as error:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print("  clean EOF after shutdown: exit 0")
+    print("  malformed/oversized frames: 7 rejected with exit 1")
+    print("  closed stdout reader with inherited SIG_IGN: exit 1")
+    if os.name == "posix" and closed_stdout_status == -signal.SIGPIPE:
+        print("  closed stdout reader: SIGPIPE (blocked by mach-std#468)")
+    else:
+        print("  closed stdout reader: exit 1")
     for label, duration in timings:
         print(f"  {label}: {duration:.3f}s")
     return 0
