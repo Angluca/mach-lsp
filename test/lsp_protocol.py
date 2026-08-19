@@ -172,6 +172,35 @@ class LspSession:
             f"diagnostics for {uri}",
         )
 
+    def quiet_diagnostics(self, settle: float = 0.4) -> list[dict[str, Any]]:
+        """Return any diagnostics published since the last wait.
+
+        Diagnostics belong to document state, so a feature request must not
+        produce one. Anything a request republished is already in `pending`
+        (the request's own reply drained the inbox past it); `settle` also
+        catches a publish still in flight behind that reply.
+        """
+        found = [m for m in self.pending
+                 if m.get("method") == "textDocument/publishDiagnostics"]
+        self.pending = [m for m in self.pending
+                        if m.get("method") != "textDocument/publishDiagnostics"]
+        deadline = time.monotonic() + settle
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return found
+            try:
+                item = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                return found
+            if item is None or isinstance(item, BaseException):
+                return found
+            self.message_count += 1
+            if item.get("method") == "textDocument/publishDiagnostics":
+                found.append(item)
+            else:
+                self.pending.append(item)
+
     def finish(self, send_exit: bool = True) -> tuple[int, float, int]:
         """Perform shutdown/exit and return process telemetry."""
         response = self.request("shutdown")
@@ -595,12 +624,19 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 {"textDocument": {"uri": alpha_main.as_uri(), "version": 2},
                  "contentChanges": [{"text": main_v2}]},
             )
-            session.diagnostics(alpha_main.as_uri(), 2)
+            # the change itself publishes every open document of the affected
+            # root at its own version: diagnostics follow document state, and
+            # the analysis they need is driven here rather than by whichever
+            # feature request happens to come next
+            assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 2), False, 2)
+            assert_diagnostics(session.diagnostics(alpha_def.as_uri(), 2), False, 2)
+            session.quiet_diagnostics()
             live_result = definition(session, alpha_main, main_v2, "live")
             require(live_result.get("uri") == alpha_def.as_uri(),
                     f"unsaved imported export did not resolve: {live_result!r}")
-            assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 2), False, 2)
-            assert_diagnostics(session.diagnostics(alpha_def.as_uri(), 2), False, 2)
+            republished = session.quiet_diagnostics()
+            require(not republished,
+                    f"a feature request republished diagnostics: {republished!r}")
 
             broken_text = main_v2 + "\nuse alpha.missing.nope;\n"
             session.notify(
@@ -639,9 +675,8 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 {"textDocument": {"uri": alpha_main.as_uri(), "version": 5},
                  "contentChanges": [{"text": alpha_text}]},
             )
-            session.diagnostics(alpha_main.as_uri(), 5)
-            assert_definition(session, alpha_main, alpha_def, alpha_text)
             assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 5), False, 5)
+            assert_definition(session, alpha_main, alpha_def, alpha_text)
 
             # A dependency opened before its ancestor graph is loaded must still
             # enter that graph through a filesystem overlay. Current `[dep.*]`

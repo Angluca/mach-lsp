@@ -330,7 +330,7 @@ fun handle_did_close(srv: *Server, params: *sj.Value) {
     if (doc != nil) { project.document_closed(?srv.ws, doc); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
-    republish_loaded(srv);
+    republish_all(srv);
     json.free_str(uri, srv.alloc);
 }
 
@@ -358,19 +358,39 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
-    if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_loaded(srv); }
+    if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
 }
 
-# re-publish diagnostics for every open document now governed
-# by a loaded project root. run after a feature request triggers a lazy load (#96)
-# or the first whole-closure sema (#113): the buffers under the freshly-loaded root
-# were published parse-only on open, so a load upgrades them to dep-aware
-# resolution diagnostics - including any out-of-closure import the load now flags -
-# and a completed sema further layers their type diagnostics, all without the user
-# touching the file. the publish path is load-free, so a buffer under no loaded
-# root simply re-publishes its parse-only diagnostics (unchanged), and nothing new
-# is built
-fun republish_loaded(srv: *Server) {
+# re-publish diagnostics for every open document the given root governs
+#
+# A rebuild can move diagnostics for any document mirrored into that root's
+# session - an unsaved export change in one module introduces or clears errors
+# in the modules importing it - so the whole root is republished, not just the
+# document that changed. Documents under OTHER roots are untouched: their
+# snapshots did not move, and republishing them would emit one notification per
+# open buffer per keystroke.
+#
+# A nil root is the standalone case, where `only` is the whole set.
+fun republish_root(srv: *Server, root: *project.Root, only: *documents.Document) {
+    val n: usize = documents.slot_count(?srv.docs);
+    var i: usize = 0;
+    for (i < n) {
+        val d: *documents.Document = documents.at(?srv.docs, i);
+        if (d != nil && d.in_use && d.uri != nil) {
+            if (root == nil) {
+                if (d == only) { diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d); }
+            }
+            or (project.root_covers_document(?srv.ws, root, d)) {
+                diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# re-publish every open document, for the events that can move any root at once
+# (a watched-file change, a close that returns a buffer to disk authority)
+fun republish_all(srv: *Server) {
     val n: usize = documents.slot_count(?srv.docs);
     var i: usize = 0;
     for (i < n) {
@@ -404,7 +424,7 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         trace.log("project: failed to mirror document overlay\n");
         ret;
     }
-    republish_loaded(srv);
+    republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
 }
 
 # send a JSON-RPC error response for a request that carries an id

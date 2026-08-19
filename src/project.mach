@@ -1058,6 +1058,21 @@ fun document_belongs(w: *Workspace, r: *Root, path: str) bool {
     ret vendored;
 }
 
+# whether `d` is mirrored into `r`'s session, and so shares its snapshot
+#
+# Diagnostics for a document can only move when the root that analyzes it is
+# rebuilt, so this is the republish set after a change: the documents a root
+# actually governs, not every open buffer in the session.
+# ---
+# w:   the workspace
+# r:   the root to test against, or nil
+# d:   the open document
+# ret: true when `r` governs `d`
+pub fun root_covers_document(w: *Workspace, r: *Root, d: *documents.Document) bool {
+    if (r == nil || d == nil || d.path == nil || r.path == nil || r.s == nil) { ret false; }
+    ret document_belongs(w, r, d.path);
+}
+
 # release a root's retained Project, source index, Session, and owned path
 fun free_root(w: *Workspace, r: *Root) {
     free_root_graph(w, r);
