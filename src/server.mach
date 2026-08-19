@@ -71,6 +71,8 @@ val WATCH_ACTIVE:   u8 = 2;
 # rd:            per-message JSON parse arena, owned by the analysis thread
 # q:             message queue feeding the analysis thread
 # stop:          set once the reading thread should stop; read atomically
+# deferred:      a document changed but its analysis was postponed behind newer
+#                input, and must run once the queue drains
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
@@ -84,6 +86,7 @@ pub rec Server {
     rd:            json.Reader;
     q:             jobs.Queue;
     stop:          i64;
+    deferred:      bool;
     watch_dynamic: bool;
     watch_state:   u8;
 }
@@ -110,6 +113,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     project.attach_documents(?srv.ws, ?srv.docs);
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
     srv.stop = 0;
+    srv.deferred = false;
     if (!jobs.init(?srv.q, alloc)) { ret false; }
     ret true;
 }
@@ -192,6 +196,14 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     if (parsed.valid) { dispatch(srv, ?parsed.root); }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
+
+    # a coalesced burst leaves the newest text unanalyzed; the moment the queue
+    # drains is when that debt comes due, whatever the last message happened to
+    # be. deferring analysis must never mean skipping it.
+    if (srv.deferred && jobs.depth(?srv.q) == 0 && srv.status == STATUS_RUNNING) {
+        srv.deferred = false;
+        republish_all(srv);
+    }
     trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
 
     if (srv.status == STATUS_EXITED || transport.write_failed()) {
@@ -460,6 +472,19 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         trace.log("project: failed to mirror document overlay\n");
         ret;
     }
+
+    # The document's text and revision are recorded above; analyzing it is what
+    # costs. While more input is already queued, that analysis would be thrown
+    # away by the very next message, so a burst of keystrokes coalesces into one
+    # analysis of the newest text instead of one per revision. The message that
+    # finds the queue empty is the one that publishes, so the newest state is
+    # always analyzed - deferring is never dropping.
+    if (jobs.depth(?srv.q) > 0) {
+        srv.deferred = true;
+        trace.log("server: newer input queued, deferring analysis\n");
+        ret;
+    }
+    srv.deferred = false;
     republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
 }
 
