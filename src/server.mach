@@ -33,6 +33,8 @@ use editor: mach.lang.editor;
 use transport:   mls.transport;
 use json:        mls.json;
 use sj:          std.data.json;
+use jobs:        mls.jobs;
+use atomic:      std.sync.atomic;
 use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
@@ -66,7 +68,9 @@ val WATCH_ACTIVE:   u8 = 2;
 # es:            editor session over `s` (per-buffer analysis)
 # docs:          URI -> editor buffer registry
 # ws:            per-root project graphs backing cross-module analysis
-# rd:            per-message JSON parse arena
+# rd:            per-message JSON parse arena, owned by the analysis thread
+# q:             message queue feeding the analysis thread
+# stop:          set once the reading thread should stop; read atomically
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
@@ -78,6 +82,8 @@ pub rec Server {
     docs:          documents.Store;
     ws:            project.Workspace;
     rd:            json.Reader;
+    q:             jobs.Queue;
+    stop:          i64;
     watch_dynamic: bool;
     watch_state:   u8;
 }
@@ -103,6 +109,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.ws = project.init(?srv.s, alloc);
     project.attach_documents(?srv.ws, ?srv.docs);
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
+    srv.stop = 0;
+    if (!jobs.init(?srv.q, alloc)) { ret false; }
     ret true;
 }
 
@@ -110,6 +118,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # ---
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
+    jobs.dnit(?srv.q);
     json.reader_dnit(?srv.rd);
     documents.dnit(?srv.docs);
     project.dnit(?srv.ws);
@@ -118,49 +127,76 @@ pub fun dnit(srv: *Server) {
     srv.status = STATUS_EXITED;
 }
 
-# read and dispatch framed messages until the server exits
+# read framed messages until input ends, handing each to the analysis thread
+#
+# This thread owns stdin and nothing else. Every message - parsing included -
+# is handled on the worker, so the compiler's state has exactly one owner and
+# needs no locking, and a cold analysis cannot stop the server from reading the
+# cancellation, edit, or shutdown that follows it.
+#
+# The worker decides the exit code, so the read loop drains the queue before
+# reading it: an EOF arriving while `shutdown` is still queued must not be
+# mistaken for input closing before shutdown.
 # ---
 # srv: the server to drive
 # ret: the process exit code
 pub fun run(srv: *Server) i64 {
     trace.log("=== mach-lsp started ===\n");
 
-    for (srv.status != STATUS_EXITED) {
+    if (!jobs.start(?srv.q, handle_job, (srv)::ptr)) {
+        trace.log("server: could not start the analysis thread\n");
+        ret 1;
+    }
+
+    var last_read: transport.ReadStatus = transport.READ_OK;
+    for (true) {
         var msg: transport.Message;
-        val read_status: transport.ReadStatus = transport.read_message(?msg, srv.alloc);
-        if (read_status != transport.READ_OK) {
-            if (read_status == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) {
-                srv.status = STATUS_EXITED;
-                brk;
-            }
-            if (read_status == transport.READ_EOF) { trace.log("transport: input closed before shutdown\n"); }
-            or (read_status == transport.READ_MALFORMED) { trace.log("transport: malformed input frame\n"); }
-            or { trace.log("transport: input error\n"); }
-            srv.exit_code = 1;
-            srv.status = STATUS_EXITED;
+        last_read = transport.read_message(?msg, srv.alloc);
+        if (last_read != transport.READ_OK) {
+            if (last_read == transport.READ_EOF)        { trace.log("transport: input closed\n"); }
+            or (last_read == transport.READ_MALFORMED)  { trace.log("transport: malformed input frame\n"); }
+            or                                          { trace.log("transport: input error\n"); }
             brk;
         }
 
-        trace.log("recv: ");
-        trace.log(msg.body);
-        trace.log("\n");
-
-        val started_ns: i64 = trace.now_ns();
-        var parsed: json.Message = json.read(?srv.rd, msg.body, msg.body_len);
-        if (parsed.valid) { dispatch(srv, ?parsed.root); }
-        or { reply_parse_error(srv); }
-        json.release(?srv.rd);
-        trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
-        transport.message_free(?msg, srv.alloc);
-        if (transport.write_failed()) {
-            trace.log("transport: output failed\n");
-            srv.exit_code = 1;
-            srv.status = STATUS_EXITED;
+        if (!jobs.push(?srv.q, msg.body, msg.body_len)) {
+            trace.logf("server: analysis queue full at {} messages, dropping input",
+                       jobs.depth(?srv.q)::i64);
         }
+        transport.message_free(?msg, srv.alloc);
+        if (atomic.load(?srv.stop) != 0) { brk; }
     }
 
+    # every accepted message is answered before the exit code is decided
+    jobs.join(?srv.q);
     trace.log("=== mach-lsp exiting ===\n");
-    ret srv.exit_code;
+
+    if (transport.write_failed()) { ret 1; }
+    if (srv.status == STATUS_EXITED)       { ret srv.exit_code; }
+    if (last_read == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) { ret 0; }
+    ret 1;
+}
+
+# handle one queued message on the analysis thread
+#
+# The parse arena and every compiler-owned structure belong to this thread.
+fun handle_job(ctx: ptr, body: str, len: usize) {
+    val srv: *Server = ctx::*Server;
+
+    trace.log("recv: ");
+    trace.log(body);
+    trace.log("\n");
+
+    val started_ns: i64 = trace.now_ns();
+    var parsed: json.Message = json.read(?srv.rd, body, len);
+    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    or { reply_parse_error(srv); }
+    json.release(?srv.rd);
+    trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
+
+    if (srv.status == STATUS_EXITED || transport.write_failed()) {
+        atomic.store(?srv.stop, 1);
+    }
 }
 
 # route one parsed message by its `method` member
