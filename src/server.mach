@@ -35,6 +35,7 @@ use json:        mls.json;
 use sj:          std.data.json;
 use jobs:        mls.jobs;
 use atomic:      std.sync.atomic;
+use exec:        std.process.exec;
 use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
@@ -337,6 +338,17 @@ fun handle_exit(srv: *Server) {
     if (srv.status == STATUS_SHUTTING_DOWN) { srv.exit_code = 0; }
     or { srv.exit_code = 1; }
     srv.status = STATUS_EXITED;
+    atomic.store(?srv.stop, 1);
+
+    # `exit` means terminate, and the client is entitled to keep its end of the
+    # pipe open while it waits for that. The reading thread is parked in
+    # `read(2)` on stdin and nothing this thread can do reliably wakes it -
+    # closing the descriptor under a blocked reader does not - so the orderly
+    # return through `run` is not reachable here. Ending the process is what the
+    # notification asked for; responses are written unbuffered, so nothing that
+    # was owed to the client is still pending.
+    trace.log("=== mach-lsp exiting ===\n");
+    exec.exit(srv.exit_code);
 }
 
 # register the opened document and publish its diagnostics

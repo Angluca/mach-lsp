@@ -881,6 +881,52 @@ def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> Non
     require(result.stdout == b"", f"{label}: server emitted a partial response")
 
 
+def run_exit_paths(server: Path, timeout: float) -> None:
+    """Every lifecycle ending must terminate, with the documented code.
+
+    `exit` means terminate, and a client may hold its end of the pipe open while
+    it waits. With analysis on a worker the reading thread is parked in read(2),
+    so an `exit` that only set a flag would leave the process alive until the
+    client happened to close stdin.
+    """
+    cases = (
+        (("shutdown", "exit"), False, 0),
+        (("shutdown", "exit"), True, 0),
+        (("exit",), False, 1),
+        (("shutdown",), True, 0),
+        ((), True, 1),
+    )
+    for steps, close_stdin, expected in cases:
+        with tempfile.TemporaryDirectory(prefix="mls-exit-") as directory:
+            root = Path(directory).resolve()
+            session = LspSession(server, root, timeout)
+            try:
+                session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+                session.notify("initialized", {})
+                if "shutdown" in steps:
+                    response = session.request("shutdown")
+                    require(response.get("result", object()) is None,
+                            f"invalid shutdown response: {response!r}")
+                if "exit" in steps:
+                    session.notify("exit")
+                if close_stdin:
+                    session.proc.stdin.close()
+                try:
+                    code = session.proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    session.proc.kill()
+                    session.proc.wait()
+                    raise ProtocolError(
+                        f"server did not terminate for {steps!r} "
+                        f"(stdin closed: {close_stdin})") from error
+                require(code == expected,
+                        f"{steps!r} (stdin closed: {close_stdin}) exited {code}, want {expected}")
+            finally:
+                if session.proc.poll() is None:
+                    session.proc.kill()
+                    session.proc.wait()
+
+
 def run_clean_eof(server: Path, timeout: float) -> None:
     """A clean EOF after shutdown is not a malformed-frame failure."""
     with tempfile.TemporaryDirectory(prefix="mls-protocol-eof-") as directory:
@@ -957,6 +1003,7 @@ def main() -> int:
         run_active_watcher_fallback(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
+        run_exit_paths(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -967,6 +1014,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  clean EOF after shutdown: exit 0")
+    print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
