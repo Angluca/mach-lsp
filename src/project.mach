@@ -38,6 +38,7 @@ use std.allocator.deallocate;
 use std.allocator.reallocate;
 
 use strutil: std.text.string;
+use fnv1a:   std.crypto.hash.fnv1a;
 use fs:      std.filesystem;
 use chrono:  std.chrono.time;
 use pathlib: std.types.path;
@@ -83,6 +84,14 @@ pub rec Site {
     owned: bool;
 }
 
+# sentinel for a content hash that has not been computed (or could not be)
+val HASH_UNKNOWN: u64 = 0;
+
+# a source file's change-detection state
+# ---
+# mtime: modification time in unix nanoseconds, 0 when absent
+# size:  size in bytes
+# hash:  FNV-1a of the contents, HASH_UNKNOWN until a stat mismatch forces it
 rec SourceFingerprint {
     mtime: i64;
     size:  usize;
@@ -570,6 +579,8 @@ fun alloc_slot(w: *Workspace) *Root {
 # compose the selected primary artifact request and retain the compiler-owned
 # load/resolve/sema snapshot for `r.path`
 fun try_load(w: *Workspace, r: *Root) bool {
+    val started_ns: i64 = trace.now_ns();
+    fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
     record_mtimes(w, r);
     r.dirty = false;
     val sor: Result[bool, str] = sync_overlays(w, r);
@@ -875,7 +886,7 @@ fun build_mod_paths(w: *Workspace, r: *Root) Result[bool, str] {
             free_path_snapshot(w.alloc, paths, fingerprints, n, i);
             ret err[bool, str]("project: failed to normalize loaded module path");
         }
-        fingerprints[i] = file_fingerprint(w.alloc, paths[i]);
+        fingerprints[i] = file_fingerprint(paths[i]);
         i = i + 1;
     }
     free_mod_paths(w, r);
@@ -919,11 +930,8 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     var changed: bool = man != r.man_mtime || lock != r.lock_mtime;
     var i: u32 = 0;
     for (!changed && i < r.mod_path_count) {
-        if (r.mod_paths[i] != nil) {
-            val fp: SourceFingerprint = file_fingerprint(w.alloc, r.mod_paths[i]);
-            if (fp.mtime != r.mod_fingerprints[i].mtime || fp.size != r.mod_fingerprints[i].size
-                || fp.hash != r.mod_fingerprints[i].hash) { changed = true; }
-        }
+        if (r.mod_paths[i] != nil
+            && !fingerprint_matches(w.alloc, r.mod_paths[i], ?r.mod_fingerprints[i])) { changed = true; }
         i = i + 1;
     }
     if (!changed) { ret; }
@@ -1103,26 +1111,77 @@ fun join_mtime(alloc: *Allocator, dir: str, name: str) i64 {
     ret m;
 }
 
-fun file_fingerprint(alloc: *Allocator, path: str) SourceFingerprint {
+# stat-only fingerprint: the metadata half is what every scan reads
+#
+# `hash` is left HASH_UNKNOWN. The content hash exists only to suppress a
+# rebuild after a touch that did not change bytes, so it is computed lazily by
+# `fingerprint_matches` for the rare file whose (mtime, size) moved - never for
+# the whole module set on a periodic scan.
+# ---
+# path: absolute source path to stat
+# ret:  the file's (mtime, size) with an unresolved hash; zeroed when absent
+fun file_fingerprint(path: str) SourceFingerprint {
     var fp: SourceFingerprint;
     fp.mtime = 0;
     fp.size = 0;
-    fp.hash = 0;
+    fp.hash = HASH_UNKNOWN;
     val fi_r: Result[fs.Metadata, str] = fs.metadata(path);
     if (is_err[fs.Metadata, str](fi_r)) { ret fp; }
     var fi: fs.Metadata = unwrap_ok[fs.Metadata, str](fi_r);
     fp.mtime = chrono.time_unix_nsec(fi.modified);
     fp.size = fi.size;
-    val text_r: Result[str, str] = fs.read_string(alloc, path);
-    if (!is_err[str, str](text_r)) {
-        val text: str = unwrap_ok[str, str](text_r);
-        var h: u64 = 14695981039346656037;
-        var i: usize = 0;
-        for (i < str_len(text)) { h = (h ^ text[i]::u64) * 1099511628211; i = i + 1; }
-        fp.hash = h;
-        strutil.str_free(alloc, text);
-    }
     ret fp;
+}
+
+# FNV-1a over a file's bytes, or HASH_UNKNOWN when it cannot be read
+# ---
+# alloc: allocator for the transient file read
+# path:  absolute source path to hash
+# ret:   the content hash, or HASH_UNKNOWN on a read failure
+fun file_content_hash(alloc: *Allocator, path: str) u64 {
+    val text_r: Result[str, str] = fs.read_string(alloc, path);
+    if (is_err[str, str](text_r)) { ret HASH_UNKNOWN; }
+    val text: str = unwrap_ok[str, str](text_r);
+    val n: usize = str_len(text);
+    var h: u64 = fnv1a.FNV_INIT;
+    var i: usize = 0;
+    for (i < n) {
+        h = fnv1a.step_u8(h, text[i]);
+        i = i + 1;
+    }
+    strutil.str_free(alloc, text);
+    if (h == HASH_UNKNOWN) { ret HASH_UNKNOWN + 1; }
+    ret h;
+}
+
+# whether `path` still matches the fingerprint recorded in `prev`
+#
+# Equal (mtime, size) accepts without touching the file's bytes, which is the
+# whole-module-set case on every periodic scan. Only a moved stat pair falls
+# through to a content hash, and only then is `prev.hash` resolved so a pure
+# touch does not force a rebuild. `prev` is updated in place so the resolved
+# hash is reused by later scans.
+# ---
+# alloc: allocator for the transient read a hash comparison needs
+# path:  absolute source path to check
+# prev:  recorded fingerprint, updated in place
+# ret:   true when the file's content is unchanged
+fun fingerprint_matches(alloc: *Allocator, path: str, prev: *SourceFingerprint) bool {
+    val now: SourceFingerprint = file_fingerprint(path);
+    if (now.mtime == prev.mtime && now.size == prev.size) { ret true; }
+    if (now.size != prev.size) {
+        @prev = now;
+        ret false;
+    }
+    # same size, different mtime: only a content hash separates a touch from an
+    # edit, so resolve both sides once and cache them.
+    if (prev.hash == HASH_UNKNOWN) { prev.hash = file_content_hash(alloc, path); }
+    val h: u64 = file_content_hash(alloc, path);
+    prev.mtime = now.mtime;
+    prev.size = now.size;
+    if (h == prev.hash && h != HASH_UNKNOWN) { ret true; }
+    prev.hash = h;
+    ret false;
 }
 
 # where symbol `sym` is declared, as an Ast / SourceFile / URI triple.

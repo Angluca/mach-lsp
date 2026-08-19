@@ -131,7 +131,9 @@ pub fun run(srv: *Server) i64 {
         trace.log(msg.body);
         trace.log("\n");
 
+        val started_ns: i64 = trace.now_ns();
         dispatch(srv, ?msg);
+        trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
         transport.message_free(?msg, srv.alloc);
         if (transport.write_failed()) {
             trace.log("transport: output failed\n");
