@@ -43,6 +43,9 @@ pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;
 pub val STATUS_SHUTTING_DOWN: u8 = 2;
 pub val STATUS_EXITED:        u8 = 3;
+val WATCH_FALLBACK: u8 = 0;
+val WATCH_PENDING:  u8 = 1;
+val WATCH_ACTIVE:   u8 = 2;
 
 # the long-lived server state
 # ---
@@ -64,6 +67,7 @@ pub rec Server {
     docs:          documents.Store;
     ws:            project.Workspace;
     watch_dynamic: bool;
+    watch_state:   u8;
 }
 
 # build a server over the given allocator
@@ -76,6 +80,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.exit_code = 0;
     srv.alloc = alloc;
     srv.watch_dynamic = false;
+    srv.watch_state = WATCH_FALLBACK;
 
     val sr: Result[sess.Session, str] = sess.init(alloc);
     if (is_err[sess.Session, str](sr)) { ret false; }
@@ -83,7 +88,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 
     srv.es = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
-    srv.ws = project.init(?srv.s, ?srv.es, alloc);
+    srv.ws = project.init(?srv.s, alloc);
+    project.attach_documents(?srv.ws, ?srv.docs);
     ret true;
 }
 
@@ -142,7 +148,7 @@ pub fun run(srv: *Server) i64 {
 fun dispatch(srv: *Server, msg: *transport.Message) {
     val body: str = msg.body;
     val method: str = json.extract_string(body, "\"method\"", srv.alloc);
-    if (method == nil) { ret; }
+    if (method == nil) { handle_response(srv, body); ret; }
 
     if (str_equals(method, "initialize")) {
         json.free_str(method, srv.alloc);
@@ -188,6 +194,7 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
     }
     if (str_equals(method, "textDocument/didSave")) {
         json.free_str(method, srv.alloc);
+        handle_did_save(srv, body);
         ret;
     }
     if (str_equals(method, "workspace/didChangeConfiguration")) {
@@ -271,9 +278,32 @@ fun handle_initialized(srv: *Server) {
     if (!srv.watch_dynamic) { ret; }
     val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
     transport.send_message(reg, srv.alloc);
-    # the watcher now covers manifest / lockfile changes; skip the per-request
-    # mtime fallback check.
-    project.set_watch_active(?srv.ws, true);
+    srv.watch_state = WATCH_PENDING;
+}
+
+# accept dynamic watching only after the client acknowledges registration;
+# rejection keeps conservative fallback invalidation enabled
+fun handle_response(srv: *Server, body: str) {
+    if (srv.watch_state != WATCH_PENDING) { ret; }
+    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+    if (id == nil) { ret; }
+    val ours: bool = str_equals(id, "\"mls/registerWatchers\"");
+    json.free_str(id, srv.alloc);
+    if (!ours) { ret; }
+    val er: str = json.extract_raw(body, "\"error\"", srv.alloc);
+    if (er != nil) {
+        json.free_str(er, srv.alloc);
+        srv.watch_state = WATCH_FALLBACK;
+        ret;
+    }
+    srv.watch_state = WATCH_ACTIVE;
+}
+
+fun handle_did_save(srv: *Server, body: str) {
+    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+    if (uri == nil) { ret; }
+    project.invalidate_uri(?srv.ws, uri);
+    json.free_str(uri, srv.alloc);
 }
 
 # invalidate every project root whose tree
@@ -316,7 +346,9 @@ fun handle_did_open(srv: *Server, body: str) {
     val text: str = json.extract_after(body, "\"textDocument\"", "\"text\"", srv.alloc);
     if (text == nil) { json.free_str(uri, srv.alloc); ret; }
 
-    publish_for(srv, uri, text, true);
+    var version: i64 = 0;
+    if (!document_version(srv, body, ?version)) { json.free_str(text, srv.alloc); json.free_str(uri, srv.alloc); ret; }
+    publish_for(srv, uri, text, version, true);
 
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
@@ -331,10 +363,22 @@ fun handle_did_change(srv: *Server, body: str) {
     val text: str = json.extract_after(body, "\"contentChanges\"", "\"text\"", srv.alloc);
     if (text == nil) { json.free_str(uri, srv.alloc); ret; }
 
-    publish_for(srv, uri, text, false);
+    var version: i64 = 0;
+    if (!document_version(srv, body, ?version)) { json.free_str(text, srv.alloc); json.free_str(uri, srv.alloc); ret; }
+    publish_for(srv, uri, text, version, false);
 
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
+}
+
+# read the required TextDocumentItem/VersionedTextDocumentIdentifier version,
+# distinguishing a missing field from the valid numeric value zero
+fun document_version(srv: *Server, body: str, out: *i64) bool {
+    val raw: str = json.extract_raw(body, "\"version\"", srv.alloc);
+    if (raw == nil) { ret false; }
+    json.free_str(raw, srv.alloc);
+    @out = json.extract_number_after(body, "\"textDocument\"", "\"version\"", srv.alloc);
+    ret true;
 }
 
 # retire the document, reclaim its cached resolve result, and
@@ -342,10 +386,11 @@ fun handle_did_change(srv: *Server, body: str) {
 fun handle_did_close(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
-    val doc: *documents.Document = documents.find(?srv.docs, uri);
-    if (doc != nil) { project.free_cached(?srv.ws, doc.file_id); }
+    val doc: *documents.Document = documents.closing(?srv.docs, uri);
+    if (doc != nil) { project.document_closed(?srv.ws, doc); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
+    republish_loaded(srv);
     json.free_str(uri, srv.alloc);
 }
 
@@ -358,11 +403,8 @@ fun handle_did_close(srv: *Server, body: str) {
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
-    # a feature request resolves dep-aware via project.root_for, which loads the
-    # governing project lazily on first use; a type-aware feature additionally
-    # sema's the closure lazily (ensure_sema). snapshot both the load epoch and the
-    # sema epoch so a load (#96) or a first sema (#113) triggered here re-publishes
-    # the now-loaded / now-typed buffers' diagnostics
+    # snapshot compiler epochs so a feature-triggered rebuild republishes the
+    # now-current diagnostics for every affected open document
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
@@ -371,7 +413,7 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 3) { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    or (which == 5) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, body, uri); }
     or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
@@ -394,7 +436,7 @@ fun republish_loaded(srv: *Server) {
     for (i < n) {
         val d: *documents.Document = documents.at(?srv.docs, i);
         if (d != nil && d.in_use && d.uri != nil) {
-            diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, d.uri, d.file_id);
+            diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d);
         }
         i = i + 1;
     }
@@ -402,10 +444,13 @@ fun republish_loaded(srv: *Server) {
 
 # register/update `uri`'s buffer and publish its diagnostics.
 # `is_open` selects open vs change registration; both end in a publish
-fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
+fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) {
+    val path: str = project.path_of_uri(srv.alloc, uri);
+    if (path == nil) { ret; }
     var dr: Result[*documents.Document, str];
-    if (is_open) { dr = documents.open(?srv.docs, uri, text); }
-    or { dr = documents.change(?srv.docs, uri, text); }
+    if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }
+    or { dr = documents.change(?srv.docs, uri, text, version); }
+    json.free_str(path, srv.alloc);
 
     if (is_err[*documents.Document, str](dr)) {
         trace.log("documents: ");
@@ -414,7 +459,12 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
         ret;
     }
     val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
+    val cr: Result[bool, str] = project.document_changed(?srv.ws, doc);
+    if (is_err[bool, str](cr)) {
+        trace.log("project: failed to mirror document overlay\n");
+        ret;
+    }
+    republish_loaded(srv);
 }
 
 # send a JSON-RPC error response for a request that carries an id;

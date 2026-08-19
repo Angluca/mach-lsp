@@ -17,7 +17,7 @@ abi = "aapcs64"
 [target.linux-riscv64]
 isa = "riscv64"
 os  = "linux"
-abi = "lp64"
+abi = "lp64d"
 
 [target.windows-x86_64]
 isa  = "x86_64"
@@ -58,4 +58,4 @@ ref = "branch/main"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "branch/main"
+ref = "branch/dev"
