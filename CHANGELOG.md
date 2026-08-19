@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- perf: source fingerprints are stat-only. `file_fingerprint` read and FNV-hashed
+  every module's full source on every snapshot build and every 250 ms scan, and
+  its hash loop re-evaluated `str_len` as the loop condition, making the hash
+  quadratic in file size. On this repository (222 modules) that put 225 s of the
+  server's own bookkeeping in front of a 7.4 s compiler analysis and repeated it
+  on every request. `textDocument/definition` cold 231 s → 7.4 s, warm 222 s →
+  0.6 ms, after an edit → 181 ms. (#95)
+- diagnostics: publishing drives the analysis instead of reporting whichever
+  snapshot a previous request left behind. A file with a type error opened clean
+  and only started reporting once an unrelated feature request built the project.
+  Editor output now matches `mach build` from `didOpen`, and a hover no longer
+  changes it. Republishing is scoped to the root that changed. (#142)
+- server: `exit` terminates the process even when the client leaves stdin open,
+  which the spec entitles it to do.
+
+### Added
+- server: analysis runs on a worker thread. The reading thread owns stdin and
+  nothing else, so a cold analysis no longer blocks the client mid-write —
+  flooding the server with 60 edits during a cold load went from 18.6 s of
+  blocked writes (worst single write 7.5 s) to 0.00 s. Document revisions
+  superseded by queued input are coalesced, so the same burst costs one analysis
+  instead of 60: 19.0 s → 0.9 s. (#143, #155)
+- jobs: bounded single-consumer message queue, futex-blocking so an idle server
+  costs no CPU.
+
 ### Changed
+- json: JSON-RPC messages are parsed with `std.data.json` instead of scanning the
+  raw body for a quoted key. The scanner matched a key ANYWHERE in the document,
+  including inside an opened file's own source text, and correct dispatch relied
+  on clients ordering `method` before `params`. Request ids now keep their wire
+  type, malformed bodies get a spec parse error, and string escaping is the std
+  emitter's. Messages parse into a per-message arena. (#153)
+
+### Known issues
+- memory grows ~7.4 MiB per analysis, without bound, whether or not any source
+  changed. The leak is inside the compiler's `analyze_project` / `dnit_project`
+  cycle and reproduces with no LSP code involved; tracked upstream as
+  briar-systems/mach#3001.
+
+### Changed (#141, earlier in this cycle)
 - project: replaced the shared-session, manually re-resolved graph with one
   stable compiler Session and retained `analyze_project` snapshot per root.
   Open document text is mirrored as filesystem overlays with explicit input and
