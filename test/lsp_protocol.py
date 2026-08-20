@@ -949,6 +949,98 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_completion_context(server: Path, timeout: float) -> None:
+    """Completion must answer for the cursor, not for the file.
+
+    The server advertises `.` as a trigger character, and typing a dot used to
+    return every top-level name in the file with none of the receiver's members
+    among them -- a wrong answer rather than a missing one. Nor did a partial
+    identifier narrow anything.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-compl-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "compl", 3)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            # after `b.v = N;`, so the local `b` is in scope for the probe
+            anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
+            version = [1]
+
+            def complete(probe: str) -> list[str]:
+                """Insert `probe` as a line in main's body and complete at its end."""
+                edited = list(lines)
+                edited.insert(anchor_line + 1, "    " + probe)
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
+                )
+                result = response.get("result")
+                require(isinstance(result, dict), f"completion is not a list: {result!r}")
+                items = result.get("items")
+                require(isinstance(items, list), f"completion has no items: {result!r}")
+                for item in items:
+                    require(isinstance(item.get("label"), str), f"item without a label: {item!r}")
+                    require(isinstance(item.get("kind"), int), f"item without a kind: {item!r}")
+                return [item["label"] for item in items]
+
+            # a record receiver offers its fields, and only its fields
+            fields = complete("b.")
+            require("v" in fields, f"a record receiver did not offer its field: {fields!r}")
+            require("main" not in fields and "take" not in fields,
+                    f"a record receiver offered file-level names: {fields!r}")
+
+            # a module alias offers that module's public symbols
+            members = complete("rootmod.")
+            require("answer" in members and "Box" in members,
+                    f"a module alias did not offer its exports: {members!r}")
+            require("main" not in members,
+                    f"a module alias offered the requesting file's names: {members!r}")
+
+            # a partial member narrows
+            narrowed = complete("rootmod.an")
+            require(narrowed and all(label.startswith("an") for label in narrowed),
+                    f"a partial member name did not filter: {narrowed!r}")
+            require("answer" in narrowed, f"filtering dropped the match: {narrowed!r}")
+
+            # an unresolvable receiver offers nothing, never the file's names
+            unknown = complete("nosuchreceiver.")
+            require(unknown == [],
+                    f"an unresolved receiver fell back to the file list: {unknown!r}")
+
+            # a partial identifier with no dot narrows the file-level list
+            everything = complete("")
+            prefixed = complete("Bo")
+            require(prefixed and all(label.startswith("Bo") for label in prefixed),
+                    f"a partial identifier did not filter: {prefixed!r}")
+            require(len(prefixed) < len(everything),
+                    "filtering returned as many items as no filter at all")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1189,6 +1281,7 @@ def main() -> int:
         run_active_watcher_fallback(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
+        run_completion_context(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1203,6 +1296,7 @@ def main() -> int:
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests fields, variants, parameters, and generics")
+    print("  completion answers for the cursor: members, exports, prefixes")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
