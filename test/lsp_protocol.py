@@ -589,6 +589,10 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            # the fingerprint fallback coalesces to at most one scan per 250 ms
+            # per root, so a request issued inside that window is answered from
+            # the still-live snapshot. wait past it, or this asserts nothing.
+            time.sleep(0.4)
             broken = session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": alpha[0].as_uri()},
@@ -597,6 +601,9 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             require(broken.get("result") is None,
                     f"watcher rejection disabled manifest fallback: {broken!r}")
             alpha_manifest.write_text(manifest_text, encoding="utf-8")
+            # and again on the way back: a failed root retries on the next
+            # fingerprint scan, not on the next request
+            time.sleep(0.4)
             assert_definition(session, *alpha)
 
             # An unsaved export change in one module must be visible from another
@@ -758,6 +765,102 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             telemetry = session.finish()
             finished = True
             return telemetry, session.timings
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_import_navigation(server: Path, timeout: float) -> None:
+    """A `use` / `fwd` path must navigate like a body reference to the same symbol.
+
+    An import path is neither an expression nor a type and an import declaration
+    has no name span, so nothing in the offset pivot reached it: hover and
+    definition both answered null anywhere on a `use` line. The resolver does
+    record the bound symbol on the declaration, which is what makes this
+    answerable.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-import-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "imp", 5)
+        bridge = main.parent / "bridge.mach"
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            lines = text.splitlines()
+
+            def at(needle: str, within: str) -> dict[str, Any]:
+                line = next(i for i, v in enumerate(lines) if within in v)
+                return {"textDocument": {"uri": main.as_uri()},
+                        "position": {"line": line, "character": lines[line].index(needle) + 1}}
+
+            def location(label: str, params: dict[str, Any]) -> dict[str, Any]:
+                response = session.request("textDocument/definition", params)
+                result = response.get("result")
+                require(isinstance(result, dict),
+                        f"{label}: definition on an import is not a Location: {result!r}")
+                assert_range(result.get("range"), f"{label}.range")
+                return result
+
+            def hover_text(label: str, params: dict[str, Any]) -> str:
+                response = session.request("textDocument/hover", params)
+                result = response.get("result")
+                require(isinstance(result, dict), f"{label}: hover on an import is null")
+                contents = result.get("contents")
+                require(isinstance(contents, dict), f"{label}: hover contents malformed")
+                return str(contents.get("value"))
+
+            # a plain symbol import: the leaf names a declaration in another module
+            leaf = at("Box", "use imp.defs.Box;")
+            require(location("symbol import leaf", leaf).get("uri") == defs.as_uri(),
+                    "a symbol import leaf did not resolve to its declaring module")
+            require("Box" in hover_text("symbol import leaf", leaf),
+                    "hover on a symbol import leaf did not name the symbol")
+
+            # the qualifier of the same path resolves to the same symbol, so a
+            # cursor anywhere on the line is useful rather than only on the leaf
+            require(location("import qualifier", at("imp", "use imp.defs.Box;")).get("uri")
+                    == defs.as_uri(),
+                    "the qualifier of an import path did not resolve")
+
+            # a member alias binds the imported symbol under a new name
+            require(location("member alias", at("direct", "use direct:")).get("uri")
+                    == defs.as_uri(),
+                    "a member alias did not resolve to its declaration")
+
+            # a bare-module alias names a FILE, not a declaration
+            module_alias = at("rootmod", "use rootmod:")
+            require(location("module alias", module_alias).get("uri") == defs.as_uri(),
+                    "a module alias did not resolve to the module's file")
+            require("module" in hover_text("module alias", module_alias),
+                    "hover on a module alias did not name it as a module")
+
+            # `fwd` re-export paths behave like `use` paths
+            bridge_text = bridge.read_text(encoding="utf-8")
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": bridge.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": bridge_text}},
+            )
+            session.diagnostics(bridge.as_uri(), 1)
+            blines = bridge_text.splitlines()
+            bline = next(i for i, v in enumerate(blines) if v.startswith("fwd "))
+            fwd = {"textDocument": {"uri": bridge.as_uri()},
+                   "position": {"line": bline, "character": blines[bline].index("answer") + 1}}
+            response = session.request("textDocument/definition", fwd)
+            result = response.get("result")
+            require(isinstance(result, dict) and result.get("uri") == defs.as_uri(),
+                    f"a fwd re-export path did not resolve: {result!r}")
+
+            session.finish()
+            finished = True
         finally:
             if not finished:
                 session.abort()
@@ -1001,6 +1104,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
+        run_import_navigation(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1013,6 +1117,7 @@ def main() -> int:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print("  use / fwd import paths navigate to their declarations")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
