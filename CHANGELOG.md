@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- completion: answers for the cursor rather than for the file. The server
+  advertised `.` as a trigger character and then ignored the request position
+  entirely, returning every top-level symbol whatever the cursor was on: `srv.`
+  gave 178 items with **zero** `Server` fields among them, and a cursor mid-word
+  at `STATUS_RUNNING` gave the same 178. A record or union receiver now offers
+  its fields with their declared types, a module alias offers the target's public
+  symbols, and anything else is filtered by the partial identifier. An
+  unresolvable receiver offers nothing rather than the file's names. (#81, #82)
+- definition / hover: `use` and `fwd` import paths navigate. Both answered null
+  at every position on an import line — an import path is neither an expression
+  nor a type and an import declaration has no name span, so the offset pivot
+  missed it, while `decl_symbol` held the bound symbol the whole time. A module
+  alias resolves to the module's file and hovers as `module <fqn>`; a symbol
+  import resolves to its declaration. (#163)
+- documentSymbol: reports record fields, union variants, function parameters, and
+  generics as `children`, each with its declared type in `detail`. The outline was
+  a flat list — 39 top-level symbols on `src/server.mach`, none with children. Now
+  25 of 39 have them. (#164)
+
+### Changed
+- language: `documentSymbol` and `completion` emit through `json.Buf` in a single
+  pass instead of rendering every entry twice, once to size and once to fill.
+  Incidentally faster: `documentSymbol` 13 ms → 5 ms, `completion` 14 ms → 0.2 ms
+  on this repository. (#171, partial)
+- completion: an empty result is the same `CompletionList` shape as a populated
+  one rather than a bare array, so the method has one response type.
+
 ## [0.11.0] - 2026-08-20
 
 The server was unusably slow on any project that vendors the compiler, reported
