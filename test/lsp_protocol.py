@@ -866,6 +866,89 @@ def run_import_navigation(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
+    """A record's fields and a function's parameters belong in the outline.
+
+    documentSymbol reported a flat list, so a module's structure was invisible:
+    39 top-level names and no way to see what any of them contained.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-dsym-") as directory:
+        root = Path(directory).resolve()
+        main, defs, _ = write_project(root, "dsym", 7)
+        defs_text = defs.read_text(encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": defs_text}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            response = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            symbols = response.get("result")
+            require(isinstance(symbols, list) and symbols,
+                    f"documentSymbol returned nothing: {symbols!r}")
+
+            by_name = {s["name"]: s for s in symbols}
+
+            def children(name: str) -> list[dict[str, Any]]:
+                require(name in by_name, f"{name} missing from documentSymbol")
+                node = by_name[name]
+                assert_range(node.get("range"), f"{name}.range")
+                assert_range(node.get("selectionRange"), f"{name}.selectionRange")
+                return node.get("children") or []
+
+            # `pub rec Box[T] { v: T; }` -- one generic and one field
+            box = children("Box")
+            names = [c["name"] for c in box]
+            require("T" in names, f"Box did not report its generic parameter: {names!r}")
+            require("v" in names, f"Box did not report its field: {names!r}")
+            field = next(c for c in box if c["name"] == "v")
+            require(field.get("detail") == "T",
+                    f"a field's declared type is missing from detail: {field!r}")
+            require(field.get("kind") == 8, f"a record field is not SymbolKind.Field: {field!r}")
+            for entry in box:
+                assert_range(entry.get("range"), "Box child range")
+                assert_range(entry.get("selectionRange"), "Box child selectionRange")
+
+            # `pub fun take[T](b: Box[T]) i32` -- one generic and one parameter
+            take = children("take")
+            take_names = [c["name"] for c in take]
+            require("T" in take_names, f"take did not report its generic: {take_names!r}")
+            require("b" in take_names, f"take did not report its parameter: {take_names!r}")
+            param = next(c for c in take if c["name"] == "b")
+            require(param.get("detail") == "Box[T]",
+                    f"a parameter's declared type is missing from detail: {param!r}")
+
+            # a declaration with no members omits children rather than sending []
+            require("children" not in by_name["answer"] or not by_name["answer"]["children"],
+                    "a val reported children it does not have")
+
+            # still syntax-only: it must answer without a compiler root
+            manifest = defs.parents[1] / "mach.toml"
+            manifest_text = manifest.read_text(encoding="utf-8")
+            manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            time.sleep(0.4)
+            started = time.monotonic()
+            broken = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            require(time.monotonic() - started < 1.0,
+                    "documentSymbol blocked on project analysis")
+            require(isinstance(broken.get("result"), list) and broken["result"],
+                    f"documentSymbol needed a loaded project: {broken!r}")
+            manifest.write_text(manifest_text, encoding="utf-8")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1105,6 +1188,7 @@ def main() -> int:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_import_navigation(server, args.timeout)
+        run_document_symbol_hierarchy(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1118,6 +1202,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
+    print("  documentSymbol nests fields, variants, parameters, and generics")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")

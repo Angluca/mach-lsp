@@ -1666,110 +1666,183 @@ fun free_groups(groups: *str, n: usize, alloc: *Allocator) {
 # send a DocumentSymbol[] of the file's top-level decls.
 # takes ownership of `id_raw` and frees it
 fun emit_document_symbols(an: Analyzed, alloc: *Allocator, id_raw: str) {
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":[";
-    val suffix: str = "]}";
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"result\":[");
 
     val n: u32 = features.top_level_count(an.a);
-
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
-    var count: usize = 0;
-
-    var d1: u32 = 0;
-    for (d1 < n) {
-        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d1), alloc);
-        if (entry != nil) {
-            if (count > 0) { total = total + 1; }
-            total = total + str_len(entry);
-            json.free_str(entry, alloc);
-            count = count + 1;
-        }
-        d1 = d1 + 1;
-    }
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-
-    var emitted: usize = 0;
-    var d2: u32 = 0;
-    for (d2 < n) {
-        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d2), alloc);
-        if (entry != nil) {
-            if (emitted > 0) { buf[off] = ','; off = off + 1; }
-            off = append(buf, off, entry);
-            json.free_str(entry, alloc);
+    var emitted: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        if (push_doc_symbol(?b, an, features.top_level_decl(an.a, i), emitted > 0, alloc)) {
             emitted = emitted + 1;
         }
-        d2 = d2 + 1;
+        i = i + 1;
     }
 
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
+    json.buf_push(?b, "]}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    or { reply_empty_array(alloc, id_raw); json.buf_dnit(?b); ret; }
+    json.buf_dnit(?b);
     json.free_str(id_raw, alloc);
 }
 
-# render decl `did` as a DocumentSymbol object, or nil when the
-# decl has no nameable symbol (use / fwd / test / comptime / error)
-fun doc_symbol_json(an: Analyzed, did: id.DeclId, alloc: *Allocator) str {
+# append decl `did` as a DocumentSymbol, with its members as `children`
+#
+# A record's fields, a union's variants, and a function's generics and
+# parameters are what the outline is FOR: a flat list of 39 top-level names in a
+# 2000-line module tells a reader nothing they could not get from the file
+# itself. Emitted in one pass through the buffer rather than sized and then
+# filled, so nesting costs one traversal instead of two.
+# ---
+# b:     output buffer
+# an:    the analyzed document
+# did:   decl to render
+# comma: whether to separate from a preceding sibling
+# alloc: request allocator
+# ret:   true when a symbol was appended
+fun push_doc_symbol(b: *json.Buf, an: Analyzed, did: id.DeclId, comma: bool, alloc: *Allocator) bool {
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
-    if (!is_some[*decl.Decl](d_opt)) { ret nil; }
+    if (!is_some[*decl.Decl](d_opt)) { ret false; }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
     val nso: Option[token.Span] = features.decl_name_span(d);
-    if (!is_some[token.Span](nso)) { ret nil; }
+    if (!is_some[token.Span](nso)) { ret false; }
     val name_span: token.Span = unwrap[token.Span](nso);
-    if (name_span.len == 0) { ret nil; }
+    if (name_span.len == 0) { ret false; }
 
     val name: str = positions.span_text(an.file, name_span, alloc);
-    if (name == nil) { ret nil; }
-    val qname: str = json.quote(name, alloc);
+    if (name == nil) { ret false; }
+
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"name\":");
+    json.buf_push_quoted(b, name);
     json.free_str(name, alloc);
-    if (qname == nil) { ret nil; }
-
-    val kind: i64 = decl_lsp_kind(d.kind);
-    val kstr: str = json.format_i64(kind, alloc);
-    val full: str = range_json(positions.range_of(an.file, d.span), alloc);
-    val sel:  str = range_json(positions.range_of(an.file, name_span), alloc);
-
-    val p1: str = "{\"name\":";
-    val p2: str = ",\"kind\":";
-    val p3: str = ",\"range\":";
-    val p4: str = ",\"selectionRange\":";
-    val p5: str = "}";
-    val total: usize = str_len(p1) + slen(qname) + str_len(p2) + slen(kstr) + str_len(p3) + slen(full) + str_len(p4) + slen(sel) + str_len(p5);
-
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) {
-        json.free_str(qname, alloc); json.free_str(kstr, alloc); json.free_str(full, alloc); json.free_str(sel, alloc);
-        ret nil;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, qname);
-    off = append(buf, off, p2);
-    off = append(buf, off, kstr);
-    off = append(buf, off, p3);
-    off = append(buf, off, full);
-    off = append(buf, off, p4);
-    off = append(buf, off, sel);
-    off = append(buf, off, p5);
-    buf[off] = 0;
-
-    json.free_str(qname, alloc);
-    json.free_str(kstr, alloc);
-    json.free_str(full, alloc);
-    json.free_str(sel, alloc);
-    ret buf::str;
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, decl_lsp_kind(d.kind));
+    json.buf_push(b, ",\"range\":");
+    push_range_value(b, positions.range_of(an.file, d.span));
+    json.buf_push(b, ",\"selectionRange\":");
+    push_range_value(b, positions.range_of(an.file, name_span));
+    push_doc_symbol_children(b, an, d, alloc);
+    json.buf_push_byte(b, '}');
+    ret true;
 }
+
+# append the `children` member for a declaration that has members, or nothing
+#
+# A record and a union both hold their members in the shared `typed_names` pool;
+# a function holds its generics in `generic_names` and its parameters in the same
+# typed pool. A declaration with no members omits `children` entirely rather than
+# emitting an empty array, so a client's "has children" test stays meaningful.
+fun push_doc_symbol_children(b: *json.Buf, an: Analyzed, d: *decl.Decl, alloc: *Allocator) {
+    var fields_start: u32 = 0;
+    var fields_len:   u32 = 0;
+    var gen_start:    u32 = 0;
+    var gen_len:      u32 = 0;
+    var member_kind:  i64 = LSP_SYMBOL_FIELD;
+
+    if (d.kind == decl.DECL_KIND_REC) {
+        fields_start = d.data.rec_.fields_start; fields_len = d.data.rec_.fields_len;
+        gen_start    = d.data.rec_.generics_start; gen_len   = d.data.rec_.generics_len;
+    }
+    or (d.kind == decl.DECL_KIND_UNI) {
+        fields_start = d.data.uni_.fields_start; fields_len = d.data.uni_.fields_len;
+        gen_start    = d.data.uni_.generics_start; gen_len   = d.data.uni_.generics_len;
+        member_kind  = LSP_SYMBOL_ENUM_MEMBER;
+    }
+    or (d.kind == decl.DECL_KIND_FUN) {
+        fields_start = d.data.fun_.params_start; fields_len = d.data.fun_.params_len;
+        gen_start    = d.data.fun_.generics_start; gen_len   = d.data.fun_.generics_len;
+        member_kind  = LSP_SYMBOL_VARIABLE;
+    }
+    or { ret; }
+
+    if (fields_len == 0 && gen_len == 0) { ret; }
+
+    json.buf_push(b, ",\"children\":[");
+    var emitted: u32 = 0;
+    var g: u32 = 0;
+    for (g < gen_len) {
+        if (an.a.generic_names != nil) {
+            val gs: token.Span = an.a.generic_names[(gen_start + g)::usize];
+            if (push_member_symbol(b, an, gs, id.TYPE_NIL, LSP_SYMBOL_TYPE_PARAMETER, emitted > 0, alloc)) {
+                emitted = emitted + 1;
+            }
+        }
+        g = g + 1;
+    }
+    var f: u32 = 0;
+    for (f < fields_len) {
+        if (an.a.typed_names != nil) {
+            val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
+            if (push_member_symbol(b, an, tn.name, tn.ty, member_kind, emitted > 0, alloc)) {
+                emitted = emitted + 1;
+            }
+        }
+        f = f + 1;
+    }
+    json.buf_push_byte(b, ']');
+}
+
+# append one member (field, variant, parameter, or generic) as a DocumentSymbol
+#
+# A member has no span of its own beyond its name, so `range` and
+# `selectionRange` are both the name; `detail` carries its declared type where
+# it has one.
+fun push_member_symbol(b: *json.Buf, an: Analyzed, name_span: token.Span, ty: id.TypeId,
+                       kind: i64, comma: bool, alloc: *Allocator) bool {
+    if (name_span.len == 0) { ret false; }
+    val name: str = positions.span_text(an.file, name_span, alloc);
+    if (name == nil) { ret false; }
+
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"name\":");
+    json.buf_push_quoted(b, name);
+    json.free_str(name, alloc);
+
+    if (ty != id.TYPE_NIL) {
+        val to: Option[*atype.Type] = ast.get_type(an.a, ty);
+        if (is_some[*atype.Type](to)) {
+            val tt: str = positions.span_text(an.file, unwrap[*atype.Type](to).span, alloc);
+            if (tt != nil) {
+                json.buf_push(b, ",\"detail\":");
+                json.buf_push_quoted(b, tt);
+                json.free_str(tt, alloc);
+            }
+        }
+    }
+
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    json.buf_push(b, ",\"range\":");
+    push_range_value(b, positions.range_of(an.file, name_span));
+    json.buf_push(b, ",\"selectionRange\":");
+    push_range_value(b, positions.range_of(an.file, name_span));
+    json.buf_push_byte(b, '}');
+    ret true;
+}
+
+# append a `{start,end}` LSP Range object
+fun push_range_value(b: *json.Buf, range: positions.LspRange) {
+    json.buf_push(b, "{\"start\":{\"line\":");
+    json.buf_push_usize(b, range.start_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, range.start_char);
+    json.buf_push(b, "},\"end\":{\"line\":");
+    json.buf_push_usize(b, range.end_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, range.end_char);
+    json.buf_push(b, "}}");
+}
+
+# LSP SymbolKind values used for declaration members
+val LSP_SYMBOL_ENUM_MEMBER:    i64 = 22;
+val LSP_SYMBOL_FIELD:          i64 = 8;
+val LSP_SYMBOL_VARIABLE:       i64 = 13;
+val LSP_SYMBOL_TYPE_PARAMETER: i64 = 26;
 
 # the LSP SymbolKind for a decl kind (documentSymbol)
 fun decl_lsp_kind(kind: decl.DeclKind) i64 {
