@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs no CPU.
 
 ### Changed
+- deps: **advanced the vendored mach pin to `v4.20.0`** and mach-std to `v0.27.0`,
+  and returned `[dep.mach]` to `branch/main`. Tracking `branch/dev` was a temporary
+  measure while the retained-analysis frontend API (mach#2997) was unreleased; the
+  release convention is `branch/main`. No frontend API drift.
+- project: parsed `mach.toml` tables are torn down. Both reads - the vendoring
+  probe and the document-overlay source-directory lookup - run on the snapshot
+  rebuild path and leaked their whole table on every rebuild, because
+  `std.data.toml` had no teardown to call. mach-std#474 adds one; `get_str` and
+  `table_key` borrow out of the table, so it is released at scope exit rather than
+  at the last read. Per-edit growth halved, ~8 MiB to ~4.2 MiB. (#159)
 - json: JSON-RPC messages are parsed with `std.data.json` instead of scanning the
   raw body for a quoted key. The scanner matched a key ANYWHERE in the document,
   including inside an opened file's own source text, and correct dispatch relied
@@ -42,10 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitter's. Messages parse into a per-message arena. (#153)
 
 ### Known issues
-- memory grows ~7.4 MiB per analysis, without bound, whether or not any source
-  changed. The leak is inside the compiler's `analyze_project` / `dnit_project`
-  cycle and reproduces with no LSP code involved; tracked upstream as
-  briar-systems/mach#3001.
+- memory still grows ~4.2 MiB per analysis, without bound. briar-systems/mach#3001
+  fixed the manifest-reload half (the LSP reloads the manifest on every rebuild);
+  the residue is in `analyze_project` / `dnit_project` itself and still reproduces
+  with no LSP code involved. Tracked upstream as briar-systems/mach#3012. The LSP
+  side is clean: the server adds no measurable growth over the bare compiler
+  cycle. (#159)
 
 ### Changed (#141, earlier in this cycle)
 - project: replaced the shared-session, manually re-resolved graph with one
