@@ -58,4 +58,4 @@ ref = "branch/main"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "branch/dev"
+ref = "branch/main"

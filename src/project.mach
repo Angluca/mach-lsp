@@ -346,9 +346,8 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
 # merely its immediate parent, while still never building unrelated outer
 # projects - a monorepo root, this repo above its test fixtures - whose declared
 # vendor dirs enclose nothing the document sits in. a manifest that fails to read
-# or parse vendors nothing. the parsed table is leaked into the server's page
-# allocator - std.data.toml exposes no teardown, the same convention the driver's
-# own manifest reads use
+# or parse vendors nothing. `get_str` and `table_key` borrow out of the table, so
+# it is torn down at scope exit rather than at the last read
 fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
     val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, "mach.toml");
     if (is_err[pathlib.Path, str](mp_r)) { ret false; }
@@ -361,6 +360,7 @@ fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
     strutil.str_free(w.alloc, text);
     if (is_err[toml.Table, str](t_r)) { ret false; }
     var t: toml.Table = unwrap_ok[toml.Table, str](t_r);
+    fin { toml.dnit(w.alloc, ?t); }
 
     val deps: *toml.Table = toml.get_table(?t, "dep");
     if (deps == nil) { ret false; }
@@ -749,6 +749,7 @@ fun set_document_overlay(w: *Workspace, r: *Root, d: *documents.Document) Result
         ret err[bool, str](unwrap_err[toml.Table, str](table_r));
     }
     var table: toml.Table = unwrap_ok[toml.Table, str](table_r);
+    fin { toml.dnit(w.alloc, ?table); }
     val src_dir: str = toml.get_str(?table, "project.src");
     if (src_dir == nil) { strutil.str_free(w.alloc, own); ret ok[bool, str](true); }
     val raw_src_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, own, src_dir);
