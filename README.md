@@ -18,14 +18,29 @@ selected primary artifact supplies the target, profile, defines, `$project`, and
 come from the same compiler-owned ModuleEntry rather than LSP copies of compiler
 internals.
 
+The reading thread owns stdin and nothing else. Every message, parsing
+included, is handled on one worker thread that owns the sessions, snapshots,
+document registry, and feature handlers, so compiler state has exactly one owner
+and needs no locking. A cold analysis therefore cannot stop the server from
+reading the cancellation, edit, or shutdown behind it, and cannot block the
+client mid-write when a `didChange` fills the pipe. A change whose analysis is
+superseded by input already queued is coalesced: the text and revision are
+recorded, the analysis is deferred, and the debt is paid when the queue drains,
+so a burst of keystrokes costs one analysis of the newest text rather than one
+per revision.
+
 Roots are independent identity domains, so projects with colliding FQNs can be
 queried and rebuilt in either order. Dependency modules already present in an
 ancestor graph route to that graph read-only; unrelated nested projects remain
 isolated. Files outside a project use the upstream single-file editor API.
 
-Open/change notifications publish fast standalone parse diagnostics when no
-current project snapshot exists. A feature request rebuilds a stale snapshot and
-the server republishes compiler diagnostics afterward. Watch registration is
+Diagnostics own the analysis rather than reporting whichever snapshot a previous
+request happened to leave behind: open and change drive the load, so what the
+editor shows matches `mach build` from the first notification and does not move
+because hover or definition was requested. Documents outside any project fall
+back to standalone parse diagnostics. Republishing is scoped to the root that
+changed, so an edit in one project does not emit a notification for every open
+buffer in another. Watch registration is
 considered active only after the client acknowledges it; `didSave`, watched-file
 notifications, manifest/lock mtimes, and exact content fingerprints of previously
 loaded source paths all drive invalidation and retry. Fingerprint scans are
@@ -88,9 +103,10 @@ and fetched by `mach dep pull`; Mach tracks `branch/dev` while mach-std tracks
 | Module | Responsibility |
 |---|---|
 | `main` | entry point; page allocator + server loop |
-| `server` | lifecycle state, message loop, method dispatch |
+| `server` | lifecycle state, reading loop, and the analysis-thread dispatch |
+| `jobs` | bounded message queue feeding the single analysis thread |
 | `transport` | LSP base-protocol framing over stdin/stdout |
-| `json` | minimal JSON field extraction and response assembly |
+| `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
 | `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback |
 | `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point |

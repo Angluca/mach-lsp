@@ -83,10 +83,20 @@ pub rec Site {
     owned: bool;
 }
 
+# a source file's change-detection state
+#
+# Stat metadata only. A content hash would suppress a rebuild after a touch
+# that did not change bytes, but reading and hashing every module to save that
+# case costs more than the case does: a spurious rebuild reuses the retained
+# session, where `Q_FILE_TEXT`'s byte-equality cutoff keeps every unchanged
+# module's parse, resolve, and sema entry valid. The compiler already owns
+# content-change detection, so the LSP does not duplicate it.
+# ---
+# mtime: modification time in unix nanoseconds, 0 when absent
+# size:  size in bytes
 rec SourceFingerprint {
     mtime: i64;
     size:  usize;
-    hash:  u64;
 }
 
 # one project root and its compiler-owned semantic snapshot
@@ -570,6 +580,8 @@ fun alloc_slot(w: *Workspace) *Root {
 # compose the selected primary artifact request and retain the compiler-owned
 # load/resolve/sema snapshot for `r.path`
 fun try_load(w: *Workspace, r: *Root) bool {
+    val started_ns: i64 = trace.now_ns();
+    fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
     record_mtimes(w, r);
     r.dirty = false;
     val sor: Result[bool, str] = sync_overlays(w, r);
@@ -864,7 +876,6 @@ fun build_mod_paths(w: *Workspace, r: *Root) Result[bool, str] {
         paths[i] = nil;
         fingerprints[i].mtime = 0;
         fingerprints[i].size = 0;
-        fingerprints[i].hash = 0;
         val fo: Option[*src.SourceFile] = src.get(?r.s.sources, (?r.p.modules[i]).file_id);
         if (!is_some[*src.SourceFile](fo)) {
             free_path_snapshot(w.alloc, paths, fingerprints, n, i);
@@ -875,7 +886,7 @@ fun build_mod_paths(w: *Workspace, r: *Root) Result[bool, str] {
             free_path_snapshot(w.alloc, paths, fingerprints, n, i);
             ret err[bool, str]("project: failed to normalize loaded module path");
         }
-        fingerprints[i] = file_fingerprint(w.alloc, paths[i]);
+        fingerprints[i] = file_fingerprint(paths[i]);
         i = i + 1;
     }
     free_mod_paths(w, r);
@@ -919,11 +930,8 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     var changed: bool = man != r.man_mtime || lock != r.lock_mtime;
     var i: u32 = 0;
     for (!changed && i < r.mod_path_count) {
-        if (r.mod_paths[i] != nil) {
-            val fp: SourceFingerprint = file_fingerprint(w.alloc, r.mod_paths[i]);
-            if (fp.mtime != r.mod_fingerprints[i].mtime || fp.size != r.mod_fingerprints[i].size
-                || fp.hash != r.mod_fingerprints[i].hash) { changed = true; }
-        }
+        if (r.mod_paths[i] != nil
+            && !fingerprint_matches(r.mod_paths[i], ?r.mod_fingerprints[i])) { changed = true; }
         i = i + 1;
     }
     if (!changed) { ret; }
@@ -1050,6 +1058,21 @@ fun document_belongs(w: *Workspace, r: *Root, path: str) bool {
     ret vendored;
 }
 
+# whether `d` is mirrored into `r`'s session, and so shares its snapshot
+#
+# Diagnostics for a document can only move when the root that analyzes it is
+# rebuilt, so this is the republish set after a change: the documents a root
+# actually governs, not every open buffer in the session.
+# ---
+# w:   the workspace
+# r:   the root to test against, or nil
+# d:   the open document
+# ret: true when `r` governs `d`
+pub fun root_covers_document(w: *Workspace, r: *Root, d: *documents.Document) bool {
+    if (r == nil || d == nil || d.path == nil || r.path == nil || r.s == nil) { ret false; }
+    ret document_belongs(w, r, d.path);
+}
+
 # release a root's retained Project, source index, Session, and owned path
 fun free_root(w: *Workspace, r: *Root) {
     free_root_graph(w, r);
@@ -1103,26 +1126,35 @@ fun join_mtime(alloc: *Allocator, dir: str, name: str) i64 {
     ret m;
 }
 
-fun file_fingerprint(alloc: *Allocator, path: str) SourceFingerprint {
+# the `(mtime, size)` of `path`, zeroed when it is absent or unreadable
+# ---
+# path: absolute source path to stat
+# ret:  the file's stat fingerprint
+fun file_fingerprint(path: str) SourceFingerprint {
     var fp: SourceFingerprint;
     fp.mtime = 0;
     fp.size = 0;
-    fp.hash = 0;
     val fi_r: Result[fs.Metadata, str] = fs.metadata(path);
     if (is_err[fs.Metadata, str](fi_r)) { ret fp; }
     var fi: fs.Metadata = unwrap_ok[fs.Metadata, str](fi_r);
     fp.mtime = chrono.time_unix_nsec(fi.modified);
     fp.size = fi.size;
-    val text_r: Result[str, str] = fs.read_string(alloc, path);
-    if (!is_err[str, str](text_r)) {
-        val text: str = unwrap_ok[str, str](text_r);
-        var h: u64 = 14695981039346656037;
-        var i: usize = 0;
-        for (i < str_len(text)) { h = (h ^ text[i]::u64) * 1099511628211; i = i + 1; }
-        fp.hash = h;
-        strutil.str_free(alloc, text);
-    }
     ret fp;
+}
+
+# whether `path` still matches the fingerprint recorded in `prev`
+#
+# `prev` is refreshed on a mismatch so one disk change triggers one rebuild
+# rather than one per scan until the snapshot is replaced.
+# ---
+# path: absolute source path to check
+# prev: recorded fingerprint, updated in place on a mismatch
+# ret:  true when the file looks unchanged
+fun fingerprint_matches(path: str, prev: *SourceFingerprint) bool {
+    val now: SourceFingerprint = file_fingerprint(path);
+    if (now.mtime == prev.mtime && now.size == prev.size) { ret true; }
+    @prev = now;
+    ret false;
 }
 
 # where symbol `sym` is declared, as an Ast / SourceFile / URI triple.

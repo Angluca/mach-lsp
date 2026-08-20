@@ -58,6 +58,7 @@ use sema:   mach.lang.fe.sema;
 
 use transport: mls.transport;
 use json:      mls.json;
+use sj:        std.data.json;
 use documents: mls.documents;
 use features:  mls.features;
 use positions: mls.positions;
@@ -84,12 +85,12 @@ rec Analyzed {
 
 # answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol
-pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -462,12 +463,12 @@ fun compose_kind_name(sym: *res.Symbol, interner: *intern.Interner, alloc: *Allo
 # symbol's declaration. lands in the buffer for a local symbol and in the
 # defining dependency module's on-disk file for a cross-module one; null when
 # the position is not on a resolved symbol or its declaration cannot be located
-pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1011,12 +1012,12 @@ fun field_rename_group_json(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarge
 # the symbol at the cursor - its declaration plus every use-site across the
 # loaded project graph (the requesting buffer and every other module that
 # references the symbol). empty when the position is not on a resolved symbol
-pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1056,15 +1057,15 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 # editor's to rewrite (whether referenced cross-module or opened as the buffer
 # itself), so those yield an empty edit. an empty edit is also returned when a
 # module-scope symbol resolves to a dependency owned by the user
-pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    val new_name: str = json.extract_string(body, "\"newName\"", alloc);
+    val new_name: str = json.text(json.member(params, "newName"), alloc);
     if (new_name == nil) { reply_null(alloc, id_raw); ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1140,12 +1141,12 @@ fun param_generic_doc_span(an: Analyzed, sym: *res.Symbol, name: str, out: *toke
 # project-owned cross-module one) or a field of a known, project-owned record, or
 # null when it is not the editor's to rename (an unresolved position, a dependency
 # symbol, or a field of a vendored record)
-pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1183,8 +1184,8 @@ fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: tok
 # answer textDocument/documentSymbol with a flat list of the
 # file's top-level declarations as DocumentSymbol nodes (name, kind, range,
 # selectionRange)
-pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     val d: *documents.Document = documents.find(docs, uri);
@@ -1202,8 +1203,8 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
 
 # answer textDocument/completion with the in-scope top-level names
 # (module decls, `use` aliases / imports, primitives) as CompletionItems
-pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
@@ -1340,11 +1341,12 @@ fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.
 # analyze the target document and resolve the request's cursor position
 # to a byte offset, or none when the document is unknown / unresolvable or the
 # position is invalid (callers fall back to a null / empty reply)
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
+fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
     if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
 
-    val line: i64 = json.extract_number_after(body, "\"position\"", "\"line\"", alloc);
-    val ch:   i64 = json.extract_number_after(body, "\"position\"", "\"character\"", alloc);
+    val pos: *sj.Value = json.member(params, "position");
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) { ret none[usize](); }
 
     ret positions.offset_at(out.file, line::usize, ch::usize);

@@ -45,6 +45,19 @@ val MAX_DIAGNOSTICS: usize = 200;
 
 # publish compiler-owned diagnostics for a document's exact snapshot, falling
 # back to isolated editor diagnostics outside a project
+#
+# The analysis is DRIVEN here rather than merely read. Publishing used to take
+# whatever snapshot a previous request happened to leave behind, so a file with
+# a type error opened clean and only started reporting once some unrelated
+# hover or definition request built the project - and stopped again when that
+# snapshot was invalidated. Diagnostics are the one output that must not depend
+# on what the user asked for, so they own the pipeline: `document_view` loads
+# or refreshes the root, and the result is parse, resolve, and sema at the same
+# fidelity `mach build` reports.
+#
+# `project.refresh_inputs` makes this a revision check once the snapshot is
+# current, so republishing every open document after a change costs one
+# comparison per document rather than one analysis.
 # ---
 # w:     project workspace
 # es:    standalone editor fallback
@@ -54,7 +67,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var list: *diag.DiagList = nil;
     var sources: *src.SourceMap = nil;
     var own: src.FileId = d.file_id;
-    val vr: Result[project.DocumentView, str] = project.document_view_loaded(w, d);
+    val vr: Result[project.DocumentView, str] = project.document_view(w, d);
     if (!is_err[project.DocumentView, str](vr)) {
         val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
         list = ?v.root.s.diags;

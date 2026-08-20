@@ -172,6 +172,35 @@ class LspSession:
             f"diagnostics for {uri}",
         )
 
+    def quiet_diagnostics(self, settle: float = 0.4) -> list[dict[str, Any]]:
+        """Return any diagnostics published since the last wait.
+
+        Diagnostics belong to document state, so a feature request must not
+        produce one. Anything a request republished is already in `pending`
+        (the request's own reply drained the inbox past it); `settle` also
+        catches a publish still in flight behind that reply.
+        """
+        found = [m for m in self.pending
+                 if m.get("method") == "textDocument/publishDiagnostics"]
+        self.pending = [m for m in self.pending
+                        if m.get("method") != "textDocument/publishDiagnostics"]
+        deadline = time.monotonic() + settle
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return found
+            try:
+                item = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                return found
+            if item is None or isinstance(item, BaseException):
+                return found
+            self.message_count += 1
+            if item.get("method") == "textDocument/publishDiagnostics":
+                found.append(item)
+            else:
+                self.pending.append(item)
+
     def finish(self, send_exit: bool = True) -> tuple[int, float, int]:
         """Perform shutdown/exit and return process telemetry."""
         response = self.request("shutdown")
@@ -595,12 +624,19 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 {"textDocument": {"uri": alpha_main.as_uri(), "version": 2},
                  "contentChanges": [{"text": main_v2}]},
             )
-            session.diagnostics(alpha_main.as_uri(), 2)
+            # the change itself publishes every open document of the affected
+            # root at its own version: diagnostics follow document state, and
+            # the analysis they need is driven here rather than by whichever
+            # feature request happens to come next
+            assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 2), False, 2)
+            assert_diagnostics(session.diagnostics(alpha_def.as_uri(), 2), False, 2)
+            session.quiet_diagnostics()
             live_result = definition(session, alpha_main, main_v2, "live")
             require(live_result.get("uri") == alpha_def.as_uri(),
                     f"unsaved imported export did not resolve: {live_result!r}")
-            assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 2), False, 2)
-            assert_diagnostics(session.diagnostics(alpha_def.as_uri(), 2), False, 2)
+            republished = session.quiet_diagnostics()
+            require(not republished,
+                    f"a feature request republished diagnostics: {republished!r}")
 
             broken_text = main_v2 + "\nuse alpha.missing.nope;\n"
             session.notify(
@@ -639,9 +675,8 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 {"textDocument": {"uri": alpha_main.as_uri(), "version": 5},
                  "contentChanges": [{"text": alpha_text}]},
             )
-            session.diagnostics(alpha_main.as_uri(), 5)
-            assert_definition(session, alpha_main, alpha_def, alpha_text)
             assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 5), False, 5)
+            assert_definition(session, alpha_main, alpha_def, alpha_text)
 
             # A dependency opened before its ancestor graph is loaded must still
             # enter that graph through a filesystem overlay. Current `[dep.*]`
@@ -846,6 +881,52 @@ def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> Non
     require(result.stdout == b"", f"{label}: server emitted a partial response")
 
 
+def run_exit_paths(server: Path, timeout: float) -> None:
+    """Every lifecycle ending must terminate, with the documented code.
+
+    `exit` means terminate, and a client may hold its end of the pipe open while
+    it waits. With analysis on a worker the reading thread is parked in read(2),
+    so an `exit` that only set a flag would leave the process alive until the
+    client happened to close stdin.
+    """
+    cases = (
+        (("shutdown", "exit"), False, 0),
+        (("shutdown", "exit"), True, 0),
+        (("exit",), False, 1),
+        (("shutdown",), True, 0),
+        ((), True, 1),
+    )
+    for steps, close_stdin, expected in cases:
+        with tempfile.TemporaryDirectory(prefix="mls-exit-") as directory:
+            root = Path(directory).resolve()
+            session = LspSession(server, root, timeout)
+            try:
+                session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+                session.notify("initialized", {})
+                if "shutdown" in steps:
+                    response = session.request("shutdown")
+                    require(response.get("result", object()) is None,
+                            f"invalid shutdown response: {response!r}")
+                if "exit" in steps:
+                    session.notify("exit")
+                if close_stdin:
+                    session.proc.stdin.close()
+                try:
+                    code = session.proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    session.proc.kill()
+                    session.proc.wait()
+                    raise ProtocolError(
+                        f"server did not terminate for {steps!r} "
+                        f"(stdin closed: {close_stdin})") from error
+                require(code == expected,
+                        f"{steps!r} (stdin closed: {close_stdin}) exited {code}, want {expected}")
+            finally:
+                if session.proc.poll() is None:
+                    session.proc.kill()
+                    session.proc.wait()
+
+
 def run_clean_eof(server: Path, timeout: float) -> None:
     """A clean EOF after shutdown is not a malformed-frame failure."""
     with tempfile.TemporaryDirectory(prefix="mls-protocol-eof-") as directory:
@@ -922,6 +1003,7 @@ def main() -> int:
         run_active_watcher_fallback(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
+        run_exit_paths(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -932,6 +1014,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  clean EOF after shutdown: exit 0")
+    print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
