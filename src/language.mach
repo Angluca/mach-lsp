@@ -43,6 +43,8 @@ use std.allocator.deallocate;
 use mem: std.memory;
 
 use sess:   mach.lang.session;
+use strutil: std.text.string;
+use trace:   mls.trace;
 use src:    mach.lang.source;
 use intern: mach.lang.intern;
 use editor: mach.lang.editor;
@@ -94,7 +96,7 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
@@ -290,6 +292,15 @@ fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
 fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
     var sig: str = nil;
     var doc: str = nil;
+
+    # a module alias's decl is the `use` line the cursor is already on, so
+    # rendering it back is no answer. name the module instead.
+    var mid: sess.ModuleId;
+    if (module_alias_target(sym, ?mid) && an.root != nil) {
+        val fqn: str = project.module_fqn(ws, an.root, mid);
+        if (fqn != nil) { ret module_hover_markdown(fqn, alloc); }
+    }
+
     val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
     if (is_some[project.Site](site_o)) {
         var site: project.Site = unwrap[project.Site](site_o);
@@ -472,7 +483,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
@@ -485,6 +496,12 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
+
+    # a module alias names a file, not a declaration: `sym.decl` is the `use`
+    # line the cursor is already on, and the module has no name span to point
+    # at. its target ModuleId rides `sym.slot`, so answer with the module's own
+    # file at its start.
+    if (module_definition(ws, an, sym, alloc, id_raw)) { ret; }
 
     val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
     if (!is_some[project.Site](site_o)) { reply_null(alloc, id_raw); ret; }
@@ -505,6 +522,71 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 
     json.free_str(loc, alloc);
     json.free_str(id_raw, alloc);
+}
+
+# `module <fqn>` as a fenced hover body
+fun module_hover_markdown(fqn: str, alloc: *Allocator) str {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "```mach\nmodule ");
+    json.buf_push(?b, fqn);
+    json.buf_push(?b, "\n```");
+    val view: str = json.buf_str(?b);
+    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    val n: usize = str_len(view);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { json.buf_dnit(?b); ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
+    out[n] = 0;
+    json.buf_dnit(?b);
+    ret out::str;
+}
+
+# whether `sym` is a module alias (`use json: mls.json;`) rather than a symbol
+# import (`use std.types.string.str_equals;`), and the module it names
+#
+# The two forms are distinguished by kind, not by a flag: a module alias binds
+# SYM_USE carrying the target ModuleId in `slot`, while a symbol import binds
+# SYM_IMPORTED carrying the imported declaration. `SYM_FLAG_MODULE` is set on
+# the PublicSymbol snapshot of a re-exported alias, not on the local symbol, so
+# it is not the discriminator here.
+# ---
+# sym: the symbol under the cursor
+# out: receives the aliased module id
+# ret: true when `sym` is a module alias
+fun module_alias_target(sym: *res.Symbol, out: *sess.ModuleId) bool {
+    if (sym.kind != res.SYM_USE) { ret false; }
+    @out = sym.slot::sess.ModuleId;
+    ret true;
+}
+
+# emit the Location of the module `sym` aliases, at the start of its file
+# ---
+# ws:     the workspace
+# an:     the analyzed request document
+# sym:    the symbol under the cursor
+# alloc:  request allocator
+# id_raw: the raw JSON request id, consumed on success
+# ret:    true when a module Location was emitted and replied
+fun module_definition(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, alloc: *Allocator, id_raw: str) bool {
+    var mid: sess.ModuleId;
+    if (!module_alias_target(sym, ?mid)) { ret false; }
+    if (an.root == nil) { ret false; }
+    val muri: str = project.module_uri(ws, an.root, mid);
+    if (muri == nil) { ret false; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"result\":{\"uri\":");
+    json.buf_push_quoted(?b, muri);
+    json.buf_push(?b, ",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(?b);
+    strutil.str_free(ws.alloc, muri);
+    json.free_str(id_raw, alloc);
+    ret true;
 }
 
 # the type-driven go-to-definition path for a record / union
@@ -1021,7 +1103,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
@@ -1069,7 +1151,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # a cursor on a field name yields no SymbolRef - fall through to the
         # type-driven field rename, which gates on the record's ownership.
@@ -1150,7 +1232,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # a cursor on a field name yields no SymbolRef - accept it when it resolves
         # to a field of a project-owned record (the same gate field rename uses)
