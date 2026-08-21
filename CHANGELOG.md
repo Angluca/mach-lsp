@@ -28,10 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   25 of 39 have them. (#164)
 
 ### Changed
-- language: `documentSymbol` and `completion` emit through `json.Buf` in a single
-  pass instead of rendering every entry twice, once to size and once to fill.
-  Incidentally faster: `documentSymbol` 13 ms → 5 ms, `completion` 14 ms → 0.2 ms
-  on this repository. (#171, partial)
+- render: a new `mls.render` is the only place that knows how an LSP value is
+  spelled - Range, Location, TextEdit, the response envelope, the standard empty
+  replies. Responses were previously assembled by summing fragment lengths into
+  an exact allocation and filling it in a second pass, which meant every
+  data-dependent payload was traversed twice and each entry rendered twice, and a
+  disagreement between the two passes under-filled the buffer so `str_len`
+  truncated the frame at the resulting NUL - a valid `Content-Length` over a body
+  stopping mid-token. `json.buf_len` / `buf_rewind` cover the one case that
+  needed the sizing pass, a rename group only known to be empty once walked.
+  `language.mach` 2364 → 1968 lines, two-pass emitters 4 → 0, manual
+  `allocate[u8]` assembly 22 → 4. Incidentally faster: `documentSymbol`
+  13 ms → 5 ms, `completion` 14 ms → 0.2 ms. (#171)
 - completion: an empty result is the same `CompletionList` shape as a populated
   one rather than a bare array, so the method has one response type.
 
