@@ -1041,6 +1041,67 @@ def run_completion_context(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_document_highlight(server: Path, timeout: float) -> None:
+    """Occurrences in the active file, classified read or write."""
+    with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "imp", 4)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            lines = text.splitlines()
+
+            def highlights(needle: str, within: str) -> list[dict[str, Any]]:
+                line = next(i for i, v in enumerate(lines) if within in v)
+                response = session.request(
+                    "textDocument/documentHighlight",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": lines[line].index(needle) + 1}},
+                )
+                items = response.get("result")
+                require(isinstance(items, list), f"documentHighlight is not a list: {items!r}")
+                for item in items:
+                    assert_range(item.get("range"), "highlight.range")
+                    require(item.get("kind") in (1, 2, 3),
+                            f"highlight kind is not a DocumentHighlightKind: {item!r}")
+                    require("uri" not in item,
+                            f"a highlight carried a uri, so it is a Location: {item!r}")
+                return items
+
+            # a top-level declaration: its own name is a write, its uses reads
+            found = highlights("watched", "use imp.defs.watched;")
+            require(found, f"an import was not highlighted: {found!r}")
+
+            # an imported symbol used in the body
+            uses = highlights("take", "ret take")
+            require(uses, "an imported symbol produced no highlight")
+            require({item["kind"] for item in uses} <= {1, 2, 3},
+                    f"unexpected highlight kinds: {uses!r}")
+
+            # a cursor on nothing answers an empty list, not an error
+            blank = session.request(
+                "textDocument/documentHighlight",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": 0, "character": 0}},
+            )
+            require(isinstance(blank.get("result"), list),
+                    f"a cursor on nothing did not answer a list: {blank!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1282,6 +1343,7 @@ def main() -> int:
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_completion_context(server, args.timeout)
+        run_document_highlight(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1297,6 +1359,7 @@ def main() -> int:
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests fields, variants, parameters, and generics")
     print("  completion answers for the cursor: members, exports, prefixes")
+    print("  documentHighlight classifies reads and writes in the active file")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")

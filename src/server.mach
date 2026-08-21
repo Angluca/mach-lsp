@@ -55,6 +55,7 @@ val FEATURE_RENAME:          u8 = 3;
 val FEATURE_PREPARE_RENAME:  u8 = 4;
 val FEATURE_DOCUMENT_SYMBOL: u8 = 5;
 val FEATURE_COMPLETION:      u8 = 6;
+val FEATURE_DOCUMENT_HIGHLIGHT: u8 = 7;
 
 val WATCH_FALLBACK: u8 = 0;
 val WATCH_PENDING:  u8 = 1;
@@ -250,6 +251,7 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     if (str_equals(method, "textDocument/prepareRename"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_PREPARE_RENAME); ret; }
     if (str_equals(method, "textDocument/documentSymbol")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL); ret; }
     if (str_equals(method, "textDocument/completion"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_COMPLETION); ret; }
+    if (str_equals(method, "textDocument/documentHighlight")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT); ret; }
 
     trace.logf("server: unhandled method {}", method);
     json.free_str(method, a);
@@ -268,7 +270,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push_id(?b, json.member(root, "id"));
-    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -415,6 +417,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_PREPARE_RENAME)  { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_SYMBOL) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_COMPLETION)      { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_DOCUMENT_HIGHLIGHT) { language.document_highlight(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
