@@ -507,18 +507,40 @@ fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
     val s: *u8 = source::*u8;
     val end: usize = sp.offset + sp.len;
     var i: usize = sp.offset;
+    var at_break: bool = false;
     for (i < end) {
         if (s[i] == '\n') {
             i = i + 1;
             for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
             if (i < end && s[i] == '#') { i = i + 1; }
             for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
-            if (buf != nil) { buf[off] = ' '; }
-            off = off + 1;
+
+            # a comment line with nothing after its `#` is a paragraph break, not
+            # a wrapped line. folding it to a space ran two paragraphs together
+            # and left the join marked only by a double space, which no renderer
+            # treats as a boundary
+            if (i >= end || s[i] == '\n') {
+                if (!at_break) {
+                    if (buf != nil) { buf[off] = '\n'; }
+                    if (buf != nil) { buf[off + 1] = '\n'; }
+                    off = off + 2;
+                    at_break = true;
+                }
+                cnt;
+            }
+
+            # a paragraph break already separated these; the joining space a
+            # wrapped line needs would show as an indent on the new paragraph
+            if (!at_break) {
+                if (buf != nil) { buf[off] = ' '; }
+                off = off + 1;
+            }
+            at_break = false;
             cnt;
         }
         if (buf != nil) { buf[off] = s[i]; }
         off = off + 1;
+        at_break = false;
         i = i + 1;
     }
     ret off;
