@@ -1834,11 +1834,19 @@ def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> Non
 
 
 def run_crash_containment(server: Path, timeout: float) -> None:
-    """A worker fault is reported, not a closed pipe.
+    """A worker fault is reported, and the session comes back.
 
     The compiler front end runs over buffers the user is actively breaking, and
     `std` exposes no way to trap an in-process fault, so the process the editor
     talks to does not run it. Killing the worker stands in for the fault.
+
+    Surviving the fault is not the same as recovering from it. Everything the
+    worker knew - which documents are open and what they now contain - died with
+    it, and the client will not send any of it again: `didOpen` arrives once, and
+    every `didChange` after it is a span against text only the worker kept. So
+    the supervisor keeps its own copy and replays it. What is checked here is
+    that the replay carries the EDITED text, because replaying the text the file
+    was opened with would look identical until the moment it matters.
 
     The CONTAINMENT is portable; standing in for a fault is not. Finding the
     child needs `pgrep` and killing it needs `SIGKILL`, neither of which exists
@@ -1849,6 +1857,16 @@ def run_crash_containment(server: Path, timeout: float) -> None:
         print("  crash containment: skipped (needs pgrep and SIGKILL)")
         return
 
+    def worker_of(session: "LspSession") -> int:
+        for _ in range(200):
+            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                      capture_output=True, text=True).stdout.split()
+            if children:
+                return int(children[0])
+            time.sleep(0.02)
+        raise AssertionError("no analysis worker: the compiler runs in the client process")
+
+    # a crash is survived, and the session resumes with the text it had
     with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
         root = Path(directory).resolve()
         main, _, text = write_project(root, "crash", 5)
@@ -1865,9 +1883,17 @@ def run_crash_containment(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
 
             # the process the client talks to must not be the one analysing
-            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
-                                      capture_output=True, text=True).stdout.split()
-            require(children, "no analysis worker: the compiler runs in the client process")
+            worker = worker_of(session)
+
+            # an edit the client will never send again: it exists only in the
+            # worker's buffer and in whatever the supervisor kept
+            edited = text + "\npub fun survived_the_crash(n: i32) i32 { ret n; }\n"
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(main.as_uri(), 2)
 
             pending = session.next_id
             session._send({"jsonrpc": "2.0", "id": pending,
@@ -1876,23 +1902,82 @@ def run_crash_containment(server: Path, timeout: float) -> None:
                                       "position": {"line": 0, "character": 4},
                                       "context": {"includeDeclaration": True}}})
             session.next_id += 1
-            os.kill(int(children[0]), signal.SIGKILL)
+            os.kill(worker, signal.SIGKILL)
 
-            # the outstanding request is answered rather than left hanging
+            # The request is answered rather than left hanging. Whether the
+            # answer is the crash error or a real result is a race the test
+            # cannot win - under load the worker sometimes finishes before the
+            # signal lands - and it is not what needs guarding. What needs
+            # guarding is that SOMETHING comes back for that id, because the
+            # failure this replaces was a client waiting on it forever.
             answer = session.wait_for(
                 lambda item: item.get("id") == pending,
                 "a response after the worker died")
-            require("error" in answer, f"a crash produced a result: {answer!r}")
+            require("error" in answer or "result" in answer,
+                    f"the request the worker died on was never answered: {answer!r}")
 
-            # and the person is told what happened
+            # and the person is told what happened, as a warning rather than an
+            # error, because the session is coming back
             note = session.wait_for(
                 lambda item: item.get("method") == "window/showMessage",
                 "a message explaining the crash")
             require("crash" in note["params"]["message"].lower(),
                     f"the message does not explain the crash: {note!r}")
+            require(note["params"].get("type") == 2,
+                    f"a recovered crash was not reported as a warning: {note!r}")
+
+            # the session works again, against the edited text, without the
+            # client re-opening anything
+            symbols = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            names = [s["name"] for s in (symbols.get("result") or [])]
+            require(names, f"the session did not recover: {symbols!r}")
+            require("survived_the_crash" in names,
+                    f"the replay lost the edits made before the crash: {names!r}")
+
+            # exactly one initialize response reached the client: the replayed
+            # worker answers the id the client already holds, and forwarding it
+            # would be two responses for one request
+            stray = [item for item in session.pending
+                     if item.get("id") == 1 and ("result" in item or "error" in item)]
+            require(not stray,
+                    f"the replayed initialize response was forwarded to the client: {stray!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+    # a worker that keeps dying is not replaced forever
+    with tempfile.TemporaryDirectory(prefix="mls-crashloop-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "loop", 6)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            # each replacement is killed before it answers anything, which is
+            # what a worker dying on the session itself looks like
+            for _ in range(8):
+                try:
+                    os.kill(worker_of(session), signal.SIGKILL)
+                except (AssertionError, ProcessLookupError):
+                    break
+                time.sleep(0.15)
+                if session.proc.poll() is not None:
+                    break
 
             code = session.proc.wait(timeout=timeout)
-            require(code == 3, f"a worker crash exited {code}, want 3")
+            require(code == 3, f"a crash loop exited {code}, want 3")
             finished = True
         finally:
             if not finished:
@@ -2058,7 +2143,7 @@ def main() -> int:
     print("  hover renders headers, expression types, and the client's format")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
-    print("  a worker crash is answered, explained, and exits 3")
+    print("  a worker crash is answered, explained, and replayed into a replacement")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
