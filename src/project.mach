@@ -66,6 +66,7 @@ use json:      mls.json;
 use trace:     mls.trace;
 use mtypes:    mls.types;
 use documents: mls.documents;
+use positions: mls.positions;
 
 # where a resolved symbol's declaration lives - the Ast and SourceFile to
 # read its spans from, and the document URI to report. for a buffer-local symbol
@@ -73,12 +74,12 @@ use documents: mls.documents;
 # dependency module's on-disk file
 # ---
 # a:     Ast owning the symbol's decl (spans are decl-ids into this tree)
-# file:  SourceFile backing `a` (byte offset <-> position, span text)
-# uri:   document URI of `file`
+# text:  SourceFile backing `a`, paired with its length (span text, positions)
+# uri:   document URI of `text.file`
 # owned: whether `uri` is heap-owned by this Site and must be freed
 pub rec Site {
     a:     *ast.Ast;
-    file:  *src.SourceFile;
+    text:  positions.Text;
     uri:   str;
     owned: bool;
 }
@@ -1178,7 +1179,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
     if (sym.origin == own) {
         var s: Site;
         s.a     = own_a;
-        s.file  = own_file;
+        s.text  = positions.text_of(own_file);
         s.uri   = uri;
         s.owned = false;
         ret some[Site](s);
@@ -1194,7 +1195,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
 
     var s: Site;
     s.a     = m.a;
-    s.file  = unwrap[*src.SourceFile](fo);
+    s.text  = positions.text_of(unwrap[*src.SourceFile](fo));
     s.uri   = furi;
     s.owned = true;
     ret some[Site](s);
@@ -1222,11 +1223,11 @@ pub fun free_site(w: *Workspace, site: *Site) {
 # ---
 # a:    the module's parsed Ast (decl / expr / type ids index into it)
 # rr:   the module's ResolveResult side tables
-# file: the SourceFile backing `a` (byte offset <-> position, span text)
+# text: the SourceFile backing `a`, paired with its length (positions, span text)
 pub rec ModuleView {
     a:    *ast.Ast;
     rr:   *res.ResolveResult;
-    file: *src.SourceFile;
+    text: positions.Text;
 }
 
 # compiler-owned snapshot of one open document.
@@ -1236,7 +1237,7 @@ pub rec DocumentView {
     a:        *ast.Ast;
     rr:       *res.ResolveResult;
     sr:       *sema.SemaResult;
-    file:     *src.SourceFile;
+    text:     positions.Text;
     interner: *intern.Interner;
     revision: u64;
     file_id:  src.FileId;
@@ -1284,7 +1285,7 @@ fun view_from_root(root: *Root, d: *documents.Document) Result[DocumentView, str
     v.a = m.a;
     v.rr = m.resolve_result;
     v.sr = m.sema_result;
-    v.file = unwrap[*src.SourceFile](fo);
+    v.text = positions.text_of(unwrap[*src.SourceFile](fo));
     v.interner = ?root.s.interner;
     v.revision = root.snapshot_revision;
     v.file_id = m.file_id;
@@ -1318,7 +1319,7 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) Option[Modul
     var v: ModuleView;
     v.a    = m.a;
     v.rr   = m.resolve_result;
-    v.file = unwrap[*src.SourceFile](fo);
+    v.text = positions.text_of(unwrap[*src.SourceFile](fo));
     ret some[ModuleView](v);
 }
 
@@ -1366,7 +1367,7 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 # origin:       ModuleId of the declaring module
 # decl:         DeclId of the rec / uni declaration in `origin`'s Ast
 # a:            the declaring module's parsed Ast (field spans index into it)
-# file:         SourceFile backing `a`
+# text:         SourceFile backing `a`, paired with its length
 # fields_start: start index into `a.typed_names` of the first field
 # fields_len:   number of fields (record fields / union variants)
 # is_rec:       true for a record, false for a union
@@ -1374,7 +1375,7 @@ pub rec RecordSite {
     origin:       sess.ModuleId;
     decl:         id.DeclId;
     a:            *ast.Ast;
-    file:         *src.SourceFile;
+    text:         positions.Text;
     fields_start: u32;
     fields_len:   u32;
     is_rec:       bool;
@@ -1469,7 +1470,7 @@ fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, a: *ast.Ast, file: 
     rs.origin = origin;
     rs.decl   = decl;
     rs.a      = a;
-    rs.file   = file;
+    rs.text   = positions.text_of(file);
     rs.is_rec = is_rec;
     if (is_rec) {
         rs.fields_start = d.data.rec_.fields_start;
