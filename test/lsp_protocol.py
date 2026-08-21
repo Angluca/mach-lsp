@@ -929,6 +929,40 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
             require("children" not in by_name["answer"] or not by_name["answer"]["children"],
                     "a val reported children it does not have")
 
+            # The outline reuses the buffer's cached parse rather than re-parsing
+            # per request, which is only correct while an edit drops that cache.
+            # A stale outline is silent - it looks like a working feature naming
+            # symbols that are no longer there - so the invalidation is pinned.
+            edited = defs_text + "\npub fun freshly_added(q: i32) i32 { ret q; }\n"
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": defs.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(defs.as_uri(), 2)
+            after = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            after_names = [s["name"] for s in (after.get("result") or [])]
+            require("freshly_added" in after_names,
+                    f"documentSymbol served a stale parse after an edit: {after_names!r}")
+            reissued = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            require([s["name"] for s in (reissued.get("result") or [])] == after_names,
+                    "documentSymbol is not stable across identical requests")
+
+            # and a decl removed by an edit must leave the outline
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": defs.as_uri(), "version": 3},
+                 "contentChanges": [{"text": defs_text}]},
+            )
+            session.diagnostics(defs.as_uri(), 3)
+            reverted = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            reverted_names = [s["name"] for s in (reverted.get("result") or [])]
+            require("freshly_added" not in reverted_names,
+                    f"a removed declaration survived in the outline: {reverted_names!r}")
+
             # still syntax-only: it must answer without a compiler root
             manifest = defs.parents[1] / "mach.toml"
             manifest_text = manifest.read_text(encoding="utf-8")
@@ -2011,7 +2045,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
-    print("  documentSymbol nests fields, variants, parameters, and generics")
+    print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  documentHighlight classifies reads and writes in the active file")
     print("  workspace/symbol searches loaded roots, best matches first")
