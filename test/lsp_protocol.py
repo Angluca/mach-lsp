@@ -1102,6 +1102,70 @@ def run_document_highlight(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_workspace_symbol(server: Path, timeout: float) -> None:
+    """Find a declaration without already looking at it."""
+    with tempfile.TemporaryDirectory(prefix="mls-wsym-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "wsym", 6)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("workspaceSymbolProvider") is True,
+                    "workspaceSymbolProvider is not advertised")
+            session.notify("initialized", {})
+
+            def query(text_: str) -> list[dict[str, Any]]:
+                response = session.request("workspace/symbol", {"query": text_})
+                items = response.get("result")
+                require(isinstance(items, list), f"workspace/symbol is not a list: {items!r}")
+                for item in items:
+                    require(isinstance(item.get("name"), str), f"symbol without a name: {item!r}")
+                    require(isinstance(item.get("kind"), int), f"symbol without a kind: {item!r}")
+                    location = item.get("location")
+                    require(isinstance(location, dict) and "uri" in location,
+                            f"symbol without a location: {item!r}")
+                    assert_range(location.get("range"), "symbol.location.range")
+                return items
+
+            # nothing is loaded yet: a query must answer, not block on a build
+            started = time.monotonic()
+            require(query("answer") == [], "an unloaded workspace returned symbols")
+            require(time.monotonic() - started < 2.0,
+                    "workspace/symbol forced a cold project load")
+
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            found = query("answer")
+            require(found, "a declared symbol was not found after loading")
+            names = [item["name"] for item in found]
+            require("answer" in names, f"the exact match is missing: {names!r}")
+            hit = next(item for item in found if item["name"] == "answer")
+            require(hit["location"]["uri"] == defs.as_uri(),
+                    f"symbol resolved to the wrong file: {hit!r}")
+            require(hit.get("containerName"), "no containerName to disambiguate the module")
+
+            # a leading match outranks an interior one
+            ranked = [item["name"] for item in query("Box")]
+            require(ranked and ranked[0] == "Box",
+                    f"an exact match was not ranked first: {ranked!r}")
+
+            require(query("zzz-no-such-symbol") == [], "a miss returned results")
+            require(query("") == [], "an empty query returned results")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1344,6 +1408,7 @@ def main() -> int:
         run_document_symbol_hierarchy(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_document_highlight(server, args.timeout)
+        run_workspace_symbol(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1360,6 +1425,7 @@ def main() -> int:
     print("  documentSymbol nests fields, variants, parameters, and generics")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  documentHighlight classifies reads and writes in the active file")
+    print("  workspace/symbol searches loaded roots, best matches first")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
