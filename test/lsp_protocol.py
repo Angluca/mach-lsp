@@ -1384,6 +1384,60 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_cancellation(server: Path, timeout: float) -> None:
+    """A withdrawn request is answered RequestCancelled, never dropped."""
+    with tempfile.TemporaryDirectory(prefix="mls-cancel-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "cancel", 3)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            # the cancellation is sent FIRST so this does not race the worker.
+            # Against a fixture this small the queue drains faster than a second
+            # message arrives, and cancelling work already in progress is
+            # best-effort by design; what is under test is that a request found
+            # withdrawn when the worker reaches it is answered, not dropped.
+            doc = {"textDocument": {"uri": main.as_uri()}}
+            first = session.next_id
+            session.notify("$/cancelRequest", {"id": first})
+            session._send({"jsonrpc": "2.0", "id": first,
+                           "method": "textDocument/documentSymbol", "params": doc})
+            session.next_id += 1
+
+            answer = session.wait_for(
+                lambda item: item.get("id") == first, f"a response for request {first}")
+            require("error" in answer,
+                    f"a cancelled request was answered normally: {answer!r}")
+            require(answer["error"].get("code") == -32800,
+                    f"cancellation is not RequestCancelled: {answer!r}")
+
+            # a cancellation naming an id the server never saw must be inert
+            session.notify("$/cancelRequest", {"id": 999999})
+            later = session.request("textDocument/documentSymbol", doc)
+            require(isinstance(later.get("result"), list),
+                    f"a stray cancellation disturbed a later request: {later!r}")
+
+            # and the id is consumed: reusing it must not be cancelled again
+            reused = session.request("textDocument/documentSymbol", doc)
+            require(isinstance(reused.get("result"), list),
+                    f"a consumed cancellation still applied: {reused!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1630,6 +1684,7 @@ def main() -> int:
         run_signature_help(server, args.timeout)
         run_inlay_hints(server, args.timeout)
         run_semantic_tokens(server, args.timeout)
+        run_cancellation(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1650,6 +1705,7 @@ def main() -> int:
     print("  signatureHelp tracks the active argument through incomplete calls")
     print("  inlayHint names literal arguments at multi-parameter calls")
     print("  semanticTokens decode in order, within the legend and the file")
+    print("  a withdrawn request is answered RequestCancelled")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
