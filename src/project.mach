@@ -1882,18 +1882,71 @@ pub fun uri_of_path(alloc: *Allocator, path: str) str {
 }
 
 fun norm_uri(alloc: *Allocator, norm: str) str {
-    val scheme: str = "file://";
-    val plen: usize = str_len(norm);
-    val slen: usize = str_len(scheme);
-    val total: usize = slen + plen;
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, scheme);
-    off = append(buf, off, norm);
-    buf[off] = 0;
-    ret buf::str;
+    if (norm == nil) { ret nil; }
+    val n: usize = str_len(norm);
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "file://");
+
+    # A URI path uses `/` whatever the platform writes, and the authority slot
+    # must not be filled by accident. On POSIX the path already begins `/`, so
+    # concatenation produced `file:///a/b` and looked correct; on Windows
+    # `C:\dir` produced `file://C:\dir`, whose `C:` a client reads as the HOST.
+    # UNC is the one form that genuinely has an authority: `//server/share`
+    # keeps it.
+    var i: usize = 0;
+    val unc: bool = n >= 2 && is_sep(norm[0]) && is_sep(norm[1]);
+    if (unc) { i = 2; }
+    or {
+        json.buf_push_byte(?b, '/');
+        if (n > 0 && is_sep(norm[0])) { i = 1; }
+    }
+
+    for (i < n) {
+        val c: u8 = norm[i];
+        if (is_sep(c)) { json.buf_push_byte(?b, '/'); }
+        or (uri_unreserved(c)) { json.buf_push_byte(?b, c); }
+        or { push_percent(?b, c); }
+        i = i + 1;
+    }
+
+    val view: str = json.buf_str(?b);
+    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    val out: str = json.dup(view, alloc);
+    json.buf_dnit(?b);
+    ret out;
+}
+
+# whether `c` separates path segments on either platform
+#
+# A path normalized on Windows carries `\`; one that came from a manifest or a
+# URI may still carry `/`. Both end up as `/` in a URI.
+fun is_sep(c: u8) bool {
+    ret c == '/' || c == '\\';
+}
+
+# whether `c` may appear literally in a URI path
+#
+# The unreserved set, plus `:` so a drive specifier survives as `C:` rather than
+# `C%3A`, which is legal but which clients render badly.
+fun uri_unreserved(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    if (c == '-' || c == '.' || c == '_' || c == '~') { ret true; }
+    ret c == ':';
+}
+
+# append `c` as a percent escape
+fun push_percent(b: *json.Buf, c: u8) {
+    json.buf_push_byte(b, '%');
+    json.buf_push_byte(b, hex_digit((c::i64 / 16) & 15));
+    json.buf_push_byte(b, hex_digit(c::i64 & 15));
+}
+
+fun hex_digit(v: i64) u8 {
+    if (v < 10) { ret ('0'::i64 + v)::u8; }
+    ret ('A'::i64 + (v - 10))::u8;
 }
 
 # copy `s` into `buf` at `offset`, returning the new offset
@@ -2016,6 +2069,55 @@ test "project: normalization collapses . and .. without escaping the root" {
     val c: str = normalize_path(?pa, "/../x");
     if (c == nil)                                       { fail = true; }
     or { if (!str_equals(c, native(?pa, "/x")))         { fail = true; } }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "project: a path becomes a file URI a client can parse" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+
+    # a posix path: three slashes, and a space is escaped
+    val a: str = norm_uri(?pa, "/home/u/a b.mach");
+    if (a == nil)                                        { fail = true; }
+    or { if (!str_equals(a, "file:///home/u/a%20b.mach")) { fail = true; } }
+
+    # a windows drive path must not put `C:` in the authority slot
+    val b: str = norm_uri(?pa, "C:\\src\\main.mach");
+    if (b == nil)                                        { fail = true; }
+    or { if (!str_equals(b, "file:///C:/src/main.mach")) { fail = true; } }
+
+    # UNC is the one form that genuinely has an authority
+    val c: str = norm_uri(?pa, "\\\\server\\share\\x.mach");
+    if (c == nil)                                        { fail = true; }
+    or { if (!str_equals(c, "file://server/share/x.mach")) { fail = true; } }
+
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the two directions must compose: a URI that decodes to a path must rebuild to
+# the same URI, or a document opened by one spelling is a different document
+# from the same file reached by go-to-definition
+test "project: uri and path round-trip" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val p1: str = uri_to_path(?pa, "file:///home/u/a%20b.mach");
+    if (p1 == nil) { fail = true; }
+    or {
+        val u1: str = norm_uri(?pa, p1);
+        if (u1 == nil)                                        { fail = true; }
+        or { if (!str_equals(u1, "file:///home/u/a%20b.mach")) { fail = true; } }
+    }
+    val p2: str = uri_to_path(?pa, "file:///C:/src/main.mach");
+    if (p2 == nil) { fail = true; }
+    or {
+        val u2: str = norm_uri(?pa, p2);
+        if (u2 == nil)                                        { fail = true; }
+        or { if (!str_equals(u2, "file:///C:/src/main.mach")) { fail = true; } }
+    }
     if (fail) { ret 1; }
     ret 0;
 }
