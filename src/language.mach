@@ -52,6 +52,7 @@ use type:   mach.lang.type;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
+use aexpr:  mach.lang.fe.ast.expr;
 use decl:   mach.lang.fe.ast.decl;
 use atype:  mach.lang.fe.ast.type;
 use fedoc:  mach.lang.fe.doc;
@@ -1044,6 +1045,145 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     deallocate[XRef](alloc, refs, cap);
 }
 
+# answer textDocument/documentHighlight with every occurrence of the symbol at
+# the cursor within this document, classified read or write
+#
+# The same query `references` answers, scoped to one file and with an access
+# kind. Clients fire it on every cursor move, so it never leaves the buffer's
+# own analysis: no other module is walked and no rebuild is triggered.
+pub fun document_highlight(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an: Analyzed;
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_empty_array(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
+
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
+    if (!is_some[features.SymbolRef](ro)) {
+        if (field_highlights(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
+        render.reply_empty_array(alloc, id_raw); ret;
+    }
+    val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    push_symbol_highlights(?b, an, sr.sym_id);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# append every occurrence of `target` in the buffer, classified by access
+#
+# Lives apart from the request handler because that handler takes an `id`
+# parameter, which shadows the `mach.lang.fe.ast.id` module alias the walk needs.
+fun push_symbol_highlights(b: *json.Buf, an: Analyzed, target: res.SymbolId) {
+    var emitted: usize = 0;
+
+    var bind: token.Span;
+    if (binding_span(an, target, ?bind)) {
+        push_highlight(b, an.file, bind, HIGHLIGHT_TEXT, emitted > 0);
+        emitted = emitted + 1;
+    }
+
+    var di: usize = 0;
+    for (di < an.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
+        if (is_some[token.Span](dso)) {
+            push_highlight(b, an.file, unwrap[token.Span](dso), HIGHLIGHT_WRITE, emitted > 0);
+            emitted = emitted + 1;
+        }
+        val iso: Option[token.Span] = features.import_ref_span(an.a, an.rr, di::id.DeclId, target, an.file);
+        if (is_some[token.Span](iso)) {
+            push_highlight(b, an.file, unwrap[token.Span](iso), HIGHLIGHT_TEXT, emitted > 0);
+            emitted = emitted + 1;
+        }
+        di = di + 1;
+    }
+
+    var ei: usize = 0;
+    for (ei < an.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, target);
+        if (is_some[token.Span](so)) {
+            var kind: i64 = HIGHLIGHT_READ;
+            if (is_assign_target(an.a, ei::id.ExprId)) { kind = HIGHLIGHT_WRITE; }
+            push_highlight(b, an.file, unwrap[token.Span](so), kind, emitted > 0);
+            emitted = emitted + 1;
+        }
+        ei = ei + 1;
+    }
+
+    var ti: usize = 0;
+    for (ti < an.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, target);
+        if (is_some[token.Span](so)) {
+            push_highlight(b, an.file, unwrap[token.Span](so), HIGHLIGHT_READ, emitted > 0);
+            emitted = emitted + 1;
+        }
+        ti = ti + 1;
+    }
+}
+
+# highlight the field under the cursor across this document, for the positions
+# where name resolution leaves a value-field access unbound
+fun field_highlights(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+    if (an.root == nil || an.sr == nil) { ret false; }
+    val to: Option[FieldTarget] = field_target_at(ws, an, offset);
+    if (!is_some[FieldTarget](to)) { ret false; }
+    val t: FieldTarget = unwrap[FieldTarget](to);
+    val ti: *type.TypeInterner = project.type_interner(ws, an.root);
+
+    var s: FieldXRef;
+    s.a         = an.a;
+    s.sr        = an.sr;
+    s.file      = an.file;
+    s.uri       = uri;
+    s.declaring = an.own == t.rs.origin;
+    s.owned     = false;
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    var k: WalkSink = sink_init_mode(?b, alloc, SINK_HIGHLIGHT, nil, nil);
+    walk_field_sites(?s, ti, t, s.declaring, ?k);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+    ret true;
+}
+
+# whether expression `eid` is the left operand of an assignment, which makes a
+# reference through it a write rather than a read
+fun is_assign_target(a: *ast.Ast, eid: id.ExprId) bool {
+    var i: usize = 0;
+    for (i < a.expr_len) {
+        val eo: Option[*aexpr.Expr] = ast.get_expr(a, i::id.ExprId);
+        if (is_some[*aexpr.Expr](eo)) {
+            val e: *aexpr.Expr = unwrap[*aexpr.Expr](eo);
+            if (e.kind == aexpr.EXPR_KIND_BINARY && e.data.binary.op == aexpr.BIN_ASSIGN
+                && e.data.binary.lhs == eid) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# append one DocumentHighlight
+fun push_highlight(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    push_highlight_body(b, file, span, kind);
+}
+
+# one DocumentHighlight object, without the separating comma
+fun push_highlight_body(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64) {
+    json.buf_push(b, "{\"range\":");
+    render.span_range(b, file, span);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    json.buf_push_byte(b, '}');
+}
+
 # answer textDocument/rename with a WorkspaceEdit replacing every
 # reference to the symbol at the cursor with the requested new name, across the
 # whole project graph - the declaring file plus every module that imports or
@@ -1418,31 +1558,46 @@ rec WalkSink {
     b:        *json.Buf;
     alloc:    *Allocator;
     count:    usize;
+    mode:     u8;
     new_text: str;
     guard:    str;
 }
 
+# what shape one walked span is emitted as
+val SINK_LOCATION:  u8 = 0;
+val SINK_TEXT_EDIT: u8 = 1;
+val SINK_HIGHLIGHT: u8 = 2;
+
 # a sink appending into `b`
 #
-# `new_text` nil emits Location entries; non-nil emits TextEdit entries
-# replacing each span with that (unquoted) text. `guard`, when non-nil, drops
-# body spans not spelled exactly `guard`, so rename skips alias-spelled
-# references while references reports them. There is no sizing mode: one walk
-# writes, so the size and the content cannot disagree.
+# One walk feeds every consumer of a reference set: references wants Locations,
+# rename wants TextEdits, documentHighlight wants ranges with an access kind.
+# `guard`, when non-nil, drops body spans not spelled exactly `guard`, so rename
+# skips alias-spelled references while references reports them. There is no
+# sizing mode: one walk writes, so size and content cannot disagree.
 # ---
 # b:        buffer to append into
 # alloc:    request allocator
-# new_text: replacement text for TextEdit mode, or nil for Locations
+# mode:     which LSP shape to emit
+# new_text: replacement text for SINK_TEXT_EDIT, else nil
 # guard:    required spelling for body spans, or nil to admit all
 # ret:      an empty sink
-fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSink {
+fun sink_init_mode(b: *json.Buf, alloc: *Allocator, mode: u8, new_text: str, guard: str) WalkSink {
     var k: WalkSink;
     k.b        = b;
     k.alloc    = alloc;
     k.count    = 0;
+    k.mode     = mode;
     k.new_text = new_text;
     k.guard    = guard;
     ret k;
+}
+
+# a sink emitting Locations, or TextEdits when `new_text` is non-nil
+fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSink {
+    var mode: u8 = SINK_LOCATION;
+    if (new_text != nil) { mode = SINK_TEXT_EDIT; }
+    ret sink_init_mode(b, alloc, mode, new_text, guard);
 }
 
 # append one Location or TextEdit for `span` in `file` (located at `uri`)
@@ -1451,8 +1606,9 @@ fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSi
 # and the field walk (FieldXRef) share it.
 fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
     if (k.count > 0) { json.buf_push_byte(k.b, ','); }
-    if (k.new_text == nil) { render.location(k.b, file, uri, span); }
-    or                     { render.text_edit(k.b, file, span, k.new_text); }
+    if (k.mode == SINK_TEXT_EDIT)      { render.text_edit(k.b, file, span, k.new_text); }
+    or (k.mode == SINK_HIGHLIGHT)      { push_highlight_body(k.b, file, span, HIGHLIGHT_READ); }
+    or                                 { render.location(k.b, file, uri, span); }
     k.count = k.count + 1;
 }
 
@@ -1731,6 +1887,11 @@ fun push_member_symbol(b: *json.Buf, an: Analyzed, name_span: token.Span, ty: id
     ret true;
 }
 
+
+# LSP DocumentHighlightKind
+val HIGHLIGHT_TEXT:  i64 = 1;
+val HIGHLIGHT_READ:  i64 = 2;
+val HIGHLIGHT_WRITE: i64 = 3;
 
 # LSP CompletionItemKind for a record or union field
 val LSP_COMPLETION_FIELD: i64 = 5;
