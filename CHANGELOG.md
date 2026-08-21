@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-21
+
+Five new language features, cancellation, and the emit layer they all share.
+Advertised capabilities go from 6 to 11.
+
 ### Added
+- protocol: `$/cancelRequest` is honoured. A withdrawn request is answered
+  RequestCancelled (-32800) rather than dropped, because a request still owes
+  exactly one response. The cancellation is handled on the reading thread rather
+  than queued - queued, it would be dequeued after the request it withdraws had
+  already run. Cancelling work already in progress remains out of scope. (#153)
 - documentHighlight, workspace/symbol, signatureHelp, inlayHint, and
   semanticTokens. Advertised capabilities go from 6 to 11. (#170, #167, #168,
   #169, #166)
@@ -31,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature binds to one contract instead of reaching into `language.mach`.
 - render: `language.mach`'s remaining two-pass emitters are gone; `mls.render`
   is the only place that knows how an LSP value is spelled. (#171)
+
+### Fixed
+- hover: a record or union renders its declaration header rather than its whole
+  body. `Server` hovered as fifteen lines of fields with its doc comment buried
+  underneath; a binding with a multi-line initialiser did the same. (#145,
+  first half)
 
 ### Known issues
 - codeAction is blocked on briar-systems/mach#3023. A mach diagnostic's `help`
