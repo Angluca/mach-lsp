@@ -44,6 +44,7 @@ use mem: std.memory;
 
 use sess:   mach.lang.session;
 use strutil: std.text.string;
+use typename: mach.lang.fe.sema.typename;
 use trace:   mls.trace;
 use src:    mach.lang.source;
 use intern: mach.lang.intern;
@@ -80,7 +81,7 @@ use analysis:  mls.analysis;
 
 # answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol
-pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str, markdown: bool) {
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
@@ -94,7 +95,11 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
         # hover before giving up.
-        if (field_hover(ws, alloc, ?an, offset, id_raw)) { ret; }
+        if (field_hover(ws, alloc, ?an, offset, id_raw, markdown)) { ret; }
+        # nothing named this position, but sema may still know what the
+        # expression under it evaluates to. an inferred type is the whole reason
+        # to hover a call or an operator, neither of which resolves to a symbol
+        if (expression_hover(ws, alloc, ?an, offset, id_raw, markdown)) { ret; }
         render.reply_null(alloc, id_raw); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
@@ -106,12 +111,80 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val md: str = hover_markdown(ws, an, sym, uri, alloc);
     if (md == nil) { render.reply_null(alloc, id_raw); ret; }
 
-    reply_hover(alloc, id_raw, an.file, sr.name_span, md);
+    reply_hover(alloc, id_raw, an.file, sr.name_span, md, markdown);
+}
+
+# hover the type of the expression under the cursor
+#
+# Mach requires a type annotation on every binding, so there is no inferred
+# BINDING type to reveal - but a call, an operator, a cast, or a member access
+# has a type the source never spells, and that is what a reader hovering it
+# wants. The spelling comes from the compiler's own `type_to_str`, the renderer
+# its diagnostics use, so a hover and an error message never disagree about how
+# a type is written.
+fun expression_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed,
+                     offset: usize, id_raw: str, markdown: bool) bool {
+    if (an.sr == nil || an.root == nil) { ret false; }
+    val s: *sess.Session = project.root_session(an.root);
+    if (s == nil) { ret false; }
+
+    val eid: id.ExprId = ast.offset_to_expr(an.a, offset);
+    if (eid == id.EXPR_NIL) { ret false; }
+    val tid: type.TypeId = project.type_of(an.sr, eid);
+    if (tid == type.TYPE_NIL) { ret false; }
+
+    val tr: Result[str, str] = typename.type_to_str(s, tid);
+    if (is_err[str, str](tr)) { ret false; }
+    val text: str = unwrap_ok[str, str](tr);
+    # the renderer answers `<error>` / `<anon>` for a type it cannot spell;
+    # showing that reads as a claim about the code rather than a gap in tooling
+    if (text == nil || str_len(text) == 0 || text[0] == '<') {
+        typename.type_str_free(s, text);
+        ret false;
+    }
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "```mach\n");
+    json.buf_push(?b, text);
+    json.buf_push(?b, "\n```");
+    typename.type_str_free(s, text);
+    val md: str = buf_into_str(?b, alloc);
+    if (md == nil) { ret false; }
+
+    val eo: Option[*aexpr.Expr] = ast.get_expr(an.a, eid);
+    if (!is_some[*aexpr.Expr](eo)) { json.free_str(md, alloc); ret false; }
+    reply_hover(alloc, id_raw, an.file, unwrap[*aexpr.Expr](eo).span, md, markdown);
+    ret true;
 }
 
 # send a `textDocument/hover` reply rendering Markdown `md` over the
 # name span `name_span` in `file`, freeing `md` and `id_raw`. nil-replies when the
 # Markdown cannot be quoted. shared by the symbol and field hover paths
+# append `md` with its markdown fencing removed
+#
+# The content is composed as markdown because that is what almost every client
+# takes; a plaintext client gets the same text without the fence markers rather
+# than a second rendering path that could drift from the first.
+fun push_unfenced(b: *json.Buf, md: str) {
+    var plain: json.Buf = json.buf_init(b.a);
+    val n: usize = str_len(md);
+    var i: usize = 0;
+    for (i < n) {
+        if (md[i] == '`' && i + 2 < n && md[i + 1] == '`' && md[i + 2] == '`') {
+            i = i + 3;
+            # a fence opener carries a language tag through to its newline
+            for (i < n && md[i] != '\n') { i = i + 1; }
+            if (i < n) { i = i + 1; }
+        }
+        or {
+            json.buf_push_byte(?plain, md[i]);
+            i = i + 1;
+        }
+    }
+    json.buf_push_quoted(b, json.buf_str(?plain));
+    json.buf_dnit(?plain);
+}
+
 # an owned copy of a buffer's contents, releasing the buffer
 #
 # The markdown composers build a string rather than a JSON value, so they append
@@ -146,11 +219,15 @@ fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: tok
     render.send(?b, alloc, id_raw);
 }
 
-fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span: token.Span, md: str) {
+fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span: token.Span, md: str, markdown: bool) {
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
-    json.buf_push(?b, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
-    json.buf_push_quoted(?b, md);
+    json.buf_push(?b, "{\"contents\":{\"kind\":");
+    if (markdown) { json.buf_push_quoted(?b, "markdown"); }
+    or            { json.buf_push_quoted(?b, "plaintext"); }
+    json.buf_push(?b, ",\"value\":");
+    if (markdown) { json.buf_push_quoted(?b, md); }
+    or            { push_unfenced(?b, md); }
     json.buf_push(?b, "},\"range\":");
     render.span_range(?b, file, name_span);
     json.buf_push_byte(?b, '}');
@@ -174,7 +251,7 @@ fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span
 # offset: cursor byte offset into the buffer
 # id_raw: the raw JSON request id (for the reply)
 # ret:    true when a field hover was rendered and replied
-fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, offset: usize, id_raw: str) bool {
+fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, offset: usize, id_raw: str, markdown: bool) bool {
     if (an.root == nil) { ret false; }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -192,7 +269,7 @@ fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyze
     val md: str = field_hover_markdown(rs, an.file, fr.name_span, alloc);
     if (md == nil) { ret false; }
 
-    reply_hover(alloc, id_raw, an.file, fr.name_span, md);
+    reply_hover(alloc, id_raw, an.file, fr.name_span, md, markdown);
     ret true;
 }
 

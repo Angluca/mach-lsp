@@ -100,6 +100,7 @@ val WATCH_ACTIVE:   u8 = 2;
 # stop:          set once the reading thread should stop; read atomically
 # deferred:      a document changed but its analysis was postponed behind newer
 #                input, and must run once the queue drains
+# hover_markdown: whether the client renders markdown hover content
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
@@ -116,6 +117,7 @@ pub rec Server {
     rd_client:     json.Reader;
     stop:          i64;
     deferred:      bool;
+    hover_markdown: bool;
     watch_dynamic: bool;
     watch_state:   u8;
 }
@@ -143,6 +145,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
     srv.stop = 0;
     srv.deferred = false;
+    srv.hover_markdown = true;
     if (!jobs.init(?srv.q, alloc)) { ret false; }
     if (!jobs.cancels_init(?srv.cancels, alloc)) { ret false; }
     if (!json.reader_init(?srv.rd_client, alloc)) { ret false; }
@@ -351,6 +354,13 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     val watched: *sj.Value = json.member(
         json.member2(params, "capabilities", "workspace"), "didChangeWatchedFiles");
     srv.watch_dynamic = json.boolean(json.member(watched, "dynamicRegistration"), false);
+
+    # a client advertises the hover formats it renders, in order of preference.
+    # Sending markdown to one that only takes plaintext puts literal backticks
+    # and fences in front of the reader, which is worse than the plain text it
+    # asked for.
+    srv.hover_markdown = accepts_markdown(
+        json.member(json.member2(params, "capabilities", "textDocument"), "hover"), srv.alloc);
 
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -586,7 +596,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
-    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
     or (which == FEATURE_DEFINITION)      { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_REFERENCES)      { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_RENAME)          { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
@@ -602,6 +612,29 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
+}
+
+# whether the client's hover capability lists markdown
+#
+# An absent capability means an old client, and the spec's default there is
+# plaintext; an empty list says the same. Markdown is only used when the client
+# actually names it.
+fun accepts_markdown(hover: *sj.Value, alloc: *Allocator) bool {
+    if (hover == nil) { ret false; }
+    val formats: *sj.Value = json.member(hover, "contentFormat");
+    if (formats == nil) { ret false; }
+    val n: usize = json.count(formats);
+    var i: usize = 0;
+    for (i < n) {
+        val f: str = json.text(json.element(formats, i), alloc);
+        if (f != nil) {
+            val md: bool = str_equals(f, "markdown");
+            json.free_str(f, alloc);
+            if (md) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # whether the client withdrew this request before the worker reached it
