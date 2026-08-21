@@ -67,6 +67,7 @@ use features:  mls.features;
 use positions: mls.positions;
 use render:    mls.render;
 use project:   mls.project;
+use analysis:  mls.analysis;
 
 # the resolved analysis of one request's target document
 # ---
@@ -76,16 +77,6 @@ use project:   mls.project;
 # a:        the buffer's parsed Ast
 # rr:       the buffer's ResolveResult side tables
 # own:      this buffer's module id (Symbol.origin equals it for local symbols)
-# root:     the project root the buffer resolved against, or nil for single-file
-rec Analyzed {
-    interner: *intern.Interner;
-    file:     *src.SourceFile;
-    sr:       *sema.SemaResult;
-    a:        *ast.Ast;
-    rr:       *res.ResolveResult;
-    own:      sess.ModuleId;
-    root:     *project.Root;
-}
 
 # answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol
@@ -93,8 +84,8 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -183,7 +174,7 @@ fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span
 # offset: cursor byte offset into the buffer
 # id_raw: the raw JSON request id (for the reply)
 # ret:    true when a field hover was rendered and replied
-fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, offset: usize, id_raw: str) bool {
+fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, offset: usize, id_raw: str) bool {
     if (an.root == nil) { ret false; }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -304,7 +295,7 @@ fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
 # falling back to the symbol kind and name when no decl header is available. the
 # decl's doc comment, if any, follows the block as prose, read from the same
 # Site so a cross-module symbol's docs render too
-fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
+fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
     var sig: str = nil;
     var doc: str = nil;
 
@@ -479,8 +470,8 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -560,7 +551,7 @@ fun module_alias_target(sym: *res.Symbol, out: *sess.ModuleId) bool {
 # alloc:  request allocator
 # id_raw: the raw JSON request id, consumed on success
 # ret:    true when a module Location was emitted and replied
-fun module_definition(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, alloc: *Allocator, id_raw: str) bool {
+fun module_definition(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symbol, alloc: *Allocator, id_raw: str) bool {
     var mid: sess.ModuleId;
     if (!module_alias_target(sym, ?mid)) { ret false; }
     if (an.root == nil) { ret false; }
@@ -598,7 +589,7 @@ fun module_definition(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, al
 # offset: cursor byte offset into the buffer
 # id_raw: the raw JSON request id (for the reply)
 # ret:    true when a field declaration was located and emitted
-fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
     if (an.root == nil) { ret false; }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -645,7 +636,7 @@ rec FieldSelf {
 # an:     the analyzed request document
 # offset: cursor byte offset into the buffer
 # ret:    some(FieldSelf) on a field declaration name, or none
-fun field_self_at(an: *Analyzed, offset: usize) Option[FieldSelf] {
+fun field_self_at(an: *analysis.Analyzed, offset: usize) Option[FieldSelf] {
     val did: id.DeclId = ast.offset_to_decl(an.a, offset);
     if (did == id.DECL_NIL) { ret none[FieldSelf](); }
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
@@ -675,7 +666,7 @@ fun field_self_at(an: *Analyzed, offset: usize) Option[FieldSelf] {
 # site. builds the site's `file://` URI (the buffer's own URI when the record is
 # declared in this module, else the defining module's on-disk file) and emits the
 # field name span. true on success; false on a URI / allocation failure
-fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, rs: project.RecordSite, name: token.Span, id_raw: str) bool {
+fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, rs: project.RecordSite, name: token.Span, id_raw: str) bool {
     var furi: str = uri;
     var owned: bool = false;
     if (rs.origin != an.own) {
@@ -719,7 +710,7 @@ rec FieldTarget {
 # an:     the analyzed request document
 # offset: cursor byte offset into the buffer
 # ret:    some(FieldTarget) on a field position, or none
-fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option[FieldTarget] {
+fun field_target_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) Option[FieldTarget] {
     if (an.root == nil) { ret none[FieldTarget](); }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -753,7 +744,7 @@ fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option
 # field's declared-name span. the field name and its source live in the record's
 # declaring module (`rs.file`), which is the cross-module byte identity every
 # other module's references are matched against
-fun make_field_target(an: *Analyzed, rs: project.RecordSite, field_name: token.Span) FieldTarget {
+fun make_field_target(an: *analysis.Analyzed, rs: project.RecordSite, field_name: token.Span) FieldTarget {
     var t: FieldTarget;
     t.key.origin     = rs.origin;
     t.key.decl       = rs.decl;
@@ -789,7 +780,7 @@ rec FieldXRef {
 # out:   array of at least `cap` FieldXRef slots
 # cap:   capacity of `out` (module_count, or one for a standalone file)
 # ret:   number of populated entries (>= 1), or 0 when the buffer cannot be typed
-fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
+fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
     if (an.sr == nil) { ret 0; }
     if (an.root == nil) {
         out[0].a = an.a;
@@ -867,7 +858,7 @@ fun walk_field_sites(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, want
 # member-access / struct-literal sites plus the field declaration, and emits a
 # Location[]. true when a field was resolved and replied; false (without replying)
 # so the caller falls back to an empty array
-fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
@@ -894,7 +885,7 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
 # module, and emits a WorkspaceEdit replacing every member-access / struct-literal
 # site, the field declaration, and the record's matching doc component. true when
 # the edit was replied
-fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str, new_name: str) bool {
+fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str, new_name: str) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
@@ -925,7 +916,7 @@ fun field_record_renameable(ws: *project.Workspace, root: *project.Root, t: Fiel
 # write the field-name span the cursor sits on into `out` and
 # return true when it resolves to a field of a project-owned record, or false. the
 # prepareRename gate for field positions
-fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: usize, out: *token.Span) bool {
+fun field_prepare_span(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, offset: usize, out: *token.Span) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
@@ -1012,8 +1003,8 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1055,8 +1046,8 @@ pub fun document_highlight(ws: *project.Workspace, es: *editor.EditorSession, al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1079,7 +1070,7 @@ pub fun document_highlight(ws: *project.Workspace, es: *editor.EditorSession, al
 #
 # Lives apart from the request handler because that handler takes an `id`
 # parameter, which shadows the `mach.lang.fe.ast.id` module alias the walk needs.
-fun push_symbol_highlights(b: *json.Buf, an: Analyzed, target: res.SymbolId) {
+fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: res.SymbolId) {
     var emitted: usize = 0;
 
     var bind: token.Span;
@@ -1128,7 +1119,7 @@ fun push_symbol_highlights(b: *json.Buf, an: Analyzed, target: res.SymbolId) {
 
 # highlight the field under the cursor across this document, for the positions
 # where name resolution leaves a value-field access unbound
-fun field_highlights(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+fun field_highlights(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
     if (an.root == nil || an.sr == nil) { ret false; }
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
@@ -1199,8 +1190,8 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     val new_name: str = json.text(json.member(params, "newName"), alloc);
     if (new_name == nil) { render.reply_null(alloc, id_raw); ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1254,7 +1245,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 # (`Decl.doc` resolved through `mach.lang.fe.doc`) is a buffer edit. a generic's
 # component head is the bracket form `# [T]:`, so the returned span is the inner
 # identifier only (the brackets stay)
-fun param_generic_doc_span(an: Analyzed, sym: *res.Symbol, name: str, out: *token.Span) bool {
+fun param_generic_doc_span(an: analysis.Analyzed, sym: *res.Symbol, name: str, out: *token.Span) bool {
     if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC) { ret false; }
     if (sym.decl == id.DECL_NIL) { ret false; }
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, sym.decl);
@@ -1280,8 +1271,8 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1318,7 +1309,7 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
     if (is_err[*ast.Ast, str](ar)) { render.reply_empty_array(alloc, id_raw); ret; }
     val fo: Option[*src.SourceFile] = src.get(?es.s.sources, d.file_id);
     if (!is_some[*src.SourceFile](fo)) { render.reply_empty_array(alloc, id_raw); ret; }
-    var an: Analyzed;
+    var an: analysis.Analyzed;
     an.a = unwrap_ok[*ast.Ast, str](ar);
     an.file = unwrap[*src.SourceFile](fo);
 
@@ -1331,8 +1322,8 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    if (!analyze(ws, es, docs, uri, ?an)) { reply_empty_completion(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty_completion(alloc, id_raw); ret; }
 
     # completion is the one feature whose answer depends on where the cursor is
     # rather than merely what it is on: the identifier being typed narrows the
@@ -1411,7 +1402,7 @@ fun empty_span() token.Span {
 # `out` and return true, or false when the symbol binds at a Decl node (whose
 # site the decl walk already covers). lets references / rename include the one
 # binding site a param / generic has, which no side table records
-fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
+fun binding_span(an: analysis.Analyzed, sid: res.SymbolId, out: *token.Span) bool {
     val so: Option[*res.Symbol] = features.symbol(an.rr, sid);
     if (!is_some[*res.Symbol](so)) { ret false; }
     val bo: Option[token.Span] = features.binding_name_span(an.a, unwrap[*res.Symbol](so));
@@ -1443,7 +1434,7 @@ rec XRef {
 # collect each retained module whose resolver maps the target's canonical
 # (origin, declaration) identity. The active document is already that exact
 # ModuleEntry, so it uses the request URI and is neither bridged nor duplicated.
-fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
+fun build_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
     if (an.root == nil || sym.decl == id.DECL_NIL
         || (sym.origin == an.own && ((sym.flags & res.SYM_FLAG_MODULE) == 0
             || (sym.flags & res.SYM_FLAG_PUB) == 0))) {
@@ -1490,60 +1481,7 @@ fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
         i = i + 1;
     }
 }
-# the project root that governs it and populate `out` with its interner, file,
-# Ast, ResolveResult, governing root, and module id. false when the document is
-# unknown or resolution fails. Project documents use their compiler-owned
-# ModuleId; standalone files use the editor FileId only within that fallback
-# Session.
-fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
-    if (uri == nil) { ret false; }
-    val doc: *documents.Document = documents.find(docs, uri);
-    if (doc == nil) { ret false; }
 
-    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
-    if (!is_err[project.DocumentView, str](vr)) {
-        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
-        out.rr       = v.rr;
-        out.a        = v.a;
-        out.sr       = v.sr;
-        out.interner = v.interner;
-        out.file     = v.file;
-        out.root     = v.root;
-        out.own      = v.module;
-        ret true;
-    }
-    if (project.has_project(ws, uri)) { ret false; }
-
-    val rr: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
-    if (is_err[*res.ResolveResult, str](rr)) { ret false; }
-    out.rr = unwrap_ok[*res.ResolveResult, str](rr);
-    out.a = editor.ast_of(es, doc.file_id);
-    if (out.a == nil) { ret false; }
-    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (!is_some[*src.SourceFile](fo)) { ret false; }
-    out.sr = nil;
-    val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
-    if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
-    out.interner = ?es.s.interner;
-    out.file = unwrap[*src.SourceFile](fo);
-    out.root = nil;
-    out.own = doc.file_id::sess.ModuleId;
-    ret true;
-}
-
-# analyze the target document and resolve the request's cursor position
-# to a byte offset, or none when the document is unknown / unresolvable or the
-# position is invalid (callers fall back to a null / empty reply)
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
-    if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
-
-    val pos: *sj.Value = json.member(params, "position");
-    val line: i64 = json.number(json.member(pos, "line"), -1);
-    val ch:   i64 = json.number(json.member(pos, "character"), -1);
-    if (line < 0 || ch < 0) { ret none[usize](); }
-
-    ret positions.offset_at(out.file, line::usize, ch::usize);
-}
 
 # the size-or-write accumulator behind the shared reference walk.
 # one walk (walk_refs) feeds it: with `buf` nil it totals JSON byte lengths
@@ -1727,7 +1665,7 @@ fun push_rename_group(b: *json.Buf, s: *XRef, include_bind: bool, bind: token.Sp
 
 # send a DocumentSymbol[] of the file's top-level decls.
 # takes ownership of `id_raw` and frees it
-fun emit_document_symbols(an: Analyzed, alloc: *Allocator, id_raw: str) {
+fun emit_document_symbols(an: analysis.Analyzed, alloc: *Allocator, id_raw: str) {
     var b: json.Buf = json.buf_init(alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push(?b, id_raw);
@@ -1765,7 +1703,7 @@ fun emit_document_symbols(an: Analyzed, alloc: *Allocator, id_raw: str) {
 # comma: whether to separate from a preceding sibling
 # alloc: request allocator
 # ret:   true when a symbol was appended
-fun push_doc_symbol(b: *json.Buf, an: Analyzed, did: id.DeclId, comma: bool, alloc: *Allocator) bool {
+fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: bool, alloc: *Allocator) bool {
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
     if (!is_some[*decl.Decl](d_opt)) { ret false; }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
@@ -1799,7 +1737,7 @@ fun push_doc_symbol(b: *json.Buf, an: Analyzed, did: id.DeclId, comma: bool, all
 # a function holds its generics in `generic_names` and its parameters in the same
 # typed pool. A declaration with no members omits `children` entirely rather than
 # emitting an empty array, so a client's "has children" test stays meaningful.
-fun push_doc_symbol_children(b: *json.Buf, an: Analyzed, d: *decl.Decl, alloc: *Allocator) {
+fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl, alloc: *Allocator) {
     var fields_start: u32 = 0;
     var fields_len:   u32 = 0;
     var gen_start:    u32 = 0;
@@ -1854,7 +1792,7 @@ fun push_doc_symbol_children(b: *json.Buf, an: Analyzed, d: *decl.Decl, alloc: *
 # A member has no span of its own beyond its name, so `range` and
 # `selectionRange` are both the name; `detail` carries its declared type where
 # it has one.
-fun push_member_symbol(b: *json.Buf, an: Analyzed, name_span: token.Span, ty: id.TypeId,
+fun push_member_symbol(b: *json.Buf, an: analysis.Analyzed, name_span: token.Span, ty: id.TypeId,
                        kind: i64, comma: bool, alloc: *Allocator) bool {
     if (name_span.len == 0) { ret false; }
     val name: str = positions.span_text(an.file, name_span, alloc);
@@ -1916,7 +1854,7 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it
-fun emit_completions(an: Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, pfile: *src.SourceFile) {
+fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, pfile: *src.SourceFile) {
     var b: json.Buf = json.buf_init(alloc);
     push_completion_head(?b, id_raw);
 
@@ -1956,7 +1894,7 @@ fun emit_completions(an: Analyzed, alloc: *Allocator, id_raw: str, prefix: token
 # prefix: the partial member name being typed
 # dot:    byte offset of the `.`
 # ret:    true when a member list was emitted and replied
-fun emit_member_completions(ws: *project.Workspace, an: Analyzed, alloc: *Allocator, id_raw: str,
+fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
                             prefix: token.Span, dot: usize) bool {
     if (dot == 0) { ret false; }
     val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
@@ -1978,7 +1916,7 @@ fun emit_member_completions(ws: *project.Workspace, an: Analyzed, alloc: *Alloca
 }
 
 # offer a module's public symbols
-fun emit_module_members(ws: *project.Workspace, an: Analyzed, alloc: *Allocator, id_raw: str,
+fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
                         prefix: token.Span, mid: sess.ModuleId) bool {
     if (an.root == nil) { ret false; }
     val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
@@ -2025,7 +1963,7 @@ fun name_already_emitted(rr: *res.ResolveResult, sid: res.SymbolId, mid: sess.Mo
 }
 
 # offer the fields of the record or union the receiver expression types to
-fun emit_field_completions(ws: *project.Workspace, an: Analyzed, alloc: *Allocator, id_raw: str,
+fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
                            prefix: token.Span, eid: id.ExprId) bool {
     if (an.root == nil || an.sr == nil) { ret false; }
     val tid: type.TypeId = project.type_of(an.sr, eid);
@@ -2102,7 +2040,7 @@ fun push_completion_item(b: *json.Buf, label: str, kind: i64, kind_label: str, d
 
 # whether symbol `sid` is a completion candidate AND the first
 # symbol with its name, so a name bound more than once is offered only once
-fun completion_first(an: Analyzed, sid: res.SymbolId) bool {
+fun completion_first(an: analysis.Analyzed, sid: res.SymbolId) bool {
     if (!features.completion_candidate(an.rr, sid)) { ret false; }
     val name: intern.StrId = an.rr.symbols[sid].name;
     var j: u32 = 0;
