@@ -483,7 +483,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             require(isinstance(result, dict), f"invalid initialize result: {result!r}")
             capabilities = result.get("capabilities")
             require(isinstance(capabilities, dict), "initialize capabilities are missing")
-            require(capabilities.get("textDocumentSync") == 1, "full-text sync is not advertised")
+            require(capabilities.get("textDocumentSync") == 2, "incremental sync is not advertised")
             session.notify("initialized", {})
             registration = session.wait_for(
                 lambda item: item.get("method") == "client/registerCapability",
@@ -1438,6 +1438,79 @@ def run_cancellation(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_incremental_sync(server: Path, timeout: float) -> None:
+    """Range edits patch the buffer, and the buffer is what everything reads."""
+    with tempfile.TemporaryDirectory(prefix="mls-incr-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "incr", 1)
+        text = "pub fun alpha() i32 { ret 1; }\npub fun beta() i32 { ret 2; }\n"
+        main.write_text(text, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("textDocumentSync") == 2,
+                    "incremental sync is not advertised")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            version = [1]
+
+            def edit(changes: list[dict[str, Any]]) -> list[str]:
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": changes},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+                return [s["name"] for s in (response.get("result") or [])]
+
+            def span(l1: int, c1: int, l2: int, c2: int) -> dict[str, Any]:
+                return {"start": {"line": l1, "character": c1},
+                        "end": {"line": l2, "character": c2}}
+
+            # one range
+            names = edit([{"range": span(0, 8, 0, 13), "text": "gamma"}])
+            require(names == ["gamma", "beta"], f"single range edit went wrong: {names!r}")
+
+            # two ranges in one notification: the second is expressed against the
+            # result of the first, which is how the client computed it
+            names = edit([{"range": span(0, 8, 0, 13), "text": "dd"},
+                          {"range": span(1, 8, 1, 12), "text": "ee"}])
+            require(names == ["dd", "ee"], f"ordered ranges went wrong: {names!r}")
+
+            # a range spanning a line boundary
+            names = edit([{"range": span(0, 29, 1, 0), "text": "\n\n"}])
+            require(names == ["dd", "ee"], f"a multi-line range went wrong: {names!r}")
+
+            # a full-document change is still accepted in incremental mode
+            names = edit([{"text": "pub fun solo() i32 { ret 9; }\n"}])
+            require(names == ["solo"], f"a full-text change was mishandled: {names!r}")
+
+            # multi-byte text: the column is UTF-16 code units, not bytes
+            names = edit([{"range": span(0, 0, 0, 0), "text": "# \U0001F600 note\n"}])
+            require(names == ["solo"], f"a multi-byte insert corrupted the buffer: {names!r}")
+            names = edit([{"range": span(0, 5, 0, 9), "text": "x"}])
+            require(names == ["solo"],
+                    f"an edit after an astral codepoint used byte columns: {names!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1685,6 +1758,7 @@ def main() -> int:
         run_inlay_hints(server, args.timeout)
         run_semantic_tokens(server, args.timeout)
         run_cancellation(server, args.timeout)
+        run_incremental_sync(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1706,6 +1780,7 @@ def main() -> int:
     print("  inlayHint names literal arguments at multi-parameter calls")
     print("  semanticTokens decode in order, within the legend and the file")
     print("  a withdrawn request is answered RequestCancelled")
+    print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
