@@ -1905,11 +1905,31 @@ fun append(buf: *u8, offset: usize, s: str) usize {
 }
 
 
+# a POSIX-spelled path rewritten with the platform's separator
+#
+# `normalize_path` follows the native separator now, so a test that hard-codes
+# `/` asserts one platform's spelling rather than the behaviour. The segments
+# and their order are what matters.
+fun native(a: *Allocator, posix: str) str {
+    val n: usize = str_len(posix);
+    val r: Result[*u8, str] = allocate[u8](a, n + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    var i: usize = 0;
+    for (i < n) {
+        if (posix[i] == '/') { out[i] = pathlib.separator(); }
+        or                   { out[i] = posix[i]; }
+        i = i + 1;
+    }
+    out[n] = 0;
+    ret out::str;
+}
+
 test "project: file uri paths are decoded and normalized" {
     var pa: Allocator;
     page.make(?pa);
     val got: str = path_of_uri(?pa, "file:///tmp/a%20b/src/../main.mach");
-    if (got == nil || !str_equals(got, "/tmp/a b/main.mach")) { ret 1; }
+    if (got == nil || !str_equals(got, native(?pa, "/tmp/a b/main.mach"))) { ret 1; }
     ret 0;
 }
 
@@ -1987,15 +2007,15 @@ test "project: normalization collapses . and .. without escaping the root" {
     page.make(?pa);
     var fail: bool = false;
     val a: str = normalize_path(?pa, "/a/./b/../c");
-    if (a == nil)                        { fail = true; }
-    or { if (!str_equals(a, "/a/c"))     { fail = true; } }
+    if (a == nil)                                       { fail = true; }
+    or { if (!str_equals(a, native(?pa, "/a/c")))       { fail = true; } }
     val b: str = normalize_path(?pa, "/a//b/");
-    if (b == nil)                        { fail = true; }
-    or { if (!str_equals(b, "/a/b"))     { fail = true; } }
+    if (b == nil)                                       { fail = true; }
+    or { if (!str_equals(b, native(?pa, "/a/b")))       { fail = true; } }
     # `..` at the root stays at the root rather than climbing above it
     val c: str = normalize_path(?pa, "/../x");
-    if (c == nil)                        { fail = true; }
-    or { if (!str_equals(c, "/x"))       { fail = true; } }
+    if (c == nil)                                       { fail = true; }
+    or { if (!str_equals(c, native(?pa, "/x")))         { fail = true; } }
     if (fail) { ret 1; }
     ret 0;
 }
