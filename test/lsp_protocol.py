@@ -1311,6 +1311,79 @@ def run_inlay_hints(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_semantic_tokens(server: Path, timeout: float) -> None:
+    """Classification from the resolved tables, in a wire format that decodes.
+
+    The payload is a flat array of five-integer groups, each relative to the
+    previous, so ordering and non-overlap are load-bearing rather than
+    cosmetic: a single out-of-order token corrupts everything after it.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-semtok-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "semtok", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            provider = result.get("capabilities", {}).get("semanticTokensProvider")
+            require(isinstance(provider, dict), f"semanticTokensProvider missing: {provider!r}")
+            legend = provider.get("legend", {})
+            types = legend.get("tokenTypes")
+            require(isinstance(types, list) and types, f"no token legend: {legend!r}")
+            require(isinstance(legend.get("tokenModifiers"), list), "no modifier legend")
+
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            response = session.request(
+                "textDocument/semanticTokens/full", {"textDocument": {"uri": main.as_uri()}})
+            payload = response.get("result")
+            require(isinstance(payload, dict), f"semanticTokens is not an object: {payload!r}")
+            data = payload.get("data")
+            require(isinstance(data, list) and data, f"no token data: {payload!r}")
+            require(len(data) % 5 == 0,
+                    f"token data is not a multiple of five: {len(data)}")
+
+            lines = text.splitlines()
+            line = 0
+            char = 0
+            previous = (-1, -1)
+            seen_types = set()
+            for index in range(0, len(data), 5):
+                d_line, d_char, length, kind, _mods = data[index:index + 5]
+                require(d_line >= 0 and d_char >= 0, f"negative delta at {index}")
+                if d_line == 0:
+                    char += d_char
+                else:
+                    line += d_line
+                    char = d_char
+                require((line, char) >= previous,
+                        f"token {index // 5} is out of order at {(line, char)}")
+                previous = (line, char)
+                require(0 <= kind < len(types), f"token type {kind} outside the legend")
+                require(length > 0, f"zero-length token at {index}")
+                require(line < len(lines), f"token past end of file at line {line}")
+                require(char + length <= len(lines[line]) + 1,
+                        f"token runs past end of line {line}")
+                seen_types.add(types[kind])
+
+            # the point of the feature: kinds a syntax highlighter cannot infer
+            require("type" in seen_types, f"no type tokens: {sorted(seen_types)}")
+            require("function" in seen_types, f"no function tokens: {sorted(seen_types)}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1556,6 +1629,7 @@ def main() -> int:
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
         run_inlay_hints(server, args.timeout)
+        run_semantic_tokens(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1575,6 +1649,7 @@ def main() -> int:
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")
     print("  inlayHint names literal arguments at multi-parameter calls")
+    print("  semanticTokens decode in order, within the legend and the file")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
