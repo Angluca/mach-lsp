@@ -1166,6 +1166,82 @@ def run_workspace_symbol(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_signature_help(server: Path, timeout: float) -> None:
+    """Parameter hints while the argument list is still incomplete."""
+    with tempfile.TemporaryDirectory(prefix="mls-sig-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "sig", 8)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            provider = result.get("capabilities", {}).get("signatureHelpProvider")
+            require(isinstance(provider, dict) and "(" in provider.get("triggerCharacters", []),
+                    f"signatureHelpProvider is not advertised with `(`: {provider!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
+            version = [1]
+
+            def help_at(probe: str) -> dict[str, Any] | None:
+                edited = list(lines)
+                edited.insert(anchor_line + 1, "    " + probe)
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/signatureHelp",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
+                )
+                return response.get("result")
+
+            # the argument list is unclosed at every one of these positions
+            opened = help_at("take[i32](")
+            require(opened, "signatureHelp gave nothing for an open call")
+            signature = opened["signatures"][0]
+            require("b" in signature["label"],
+                    f"the parameter is missing from the label: {signature['label']!r}")
+            require(opened.get("activeParameter") == 0,
+                    f"the first argument is not active: {opened!r}")
+            require(len(signature.get("parameters") or []) == 1,
+                    f"parameter list is wrong: {signature!r}")
+            # each parameter label is a byte range into the signature label
+            span = signature["parameters"][0]["label"]
+            require(isinstance(span, list) and len(span) == 2 and span[0] < span[1],
+                    f"parameter label is not a valid range: {span!r}")
+            require(signature["label"][span[0]:span[1]].startswith("b"),
+                    f"parameter range does not cover the parameter: {signature!r}")
+
+            # a `(` inside a string literal must not open a call
+            quoted = help_at('take[i32]("a(b"')
+            require(quoted, "a paren inside a string broke the enclosing call")
+
+            # a cursor outside any call, and a callee that resolves to nothing
+            require(help_at("val zz: i64 = 1;") is None,
+                    "signatureHelp answered outside a call")
+            require(help_at("no_such_function(") is None,
+                    "signatureHelp answered for an unresolvable callee")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1409,6 +1485,7 @@ def main() -> int:
         run_completion_context(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
+        run_signature_help(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1426,6 +1503,7 @@ def main() -> int:
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  documentHighlight classifies reads and writes in the active file")
     print("  workspace/symbol searches loaded roots, best matches first")
+    print("  signatureHelp tracks the active argument through incomplete calls")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
