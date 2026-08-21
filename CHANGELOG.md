@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- deps: **advanced the vendored mach pin to `v4.22.0`**, which carries the
+  retained-analysis leak fix (mach#3010, released in 4.20.1). Session memory is
+  now flat: 40 edits of one file on this repository hold at 228 MiB, against
+  ~8 MiB per edit before the work started and ~4.2 MiB after 4.20.0. The
+  `### Known issues` entry recording that growth is retired. (#159)
+
 ## [0.12.0] - 2026-08-21
 
 Five new language features, cancellation, and the emit layer they all share.
