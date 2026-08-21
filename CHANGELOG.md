@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- documentHighlight, workspace/symbol, signatureHelp, inlayHint, and
+  semanticTokens. Advertised capabilities go from 6 to 11. (#170, #167, #168,
+  #169, #166)
+- semanticTokens classifies from the resolved side tables rather than from
+  spelling, which is the point in a language where an identifier may be a type,
+  a function, a module alias, a parameter, a field, or a comptime value with
+  nothing in how it is written to say which. 1389 tokens on `src/server.mach`.
+- signatureHelp locates the enclosing call by scanning text rather than the Ast,
+  because the request exists precisely while the argument list does not parse;
+  it handles nesting, string literals, statement boundaries, and the type
+  arguments of a generic call.
+- inlayHint names literal arguments at multi-parameter calls. Mach requires an
+  explicit type annotation on every binding, so the usual inferred-binding-type
+  hint has nothing to show; suppression is the feature, taking 420 candidate
+  hints on one file down to 76.
+- workspace/symbol searches every loaded root, ranked so leading matches precede
+  interior ones - `read_` should find `read_dir`, not `thread_spawn`.
+
+### Changed
+- analysis: request-to-document-view resolution moves to `mls.analysis`, so a
+  feature binds to one contract instead of reaching into `language.mach`.
+- render: `language.mach`'s remaining two-pass emitters are gone; `mls.render`
+  is the only place that knows how an LSP value is spelled. (#171)
+
+### Known issues
+- codeAction is blocked on briar-systems/mach#3023. A mach diagnostic's `help`
+  is a sentence, not an edit - there is no span or replacement on the record - so
+  building quick fixes today means pattern-matching the compiler's English,
+  which breaks silently whenever upstream rephrases. (#165)
+- a function-local `val` / `var` resolves in some buffers and not others, so
+  hover, definition, references, and highlight silently decline on them in
+  those files. (#181)
+
 ### Fixed
 - completion: answers for the cursor rather than for the file. The server
   advertised `.` as a trigger character and then ignored the request position
