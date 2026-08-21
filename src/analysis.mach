@@ -107,6 +107,31 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     ret true;
 }
 
+# the parsed tree for an open document, reusing the buffer's cached parse
+#
+# A syntax-only feature needs the tree and nothing else, and must answer even
+# while the project root cannot load - that is what keeps the outline alive
+# while a manifest is being edited. `editor.parse` is unconditional: it
+# re-lexes and re-parses the whole buffer on every call, which was two thirds of
+# documentSymbol's cost on a 2000-line module, spent rebuilding a tree that had
+# not changed since the last keystroke.
+#
+# Reusing the cached tree is safe by construction rather than by convention:
+# `editor.update` drops a buffer's analysis whenever its text is replaced, so a
+# non-nil `ast_of` IS the parse of the current text. The parse happens here only
+# when there is nothing to reuse.
+# ---
+# es:  the standalone editor session
+# doc: the open document
+# ret: the document's parsed tree, or nil when it cannot be parsed
+pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.Ast {
+    val cached: *ast.Ast = editor.ast_of(es, doc.file_id);
+    if (cached != nil) { ret cached; }
+    val ar: Result[*ast.Ast, str] = editor.parse(es, doc.file_id);
+    if (is_err[*ast.Ast, str](ar)) { ret nil; }
+    ret unwrap_ok[*ast.Ast, str](ar);
+}
+
 # analyze the requested document and convert its cursor position to a byte
 # offset, or none when the document is unknown, unanalyzable, or the position
 # falls outside it

@@ -1404,12 +1404,12 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
 
     val d: *documents.Document = documents.find(docs, uri);
     if (d == nil) { render.reply_empty_array(alloc, id_raw); ret; }
-    val ar: Result[*ast.Ast, str] = editor.parse(es, d.file_id);
-    if (is_err[*ast.Ast, str](ar)) { render.reply_empty_array(alloc, id_raw); ret; }
+    val tree: *ast.Ast = analysis.syntax_tree(es, d);
+    if (tree == nil) { render.reply_empty_array(alloc, id_raw); ret; }
     val fo: Option[*src.SourceFile] = src.get(?es.s.sources, d.file_id);
     if (!is_some[*src.SourceFile](fo)) { render.reply_empty_array(alloc, id_raw); ret; }
     var an: analysis.Analyzed;
-    an.a = unwrap_ok[*ast.Ast, str](ar);
+    an.a = tree;
     an.text = positions.text_of(unwrap[*src.SourceFile](fo));
 
     emit_document_symbols(an, alloc, id_raw);
