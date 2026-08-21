@@ -1242,6 +1242,75 @@ def run_signature_help(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_inlay_hints(server: Path, timeout: float) -> None:
+    """Parameter names on literal arguments, and nowhere else.
+
+    Mach requires an explicit type annotation on every binding, so there is no
+    inferred binding type to reveal; what is opaque at a call site is which
+    literal means what.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-hint-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "hint", 2)
+        # a two-parameter callee, called with one literal and one named value
+        extra = ("pub fun pair(first: i32, second: i32) i32 { ret first + second; }\n")
+        defs.write_text(defs.read_text(encoding="utf-8") + extra, encoding="utf-8")
+        body = text.replace("ret take[i32](b)", "ret pair(1, watched) + take[i32](b)")
+        body = body.replace("use hint.defs.watched;", "use hint.defs.watched;\nuse hint.defs.pair;")
+        main.write_text(body, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("inlayHintProvider") is True,
+                    "inlayHintProvider is not advertised")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": body}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = body.splitlines()
+            response = session.request(
+                "textDocument/inlayHint",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": 0, "character": 0},
+                           "end": {"line": len(lines), "character": 0}}},
+            )
+            hints = response.get("result")
+            require(isinstance(hints, list), f"inlayHint is not a list: {hints!r}")
+            for hint in hints:
+                assert_position(hint.get("position"), "hint.position")
+                require(isinstance(hint.get("label"), str), f"hint without a label: {hint!r}")
+                require(hint.get("kind") == 2, f"hint is not InlayHintKind.Parameter: {hint!r}")
+
+            labels = [hint["label"] for hint in hints]
+            require("first:" in labels,
+                    f"the literal argument was not named: {labels!r}")
+            # `watched` is an identifier, not a literal, so it is left alone
+            require("second:" not in labels,
+                    f"a self-naming argument was labelled: {labels!r}")
+
+            # a range that covers nothing yields nothing
+            empty = session.request(
+                "textDocument/inlayHint",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": 0, "character": 0},
+                           "end": {"line": 0, "character": 0}}},
+            )
+            require(empty.get("result") == [], f"an empty range produced hints: {empty!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1486,6 +1555,7 @@ def main() -> int:
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
+        run_inlay_hints(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1504,6 +1574,7 @@ def main() -> int:
     print("  documentHighlight classifies reads and writes in the active file")
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")
+    print("  inlayHint names literal arguments at multi-parameter calls")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")
