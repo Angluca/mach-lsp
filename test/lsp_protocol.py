@@ -1718,7 +1718,16 @@ def run_crash_containment(server: Path, timeout: float) -> None:
     The compiler front end runs over buffers the user is actively breaking, and
     `std` exposes no way to trap an in-process fault, so the process the editor
     talks to does not run it. Killing the worker stands in for the fault.
+
+    The CONTAINMENT is portable; standing in for a fault is not. Finding the
+    child needs `pgrep` and killing it needs `SIGKILL`, neither of which exists
+    on Windows, so this is skipped there rather than rewritten around a weaker
+    signal that would prove something different.
     """
+    if os.name != "posix":
+        print("  crash containment: skipped (needs pgrep and SIGKILL)")
+        return
+
     with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
         root = Path(directory).resolve()
         main, _, text = write_project(root, "crash", 5)
