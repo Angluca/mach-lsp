@@ -1594,6 +1594,93 @@ def run_code_actions(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_hover_presentation(server: Path, timeout: float) -> None:
+    """Hover renders what the client can read, and types the source never spells."""
+    with tempfile.TemporaryDirectory(prefix="mls-hov-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "hov", 1)
+        text = ("pub fun twice(n: i32) i32 { ret n + n; }\n"
+                "pub rec Pair { a: i32; b: i32; }\n"
+                "pub fun main() i32 { ret twice(2) + 1; }\n")
+        main.write_text(text, encoding="utf-8")
+        lines = text.splitlines()
+
+        def session_with(fmt: list[str] | None) -> LspSession:
+            caps: dict[str, Any] = {}
+            if fmt is not None:
+                caps = {"textDocument": {"hover": {"contentFormat": fmt}}}
+            s = LspSession(server, root, timeout)
+            s.request("initialize", {"rootUri": root.as_uri(), "capabilities": caps})
+            s.notify("initialized", {})
+            s.notify("textDocument/didOpen",
+                     {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                       "version": 1, "text": text}})
+            s.diagnostics(main.as_uri(), 1)
+            return s
+
+        def hover(s: LspSession, within: str, needle: str, off: int = 1) -> dict[str, Any] | None:
+            line = next(i for i, v in enumerate(lines) if within in v)
+            response = s.request(
+                "textDocument/hover",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": line, "character": lines[line].index(needle) + off}})
+            return response.get("result")
+
+        # a record renders its header, not its fields
+        s = session_with(["markdown"])
+        finished = False
+        try:
+            rec = hover(s, "pub rec Pair", "Pair")
+            require(rec, "hovering a record gave nothing")
+            value = rec["contents"]["value"]
+            require(rec["contents"]["kind"] == "markdown", f"wrong kind: {rec!r}")
+            require("rec Pair" in value, f"the header is missing: {value!r}")
+            require("a: i32" not in value, f"the whole body was rendered: {value!r}")
+
+            # an expression the source never gives a type: a call result
+            expr = hover(s, "ret twice(2)", "twice(2)", 0)
+            require(expr, "hovering an expression gave nothing")
+            require("i32" in expr["contents"]["value"],
+                    f"the expression's type is missing: {expr!r}")
+            s.finish()
+            finished = True
+        finally:
+            if not finished:
+                s.abort()
+
+        # a client that only reads plaintext must not be sent fences
+        s = session_with(["plaintext"])
+        finished = False
+        try:
+            plain = hover(s, "pub rec Pair", "Pair")
+            require(plain, "hovering gave nothing for a plaintext client")
+            contents = plain["contents"]
+            require(contents["kind"] == "plaintext", f"wrong kind: {plain!r}")
+            require("```" not in contents["value"],
+                    f"markdown fences were sent to a plaintext client: {contents!r}")
+            require("rec Pair" in contents["value"],
+                    f"unfencing lost the content: {contents!r}")
+            s.finish()
+            finished = True
+        finally:
+            if not finished:
+                s.abort()
+
+        # a client advertising nothing predates the capability; the spec's
+        # default there is plaintext
+        s = session_with(None)
+        finished = False
+        try:
+            legacy = hover(s, "pub rec Pair", "Pair")
+            require(legacy and legacy["contents"]["kind"] == "plaintext",
+                    f"a client with no hover capability got markdown: {legacy!r}")
+            s.finish()
+            finished = True
+        finally:
+            if not finished:
+                s.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1909,6 +1996,7 @@ def main() -> int:
         run_cancellation(server, args.timeout)
         run_incremental_sync(server, args.timeout)
         run_code_actions(server, args.timeout)
+        run_hover_presentation(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1933,6 +2021,7 @@ def main() -> int:
     print("  a withdrawn request is answered RequestCancelled")
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  codeAction offers the compiler's own fixes as applicable edits")
+    print("  hover renders headers, expression types, and the client's format")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and exits 3")
