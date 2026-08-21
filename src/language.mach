@@ -311,7 +311,7 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symb
     if (is_some[project.Site](site_o)) {
         var site: project.Site = unwrap[project.Site](site_o);
         if (sym.decl != id.DECL_NIL) {
-            val sso: Option[token.Span] = features.signature_span(site.a, sym);
+            val sso: Option[token.Span] = features.signature_span(site.a, site.file, sym);
             if (is_some[token.Span](sso)) {
                 sig = positions.span_text(site.file, unwrap[token.Span](sso), alloc);
             }

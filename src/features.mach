@@ -412,7 +412,7 @@ pub fun decl_name_span(d: *decl.Decl) Option[token.Span] {
 # a:   the Ast owning the decl
 # sym: the symbol whose signature span is wanted
 # ret: some(span) of the header text, or none
-pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *res.Symbol) Option[token.Span] {
     if (sym.kind == res.SYM_GENERIC) { ret binding_name_span(a, sym); }
     if (sym.kind == res.SYM_PARAM)   { ret param_signature_span(a, sym); }
 
@@ -433,7 +433,63 @@ pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
             }
         }
     }
+    # a record or union's declaration span covers every field. hover is a
+    # summary, not a source viewer: a 13-field record renders as a wall that
+    # buries the one line the reader asked about. trim to the header.
+    if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI) {
+        val ho: Option[token.Span] = header_span(file, d.span, '{');
+        if (is_some[token.Span](ho)) { ret ho; }
+    }
+
+    # a binding whose initialiser runs over several lines has the same problem;
+    # its type is what hover is for, and that ends at the `=`
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
+        if (spans_multiple_lines(file, d.span)) {
+            val ho: Option[token.Span] = header_span(file, d.span, '=');
+            if (is_some[token.Span](ho)) { ret ho; }
+        }
+    }
+
     ret some[token.Span](d.span);
+}
+
+# the leading part of `span` up to the first `stop` byte, trailing whitespace
+# removed, or none when `stop` does not occur
+fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) Option[token.Span] {
+    if (file == nil || file.text == nil) { ret none[token.Span](); }
+    val text: str = file.text;
+    var i: usize = span.offset;
+    val end: usize = span.offset + span.len;
+    for (i < end) {
+        if (text[i] == stop) {
+            var n: usize = i - span.offset;
+            for (n > 0 && is_space(text[span.offset + n - 1])) { n = n - 1; }
+            if (n == 0) { ret none[token.Span](); }
+            var out: token.Span;
+            out.offset = span.offset;
+            out.len    = n;
+            ret some[token.Span](out);
+        }
+        i = i + 1;
+    }
+    ret none[token.Span]();
+}
+
+# whether `span` covers a line break
+fun spans_multiple_lines(file: *src.SourceFile, span: token.Span) bool {
+    if (file == nil || file.text == nil) { ret false; }
+    val text: str = file.text;
+    var i: usize = span.offset;
+    val end: usize = span.offset + span.len;
+    for (i < end) {
+        if (text[i] == '\n') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
 # the `name: type` span of a parameter symbol - from its
