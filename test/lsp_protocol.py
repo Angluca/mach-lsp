@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import json
 import os
 import queue
@@ -1629,6 +1630,63 @@ def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> Non
     require(result.stdout == b"", f"{label}: server emitted a partial response")
 
 
+def run_crash_containment(server: Path, timeout: float) -> None:
+    """A worker fault is reported, not a closed pipe.
+
+    The compiler front end runs over buffers the user is actively breaking, and
+    `std` exposes no way to trap an in-process fault, so the process the editor
+    talks to does not run it. Killing the worker stands in for the fault.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "crash", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            # the process the client talks to must not be the one analysing
+            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                      capture_output=True, text=True).stdout.split()
+            require(children, "no analysis worker: the compiler runs in the client process")
+
+            pending = session.next_id
+            session._send({"jsonrpc": "2.0", "id": pending,
+                           "method": "textDocument/references",
+                           "params": {"textDocument": {"uri": main.as_uri()},
+                                      "position": {"line": 0, "character": 4},
+                                      "context": {"includeDeclaration": True}}})
+            session.next_id += 1
+            os.kill(int(children[0]), signal.SIGKILL)
+
+            # the outstanding request is answered rather than left hanging
+            answer = session.wait_for(
+                lambda item: item.get("id") == pending,
+                "a response after the worker died")
+            require("error" in answer, f"a crash produced a result: {answer!r}")
+
+            # and the person is told what happened
+            note = session.wait_for(
+                lambda item: item.get("method") == "window/showMessage",
+                "a message explaining the crash")
+            require("crash" in note["params"]["message"].lower(),
+                    f"the message does not explain the crash: {note!r}")
+
+            code = session.proc.wait(timeout=timeout)
+            require(code == 3, f"a worker crash exited {code}, want 3")
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_exit_paths(server: Path, timeout: float) -> None:
     """Every lifecycle ending must terminate, with the documented code.
 
@@ -1762,6 +1820,7 @@ def main() -> int:
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
+        run_crash_containment(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -1783,6 +1842,7 @@ def main() -> int:
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
+    print("  a worker crash is answered, explained, and exits 3")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")

@@ -51,6 +51,7 @@ use hints:       mls.hints;
 use tokens:      mls.tokens;
 use project:     mls.project;
 use trace:       mls.trace;
+use render:      mls.render;
 use positions:   mls.positions;
 
 # lifecycle statuses
@@ -73,6 +74,9 @@ val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
+
+# JSON-RPC InternalError
+val INTERNAL_ERROR: i64 = -32603;
 
 val WATCH_FALLBACK: u8 = 0;
 val WATCH_PENDING:  u8 = 1;
@@ -276,6 +280,23 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 # an unknown method gets a JSON-RPC method-not-found error when it carries an
 # id, and is dropped when it does not - a notification owes no response.
 fun dispatch(srv: *Server, root: *sj.Value) {
+    val id: *sj.Value = json.member(root, "id");
+    if (id == nil) { dispatch_inner(srv, root); ret; }
+
+    # every request owes exactly one response. A handler can fail to send one
+    # for reasons it cannot report - a latched allocation failure in the
+    # response buffer, a path that gives up without replying - and a client that
+    # never hears back waits forever. Rather than asking every handler to
+    # remember, the dispatcher checks and backstops.
+    val before: u64 = render.responses();
+    dispatch_inner(srv, root);
+    if (render.responses() == before) {
+        trace.log("server: handler produced no response; answering internal error\n");
+        send_error(srv, id, INTERNAL_ERROR, "the server produced no response for this request");
+    }
+}
+
+fun dispatch_inner(srv: *Server, root: *sj.Value) {
     val a: *Allocator = srv.alloc;
     val method_v: *sj.Value = json.member(root, "method");
     if (method_v == nil) { handle_response(srv, root); ret; }
@@ -720,6 +741,9 @@ fun send_error(srv: *Server, id: *sj.Value, code: i64, message: str) {
 # frame and send a buffer's contents, then release it
 fun send_buf(srv: *Server, b: *json.Buf) {
     val msg: str = json.buf_str(b);
-    if (msg != nil) { transport.send_message(msg, srv.alloc); }
+    if (msg != nil) {
+        transport.send_message(msg, srv.alloc);
+        render.note_response();
+    }
     json.buf_dnit(b);
 }
