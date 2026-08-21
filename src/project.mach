@@ -1495,6 +1495,15 @@ pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
     ret norm_uri(w.alloc, root.mod_paths[mid::u32]);
 }
 
+# the session a root's types and interners belong to
+#
+# Rendering a type needs the session that interned it; a type id is meaningless
+# against any other.
+pub fun root_session(r: *Root) *sess.Session {
+    if (r == nil) { ret nil; }
+    ret r.s;
+}
+
 # how many root slots the workspace holds
 #
 # Slots are stable addresses, so an index is a durable handle across a walk;
