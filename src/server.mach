@@ -39,6 +39,7 @@ use exec:        std.process.exec;
 use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
+use workspace:   mls.workspace;
 use project:     mls.project;
 use trace:       mls.trace;
 
@@ -252,6 +253,7 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     if (str_equals(method, "textDocument/documentSymbol")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL); ret; }
     if (str_equals(method, "textDocument/completion"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_COMPLETION); ret; }
     if (str_equals(method, "textDocument/documentHighlight")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT); ret; }
+    if (str_equals(method, "workspace/symbol"))            { json.free_str(method, a); handle_workspace_symbol(srv, root, params); ret; }
 
     trace.logf("server: unhandled method {}", method);
     json.free_str(method, a);
@@ -270,7 +272,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push_id(?b, json.member(root, "id"));
-    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -422,6 +424,15 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
+}
+
+# answer workspace/symbol from every loaded root
+fun handle_workspace_symbol(srv: *Server, root: *sj.Value, params: *sj.Value) {
+    val id_raw: str = json.id_text(json.member(root, "id"), srv.alloc);
+    if (id_raw == nil) { ret; }
+    val query: str = json.text(json.member(params, "query"), srv.alloc);
+    workspace.symbols(?srv.ws, srv.alloc, id_raw, query);
+    if (query != nil) { json.free_str(query, srv.alloc); }
 }
 
 # re-publish diagnostics for every open document the given root governs
