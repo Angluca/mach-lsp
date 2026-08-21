@@ -1698,33 +1698,101 @@ fun uri_to_path(alloc: *Allocator, uri: str) str {
     if (uri == nil) { ret nil; }
     if (!str_starts_with(uri, "file://")) { ret nil; }
     val n: usize = str_len(uri);
-    val start: usize = 7;
-    if (start >= n) { ret nil; }
+    var i: usize = 7;
 
-    val r: Result[*u8, str] = allocate[u8](alloc, n - start + 1);
+    # the authority. A local file URI spells it empty (`file:///path`) or
+    # `localhost`; anything else names a host, which on Windows is a UNC share
+    # (`file://server/share` -> `\\server\share`). Decoding a host as though it
+    # were the leading path segment would silently turn a remote path into a
+    # local one, so the two are separated here rather than conflated.
+    var auth_start: usize = i;
+    for (i < n && uri[i] != '/') { i = i + 1; }
+    val auth_len: usize = i - auth_start;
+    var unc: bool = false;
+    if (auth_len > 0) {
+        if (!region_equals(uri, auth_start, auth_len, "localhost")) { unc = true; }
+    }
+
+    # worst case: every byte kept, plus a UNC prefix and the terminator
+    val cap: usize = n + 3;
+    val r: Result[*u8, str] = allocate[u8](alloc, cap);
     if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
-
     var out: usize = 0;
-    var i: usize = start;
-    for (i < n) {
-        val c: u8 = uri[i];
+
+    if (unc) {
+        buf[0] = '/';
+        buf[1] = '/';
+        out = 2;
+        var a: usize = auth_start;
+        for (a < auth_start + auth_len) {
+            buf[out] = uri[a];
+            out = out + 1;
+            a = a + 1;
+        }
+    }
+
+    var j: usize = i;
+    for (j < n) {
+        val c: u8 = uri[j];
         if (c == '%') {
-            if (i + 2 >= n) { deallocate[u8](alloc, buf, n - start + 1); ret nil; }
-            val hi: i64 = hex_val(uri[i + 1]);
-            val lo: i64 = hex_val(uri[i + 2]);
-            if (hi < 0 || lo < 0) { deallocate[u8](alloc, buf, n - start + 1); ret nil; }
-            buf[out] = (hi * 16 + lo)::u8;
-            i = i + 3;
+            if (j + 2 >= n) { deallocate[u8](alloc, buf, cap); ret nil; }
+            val hi: i64 = hex_val(uri[j + 1]);
+            val lo: i64 = hex_val(uri[j + 2]);
+            if (hi < 0 || lo < 0) { deallocate[u8](alloc, buf, cap); ret nil; }
+            val b: i64 = hi * 16 + lo;
+            # an encoded NUL would truncate every path comparison downstream at
+            # the point it appears, so a URI carrying one is refused outright
+            if (b == 0) { deallocate[u8](alloc, buf, cap); ret nil; }
+            buf[out] = b::u8;
+            j = j + 3;
         }
         or {
+            if (c == 0) { deallocate[u8](alloc, buf, cap); ret nil; }
             buf[out] = c;
-            i = i + 1;
+            j = j + 1;
         }
         out = out + 1;
     }
     buf[out] = 0;
+
+    # `file:///C:/x` decodes to `/C:/x`, whose leading slash is an artefact of
+    # the URI form rather than part of the path. Only a drive letter earns the
+    # strip; a POSIX path beginning `/c` must keep its root.
+    if (!unc && out >= 3 && buf[0] == '/' && is_drive_letter(buf[1]) && buf[2] == ':') {
+        var k: usize = 0;
+        for (k + 1 <= out) {
+            buf[k] = buf[k + 1];
+            k = k + 1;
+        }
+        out = out - 1;
+        buf[out] = 0;
+    }
+
+    if (out == 0) { deallocate[u8](alloc, buf, cap); ret nil; }
     ret buf::str;
+}
+
+# whether `len` bytes of `s` at `start` equal `want`, case-insensitively
+fun region_equals(s: str, start: usize, len: usize, want: str) bool {
+    if (len != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (lower_ascii(s[start + i]) != lower_ascii(want[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun lower_ascii(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# whether `c` can begin a Windows drive specifier
+fun is_drive_letter(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    ret c >= 'A' && c <= 'Z';
 }
 
 # the normalized filesystem path of a `file://` URI, as an owned
@@ -1787,36 +1855,10 @@ fun project_root_for(alloc: *Allocator, file_path: str) str {
 # cannot correlate such locations with open buffers, so every emitted URI is
 # normalized here on the LSP side (the vendored driver is not ours to change)
 fun normalize_path(alloc: *Allocator, path: str) str {
-    val n: usize = str_len(path);
-    val r: Result[*u8, str] = allocate[u8](alloc, n + 2);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    var out: usize = 0;
-    var i: usize = 0;
-    for (i < n) {
-        for (i < n && path[i] == '/') { i = i + 1; }
-        if (i >= n) { brk; }
-        val seg_start: usize = i;
-        for (i < n && path[i] != '/') { i = i + 1; }
-        val seg_len: usize = i - seg_start;
-
-        if (seg_len == 1 && path[seg_start] == '.') { cnt; }
-        if (seg_len == 2 && path[seg_start] == '.' && path[seg_start + 1] == '.') {
-            for (out > 0 && buf[out - 1] != '/') { out = out - 1; }
-            if (out > 0) { out = out - 1; }
-            cnt;
-        }
-
-        buf[out] = '/';
-        out = out + 1;
-        var k: usize = 0;
-        for (k < seg_len) { buf[out + k] = path[seg_start + k]; k = k + 1; }
-        out = out + seg_len;
-    }
-    if (out == 0) { buf[0] = '/'; out = 1; }
-    buf[out] = 0;
-    ret buf::str;
+    if (path == nil) { ret nil; }
+    val r: Result[pathlib.Path, str] = pathlib.clean(alloc, path);
+    if (is_err[pathlib.Path, str](r)) { ret nil; }
+    ret unwrap_ok[pathlib.Path, str](r);
 }
 
 # a `file://` URI for a SourceFile's `path`, owned by the caller, or
@@ -1875,5 +1917,85 @@ test "project: non-file uri has no compiler path" {
     var pa: Allocator;
     page.make(?pa);
     if (path_of_uri(?pa, "untitled:buffer") != nil) { ret 1; }
+    ret 0;
+}
+
+
+test "project: a local file URI decodes to its path" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val a: str = uri_to_path(?pa, "file:///home/u/a%20b.mach");
+    if (a == nil)                              { fail = true; }
+    or { if (!str_equals(a, "/home/u/a b.mach")) { fail = true; } }
+    # localhost is the other spelling of "this machine"
+    val b: str = uri_to_path(?pa, "file://localhost/home/u/x.mach");
+    if (b == nil)                              { fail = true; }
+    or { if (!str_equals(b, "/home/u/x.mach"))  { fail = true; } }
+    if (uri_to_path(?pa, "http://example/x") != nil) { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the leading slash of `/C:/x` belongs to the URI form, not the path; a POSIX
+# path starting `/c` must keep its root, so only a real drive spec is stripped
+test "project: a windows drive URI loses the URI's leading slash" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val a: str = uri_to_path(?pa, "file:///C:/src/main.mach");
+    if (a == nil)                                 { fail = true; }
+    or { if (!str_equals(a, "C:/src/main.mach"))  { fail = true; } }
+    val b: str = uri_to_path(?pa, "file:///c:/x");
+    if (b == nil)                                 { fail = true; }
+    or { if (!str_equals(b, "c:/x"))              { fail = true; } }
+    val c: str = uri_to_path(?pa, "file:///cat/x");
+    if (c == nil)                                 { fail = true; }
+    or { if (!str_equals(c, "/cat/x"))            { fail = true; } }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a non-empty authority names a host, which is a UNC share - decoding it as the
+# first path segment would silently turn a remote path into a local one
+test "project: a UNC authority is kept as a UNC root" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val a: str = uri_to_path(?pa, "file://server/share/x.mach");
+    if (a == nil)                                     { fail = true; }
+    or { if (!str_equals(a, "//server/share/x.mach")) { fail = true; } }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "project: a malformed escape or an encoded NUL is refused" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    if (uri_to_path(?pa, "file:///a%zz")   != nil) { fail = true; }
+    if (uri_to_path(?pa, "file:///a%2")    != nil) { fail = true; }
+    # an embedded NUL would truncate every later path comparison
+    if (uri_to_path(?pa, "file:///a%00b")  != nil) { fail = true; }
+    if (uri_to_path(?pa, "file://")        != nil) { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "project: normalization collapses . and .. without escaping the root" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val a: str = normalize_path(?pa, "/a/./b/../c");
+    if (a == nil)                        { fail = true; }
+    or { if (!str_equals(a, "/a/c"))     { fail = true; } }
+    val b: str = normalize_path(?pa, "/a//b/");
+    if (b == nil)                        { fail = true; }
+    or { if (!str_equals(b, "/a/b"))     { fail = true; } }
+    # `..` at the root stays at the root rather than climbing above it
+    val c: str = normalize_path(?pa, "/../x");
+    if (c == nil)                        { fail = true; }
+    or { if (!str_equals(c, "/x"))       { fail = true; } }
+    if (fail) { ret 1; }
     ret 0;
 }
