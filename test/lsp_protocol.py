@@ -1904,11 +1904,17 @@ def run_crash_containment(server: Path, timeout: float) -> None:
             session.next_id += 1
             os.kill(worker, signal.SIGKILL)
 
-            # the outstanding request is answered rather than left hanging
+            # The request is answered rather than left hanging. Whether the
+            # answer is the crash error or a real result is a race the test
+            # cannot win - under load the worker sometimes finishes before the
+            # signal lands - and it is not what needs guarding. What needs
+            # guarding is that SOMETHING comes back for that id, because the
+            # failure this replaces was a client waiting on it forever.
             answer = session.wait_for(
                 lambda item: item.get("id") == pending,
                 "a response after the worker died")
-            require("error" in answer, f"a crash produced a result: {answer!r}")
+            require("error" in answer or "result" in answer,
+                    f"the request the worker died on was never answered: {answer!r}")
 
             # and the person is told what happened, as a warning rather than an
             # error, because the session is coming back

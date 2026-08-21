@@ -178,29 +178,38 @@ pub fun run(alloc: *Allocator, self: str) i64 {
             brk;
         }
 
-        # the request the worker died holding is answered before anything else:
-        # the replacement will never have heard of it, so nothing else is going
-        # to unblock the client
-        report_crash(alloc, sig, true);
-
+        # The replacement is in place and armed BEFORE the client is told
+        # anything. Telling it first would invite it to send into the gap where
+        # there is no worker to send to: a client that has just been handed an
+        # error for its pending request reissues immediately, and that reissue
+        # would be dropped with nothing left to answer it. Ordering it this way
+        # means every frame the client sends in reaction to the crash arrives at
+        # a worker that exists, behind a replay that is already pending.
         os.close(reading);
         mutex.lock(?RELAY.mu);
         os.close(RELAY.to_worker);
+        RELAY.to_worker = -1;
+        atomic.store(?RELAY.need_replay, 1);
         pid = start_worker(self, ?to_worker[0], ?from_worker[0]);
         if (pid >= 0) {
             RELAY.to_worker = to_worker[1];
             reading         = from_worker[0];
             atomic.store(?RELAY.swallow, 1);
-            atomic.store(?RELAY.need_replay, 1);
         }
         mutex.unlock(?RELAY.mu);
 
         if (pid < 0) {
             trace.log("supervisor: could not restart the analysis worker\n");
+            report_crash(alloc, sig, false);
             code = EXIT_WORKER_CRASHED;
             brk;
         }
         restarts = restarts + 1;
+
+        # now the request the worker died holding is answered: the replacement
+        # will never have heard of it, so nothing else is going to unblock the
+        # client
+        report_crash(alloc, sig, true);
         trace.logf("supervisor: analysis worker replaced after signal {}", sig);
     }
 
@@ -259,17 +268,31 @@ fun pump_client(arg: *u8) {
         note_request(r, msg.body, msg.body_len);
 
         mutex.lock(?r.mu);
-        var alive: bool = r.to_worker >= 0;
-        if (alive && atomic.load(?r.need_replay) != 0) {
-            alive = mirror.replay(?r.mir, r.to_worker);
-            atomic.store(?r.need_replay, 0);
+        # a replay is only spent once it lands. Clearing the flag on a failed
+        # write would leave the next worker holding a session it was never told
+        # about, which is worse than not restarting at all: it would answer
+        # confidently about documents it has never seen.
+        if (r.to_worker >= 0 && atomic.load(?r.need_replay) != 0) {
+            if (mirror.replay(?r.mir, r.to_worker)) { atomic.store(?r.need_replay, 0); }
         }
+
+        # the mirror is folded whether or not the frame reaches a worker. A
+        # frame lost to a dying worker's pipe is not lost to the session: it is
+        # already in the state the replacement will be given.
         mirror.record(?r.mir, msg.body, msg.body_len);
-        if (alive) { alive = transport.write_frame_to(r.to_worker, msg.body, msg.body_len); }
+
+        if (r.to_worker >= 0 && atomic.load(?r.need_replay) == 0) {
+            # a write that fails is a worker that has died, which the main
+            # thread is already reaping. It is NOT the end of the client
+            # connection, and treating it as one would end the session on
+            # exactly the timing this whole mechanism exists to survive: a
+            # request forwarded in the instant between the crash and the
+            # supervisor noticing it.
+            transport.write_frame_to(r.to_worker, msg.body, msg.body_len);
+        }
         mutex.unlock(?r.mu);
 
         transport.message_free(?msg, r.alloc);
-        if (!alive) { brk; }
     }
 
     # closing the worker's input is how it learns the client is gone
