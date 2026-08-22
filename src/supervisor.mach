@@ -87,6 +87,31 @@ val MAX_RESTARTS: i64 = 5;
 # response is to stop and say so rather than to keep spawning.
 val MAX_BARREN: i64 = 2;
 
+# how long a request may go unanswered before the worker is declared hung
+#
+# A compiler stuck in non-cooperative code cannot read a cancellation, so the
+# only way out is to end the process. The number is deliberately far above any
+# real analysis - a cold load of a large project is seconds, and a warm request
+# is under a millisecond - because the failure mode of a deadline that is too
+# short is to kill work that was about to succeed, which is worse than the hang
+# it is guarding against. A hang is indefinite; two minutes of silence is not
+# ambiguous.
+val DEFAULT_DEADLINE_NS: i64 = 120000000000;
+
+# the same bound, overridable for a workspace where two minutes is genuinely
+# too short - and for the test, which cannot wait that long to prove the
+# watchdog fires
+val DEADLINE_VAR: str = "MLS_REQUEST_DEADLINE_MS";
+
+# how long the worker gets to exit on its own after the client says `exit`
+#
+# Shutdown must terminate even when analysis is wedged, because a language
+# server that will not exit is a process the user has to hunt down.
+val SHUTDOWN_GRACE_NS: i64 = 2000000000;
+
+# how often the watchdog looks at the clock
+val WATCH_TICK_NS: i64 = 200000000;
+
 # the relay's shared state
 #
 # `to_worker` and `mir` are written by whichever thread holds `mu`; the atomics
@@ -101,6 +126,12 @@ rec Relay {
     have_id:    i64;
     need_replay: i64;
     swallow:    i64;
+    pid:        i64;
+    req_at:     i64;
+    exit_at:    i64;
+    down_seen:  i64;
+    deadline:   i64;
+    timed_out:  i64;
 }
 
 # one relay per process; the pump thread is handed its address
@@ -120,6 +151,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     RELAY.have_id     = 0;
     RELAY.need_replay = 0;
     RELAY.swallow     = 0;
+    RELAY.pid         = -1;
+    RELAY.req_at      = 0;
+    RELAY.exit_at     = 0;
+    RELAY.down_seen   = 0;
+    RELAY.timed_out   = 0;
+    RELAY.deadline    = configured_deadline();
     mirror.init(?RELAY.mir, alloc);
 
     var pid: i64 = start_worker(self, ?to_worker[0], ?from_worker[0]);
@@ -129,6 +166,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         ret 1;
     }
     RELAY.to_worker = to_worker[1];
+    atomic.store(?RELAY.pid, pid);
 
     var pump: thread.Thread;
     thread.spawn_with(pump_client, (?RELAY)::*u8, ?pump);
@@ -140,6 +178,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         ret 1;
     }
 
+    # the watchdog is the only thing holding a clock. Both pumps are parked in
+    # read(2) for as long as the worker is silent, which is exactly the state a
+    # hang produces, so neither of them can notice one.
+    var watch: thread.Thread;
+    thread.spawn_with(watchdog, (?RELAY)::*u8, ?watch);
+
     var code:     i64 = 0;
     var restarts: i64 = 0;
     var barren:   i64 = 0;
@@ -148,6 +192,11 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     for (true) {
         var frames: i64 = 0;
         val clean: bool = pump_worker(alloc, reading, ?frames);
+
+        # the watchdog must not be able to signal this pid once it is being
+        # reaped: the kernel is free to reuse the number the moment wait
+        # returns, and terminating a reused pid kills an unrelated process
+        atomic.store(?RELAY.pid, -1);
 
         var child: exec.Child;
         child.pid = pid;
@@ -165,6 +214,17 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         }
 
         val sig: i64 = exec.signal(status)::i64;
+
+        # a worker ended during shutdown is not a crash to recover from - the
+        # client is leaving, and the kill was ours. The protocol's own rule
+        # decides the code, because the worker no longer can.
+        if (atomic.load(?RELAY.exit_at) != 0) {
+            trace.logf("supervisor: worker ended during shutdown by signal {}", sig);
+            code = 1;
+            if (atomic.load(?RELAY.down_seen) != 0) { code = 0; }
+            brk;
+        }
+
         if (frames == 0) { barren = barren + 1; }
         or { barren = 0; }
 
@@ -195,6 +255,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
             RELAY.to_worker = to_worker[1];
             reading         = from_worker[0];
             atomic.store(?RELAY.swallow, 1);
+            atomic.store(?RELAY.pid, pid);
         }
         mutex.unlock(?RELAY.mu);
 
@@ -251,6 +312,77 @@ fun start_worker(self: str, to: *i32, from: *i32) i64 {
         ret -1;
     }
     ret pid;
+}
+
+# end a worker that has stopped answering, and bound shutdown
+#
+# A compiler stuck in non-cooperative code cannot read a cancellation frame, so
+# there is nothing to ask: the only way to get the session back is to end the
+# process. Killing it turns the hang into the crash the rest of this file
+# already knows how to handle - the request is answered, a replacement is
+# spawned, and the session is replayed into it.
+#
+# This has to be its own thread because both pumps are parked in read(2) for as
+# long as the worker is silent, and silence is precisely what a hang looks like.
+fun watchdog(arg: *u8) {
+    val r: *Relay = arg::*Relay;
+    for (atomic.load(?r.stop) == 0) {
+        os.sleep(WATCH_TICK_NS);
+        val now: i64 = now_ns();
+
+        var doomed: i64 = 0;
+
+        # a request that has gone unanswered past the deadline
+        val started: i64 = atomic.load(?r.req_at);
+        if (atomic.load(?r.have_id) != 0 && started != 0 && now - started > r.deadline) {
+            atomic.store(?r.timed_out, 1);
+            doomed = atomic.load(?r.pid);
+            if (doomed > 0) { trace.logf("supervisor: worker exceeded the request deadline, ending pid {}", doomed); }
+        }
+
+        # or a worker that has not exited after the client said so
+        val leaving: i64 = atomic.load(?r.exit_at);
+        if (doomed == 0 && leaving != 0 && now - leaving > SHUTDOWN_GRACE_NS) {
+            doomed = atomic.load(?r.pid);
+            if (doomed > 0) { trace.logf("supervisor: worker did not exit, ending pid {}", doomed); }
+        }
+
+        if (doomed > 0) {
+            # under the lock so the reaping thread cannot swap the pid out from
+            # under the signal
+            mutex.lock(?r.mu);
+            val target: i64 = atomic.load(?r.pid);
+            if (target == doomed) {
+                var c: exec.Child;
+                c.pid = target;
+                exec.terminate_child(c);
+            }
+            mutex.unlock(?r.mu);
+        }
+    }
+}
+
+# the monotonic clock in nanoseconds, or 0 when it cannot be read
+fun now_ns() i64 {
+    var ts: os.Timespec;
+    if (os.monotonic(?ts) < 0) { ret 0; }
+    ret ts.sec * 1000000000 + ts.nsec;
+}
+
+# the request deadline, from the environment when it names one
+fun configured_deadline() i64 {
+    var buf: [24]u8;
+    val n: i64 = env.get(DEADLINE_VAR, ?buf[0], 24);
+    if (n <= 0) { ret DEFAULT_DEADLINE_NS; }
+    var ms: i64 = 0;
+    var i: usize = 0;
+    for (i < n::usize) {
+        if (buf[i] < '0' || buf[i] > '9') { ret DEFAULT_DEADLINE_NS; }
+        ms = ms * 10 + (buf[i]::i64 - '0'::i64);
+        i = i + 1;
+    }
+    if (ms <= 0) { ret DEFAULT_DEADLINE_NS; }
+    ret ms * 1000000;
 }
 
 # forward client frames to the worker, recording what a replay would need
@@ -331,7 +463,10 @@ fun note_response(r: *Relay, body: str, len: usize) bool {
                         relay = false;
                     }
                 }
-                if (parse_id(id) == atomic.load(?r.last_id)) { atomic.store(?r.have_id, 0); }
+                if (parse_id(id) == atomic.load(?r.last_id)) {
+                    atomic.store(?r.have_id, 0);
+                    atomic.store(?r.req_at, 0);
+                }
                 json.free_str(id, r.alloc);
             }
         }
@@ -350,9 +485,15 @@ fun note_request(r: *Relay, body: str, len: usize) {
         val id: str = json.id_text(json.member(?parsed.root, "id"), r.alloc);
         if (id != nil) {
             atomic.store(?r.last_id, parse_id(id));
+            atomic.store(?r.req_at, now_ns());
             atomic.store(?r.have_id, 1);
             json.free_str(id, r.alloc);
         }
+        val m: *sj.Value = json.member(?parsed.root, "method");
+        if (json.text_equals(m, "shutdown", r.alloc)) { atomic.store(?r.down_seen, 1); }
+        # `exit` starts the clock on shutdown: from here the worker has a
+        # bounded time to go on its own before it is ended
+        if (json.text_equals(m, "exit", r.alloc)) { atomic.store(?r.exit_at, now_ns()); }
     }
     json.release(?rd);
     json.reader_dnit(?rd);
@@ -413,14 +554,22 @@ fun pump_worker(alloc: *Allocator, fd: i32, frames: *i64) bool {
 fun report_crash(alloc: *Allocator, sig: i64, recovering: bool) {
     trace.logf("supervisor: analysis worker terminated by signal {}", sig);
 
+    val hung: bool = atomic.load(?RELAY.timed_out) != 0;
+    atomic.store(?RELAY.timed_out, 0);
+
     if (atomic.load(?RELAY.have_id) != 0) {
         val id: i64 = atomic.load(?RELAY.last_id);
         if (id != 0) {
             var b: json.Buf = json.buf_init(alloc);
             json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
             json.buf_push_i64(?b, id);
-            json.buf_push(?b, ",\"error\":{\"code\":-32603,\"message\":");
-            json.buf_push_quoted(?b, "the mach analysis worker crashed while handling this request");
+            # a request the server gave up on is ServerCancelled, not an
+            # internal error: nothing went wrong inside the request, it was
+            # abandoned, and a client is entitled to treat the two differently
+            if (hung) { json.buf_push(?b, ",\"error\":{\"code\":-32802,\"message\":"); }
+            or        { json.buf_push(?b, ",\"error\":{\"code\":-32603,\"message\":"); }
+            if (hung) { json.buf_push_quoted(?b, "the mach analysis worker stopped responding and was restarted"); }
+            or        { json.buf_push_quoted(?b, "the mach analysis worker crashed while handling this request"); }
             json.buf_push(?b, "}}");
             val msg: str = json.buf_str(?b);
             if (msg != nil) { transport.send_message(msg, alloc); }
@@ -435,13 +584,17 @@ fun report_crash(alloc: *Allocator, sig: i64, recovering: bool) {
     or             { json.buf_push(?n, "1"); }
     json.buf_push(?n, ",\"message\":");
     var text: json.Buf = json.buf_init(alloc);
-    json.buf_push(?text, "mach-lsp: the analysis worker crashed (signal ");
+    if (hung) { json.buf_push(?text, "mach-lsp: the analysis worker stopped responding and was ended (signal "); }
+    or        { json.buf_push(?text, "mach-lsp: the analysis worker crashed (signal "); }
     json.buf_push_i64(?text, sig);
+    json.buf_push(?text, "). ");
+    if (hung) { json.buf_push(?text, "Analysis was stuck and could not be interrupted"); }
+    or        { json.buf_push(?text, "This is a compiler front-end fault"); }
     if (recovering) {
-        json.buf_push(?text, "). This is a compiler front-end fault; the server has restarted and restored your open documents.");
+        json.buf_push(?text, "; the server has restarted and restored your open documents.");
     }
     or {
-        json.buf_push(?text, "). This is a compiler front-end fault; the language server has stopped.");
+        json.buf_push(?text, "; the language server has stopped.");
     }
     json.buf_push_quoted(?n, json.buf_str(?text));
     json.buf_push(?n, "}}");
