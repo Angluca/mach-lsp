@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import signal
 import json
 import os
@@ -1984,6 +1985,147 @@ def run_crash_containment(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_hung_worker(server: Path, timeout: float) -> None:
+    """Analysis that cannot be interrupted must not hold the session forever.
+
+    A crash at least closes a pipe. A compiler stuck in non-cooperative code
+    does not: it holds the request, ignores cancellation because it never
+    reaches the point of reading one, and leaves the editor waiting on an id
+    that will never come back. Nothing inside the worker can fix that, so the
+    supervisor ends the process and treats it as the crash it already knows how
+    to recover from.
+
+    SIGSTOP stands in for the wedge. It is a better model than a sleep loop
+    because a stopped process really is unable to read its input, which is the
+    property that makes a hang unrecoverable from the inside. Like the crash
+    test this needs `pgrep` and POSIX signals, so it is skipped elsewhere.
+    """
+    if os.name != "posix":
+        print("  hung worker: skipped (needs pgrep and SIGSTOP)")
+        return
+
+    def worker_of(session: "LspSession") -> int:
+        for _ in range(200):
+            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                      capture_output=True, text=True).stdout.split()
+            if children:
+                return int(children[0])
+            time.sleep(0.02)
+        raise AssertionError("no analysis worker to wedge")
+
+    # a deadline short enough to test, in place of the two minutes a real
+    # session allows before it will call analysis stuck
+    previous = os.environ.get("MLS_REQUEST_DEADLINE_MS")
+    os.environ["MLS_REQUEST_DEADLINE_MS"] = "1200"
+    try:
+        with tempfile.TemporaryDirectory(prefix="mls-hang-") as directory:
+            root = Path(directory).resolve()
+            main, _, text = write_project(root, "hang", 5)
+            session = LspSession(server, root, timeout)
+            finished = False
+            wedged = None
+            try:
+                session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+                session.notify("initialized", {})
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                      "version": 1, "text": text}},
+                )
+                session.diagnostics(main.as_uri(), 1)
+
+                edited = text + "\npub fun survived_the_hang(n: i32) i32 { ret n; }\n"
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": 2},
+                     "contentChanges": [{"text": edited}]},
+                )
+                session.diagnostics(main.as_uri(), 2)
+
+                wedged = worker_of(session)
+                os.kill(wedged, signal.SIGSTOP)
+
+                pending = session.next_id
+                session.next_id += 1
+                session._send({"jsonrpc": "2.0", "id": pending,
+                               "method": "textDocument/documentSymbol",
+                               "params": {"textDocument": {"uri": main.as_uri()}}})
+
+                answer = session.wait_for(
+                    lambda item: item.get("id") == pending,
+                    "an answer to the request the worker never read")
+                error = answer.get("error") or {}
+                # ServerCancelled, not InternalError: nothing went wrong inside
+                # the request, it was abandoned, and a client is entitled to
+                # tell those apart
+                require(error.get("code") == -32802,
+                        f"a wedged request was not answered ServerCancelled: {answer!r}")
+
+                note = session.wait_for(
+                    lambda item: item.get("method") == "window/showMessage",
+                    "a message explaining the hang")
+                require("responding" in note["params"]["message"].lower(),
+                        f"the message does not explain the hang: {note!r}")
+
+                # and the session comes back, still holding the edit
+                symbols = session.request(
+                    "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+                names = [s["name"] for s in (symbols.get("result") or [])]
+                require("survived_the_hang" in names,
+                        f"the session did not recover from the hang: {names!r}")
+
+                session.finish()
+                finished = True
+            finally:
+                if not finished:
+                    session.abort()
+                if wedged is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(wedged, signal.SIGKILL)
+
+        # shutdown terminates even while analysis is wedged, with the code the
+        # protocol asks for: a server that will not exit is one the user has to
+        # go and find
+        for send_shutdown, expected in ((True, 0), (False, 1)):
+            with tempfile.TemporaryDirectory(prefix="mls-downhang-") as directory:
+                root = Path(directory).resolve()
+                main, _, text = write_project(root, "downhang", 6)
+                session = LspSession(server, root, timeout)
+                wedged = None
+                try:
+                    session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+                    session.notify("initialized", {})
+                    session.notify(
+                        "textDocument/didOpen",
+                        {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                          "version": 1, "text": text}},
+                    )
+                    session.diagnostics(main.as_uri(), 1)
+
+                    wedged = worker_of(session)
+                    os.kill(wedged, signal.SIGSTOP)
+                    if send_shutdown:
+                        session._send({"jsonrpc": "2.0", "id": session.next_id,
+                                       "method": "shutdown"})
+                        session.next_id += 1
+                    session.notify("exit", {})
+
+                    code = session.proc.wait(timeout=timeout)
+                    require(code == expected,
+                            f"a wedged shutdown exited {code}, want {expected}")
+                finally:
+                    with contextlib.suppress(Exception):
+                        session.abort()
+                    if wedged is not None:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(wedged, signal.SIGKILL)
+    finally:
+        if previous is None:
+            os.environ.pop("MLS_REQUEST_DEADLINE_MS", None)
+        else:
+            os.environ["MLS_REQUEST_DEADLINE_MS"] = previous
+
+
 def run_exit_paths(server: Path, timeout: float) -> None:
     """Every lifecycle ending must terminate, with the documented code.
 
@@ -2120,6 +2262,7 @@ def main() -> int:
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
         run_crash_containment(server, args.timeout)
+        run_hung_worker(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -2144,6 +2287,7 @@ def main() -> int:
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and replayed into a replacement")
+    print("  a wedged worker is ended, answered ServerCancelled, and recovered")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
