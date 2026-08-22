@@ -54,6 +54,7 @@ use actions:     mls.actions;
 use project:     mls.project;
 use trace:       mls.trace;
 use render:      mls.render;
+use progress:    mls.progress;
 use positions:   mls.positions;
 
 # lifecycle statuses
@@ -376,6 +377,8 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     # asked for.
     srv.hover_markdown = accepts_markdown(
         json.member(json.member2(params, "capabilities", "textDocument"), "hover"), srv.alloc);
+    progress.configure(json.boolean(
+        json.member(json.member2(params, "capabilities", "window"), "workDoneProgress"), false));
 
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");

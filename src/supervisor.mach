@@ -132,6 +132,7 @@ rec Relay {
     down_seen:  i64;
     deadline:   i64;
     timed_out:  i64;
+    open_token: str;
 }
 
 # one relay per process; the pump thread is handed its address
@@ -156,6 +157,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     RELAY.exit_at     = 0;
     RELAY.down_seen   = 0;
     RELAY.timed_out   = 0;
+    RELAY.open_token  = nil;
     RELAY.deadline    = configured_deadline();
     mirror.init(?RELAY.mir, alloc);
 
@@ -447,6 +449,7 @@ fun note_response(r: *Relay, body: str, len: usize) bool {
     if (!json.reader_init(?rd, r.alloc)) { ret relay; }
     var parsed: json.Message = json.read(?rd, body, len);
     if (parsed.valid) {
+        note_progress(r, ?parsed.root);
         val idv: *sj.Value = json.member(?parsed.root, "id");
         val answered: bool = json.member(?parsed.root, "result") != nil
                           || json.member(?parsed.root, "error") != nil;
@@ -474,6 +477,59 @@ fun note_response(r: *Relay, body: str, len: usize) bool {
     json.release(?rd);
     json.reader_dnit(?rd);
     ret relay;
+}
+
+# follow the worker's progress reports so an abandoned one can be closed
+#
+# A progress token is opened by the worker and closed by the worker, which works
+# until the worker stops existing between the two. What the person is left with
+# is a spinner that never goes away - the visible form of exactly the failure
+# the supervisor exists to clean up after, so it cleans up after this one too.
+#
+# One slot is enough because analysis is one worker running `try_load` to
+# completion before the next: begin and end are strictly nested and never
+# overlap. If that ever stops being true this needs to grow a list, which is why
+# it is written as a replacement rather than an assignment - losing track is
+# reported by the previous token being closed, not by silence.
+fun note_progress(r: *Relay, root: *sj.Value) {
+    if (!json.text_equals(json.member(root, "method"), "$/progress", r.alloc)) { ret; }
+    val params: *sj.Value = json.member(root, "params");
+    val kind: *sj.Value = json.member2(params, "value", "kind");
+
+    if (json.text_equals(kind, "begin", r.alloc)) {
+        val token: str = json.text(json.member(params, "token"), r.alloc);
+        if (token == nil) { ret; }
+        if (r.open_token != nil) { close_progress(r); }
+        r.open_token = token;
+        ret;
+    }
+    if (json.text_equals(kind, "end", r.alloc)) {
+        if (r.open_token == nil) { ret; }
+        val token: str = json.text(json.member(params, "token"), r.alloc);
+        if (token != nil) {
+            if (str_equals(token, r.open_token)) {
+                json.free_str(r.open_token, r.alloc);
+                r.open_token = nil;
+            }
+            json.free_str(token, r.alloc);
+        }
+    }
+}
+
+# end a progress report the worker will never end itself
+fun close_progress(r: *Relay) {
+    if (r.open_token == nil) { ret; }
+    var b: json.Buf = json.buf_init(r.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":");
+    json.buf_push_quoted(?b, r.open_token);
+    json.buf_push(?b, ",\"value\":{\"kind\":\"end\",\"message\":");
+    json.buf_push_quoted(?b, "analysis ended unexpectedly");
+    json.buf_push(?b, "}}}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, r.alloc); }
+    json.buf_dnit(?b);
+    json.free_str(r.open_token, r.alloc);
+    r.open_token = nil;
 }
 
 # remember the newest request id seen on the client stream
@@ -556,6 +612,9 @@ fun report_crash(alloc: *Allocator, sig: i64, recovering: bool) {
 
     val hung: bool = atomic.load(?RELAY.timed_out) != 0;
     atomic.store(?RELAY.timed_out, 0);
+
+    # whatever the worker was reporting, it is not reporting it any more
+    close_progress(?RELAY);
 
     if (atomic.load(?RELAY.have_id) != 0) {
         val id: i64 = atomic.load(?RELAY.last_id);

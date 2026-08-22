@@ -2134,6 +2134,167 @@ def run_hung_worker(server: Path, timeout: float) -> None:
             os.environ["MLS_REQUEST_DEADLINE_MS"] = previous
 
 
+def run_progress_reporting(server: Path, timeout: float) -> None:
+    """A cold load must look like work, not like a hang.
+
+    Analysis of a project is seconds during which the server answers nothing and
+    says nothing, which from the outside is indistinguishable from a server that
+    has wedged - and telling those apart matters more now that the supervisor
+    waits two minutes before it will call analysis stuck.
+
+    Three things are checked, because each has its own way of being wrong: a
+    client that never agreed to progress must not be sent any; a report must
+    open and close exactly once for a cold load and not at all for the
+    revalidations that follow; and a token whose worker dies must still be
+    closed, or the person is left with a spinner that never goes away - the
+    visible form of the failure the supervisor exists to clean up after.
+    """
+    def reports(session: "LspSession") -> list[dict[str, Any]]:
+        return [m for m in session.pending if m.get("method") == "$/progress"]
+
+    # a client that did not ask for progress is not sent any
+    with tempfile.TemporaryDirectory(prefix="mls-prog-off-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "progoff", 5)
+        session = LspSession(server, root, timeout)
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(not reports(session),
+                    f"progress was sent to a client that did not advertise it: {reports(session)!r}")
+            creates = [m for m in session.pending
+                       if m.get("method") == "window/workDoneProgress/create"]
+            require(not creates, f"a progress token was created unasked: {creates!r}")
+            session.finish()
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+    # the cold load reports once; the revalidations after it do not
+    with tempfile.TemporaryDirectory(prefix="mls-prog-on-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "progon", 5)
+        session = LspSession(server, root, timeout)
+        try:
+            session.request(
+                "initialize",
+                {"rootUri": root.as_uri(),
+                 "capabilities": {"window": {"workDoneProgress": True}}},
+            )
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            for version in (2, 3):
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\npub fun e{version}(n: i32) i32 {{ ret n; }}\n"}]},
+                )
+                session.diagnostics(main.as_uri(), version)
+            session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+
+            kinds = [m["params"]["value"]["kind"] for m in reports(session)]
+            require(kinds == ["begin", "end"],
+                    f"a cold load did not report exactly once: {kinds!r}")
+            tokens = {m["params"]["token"] for m in reports(session)}
+            require(len(tokens) == 1, f"begin and end used different tokens: {tokens!r}")
+            session.finish()
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+    # a report whose worker dies is still closed
+    if os.name != "posix":
+        print("  progress: orphan close skipped (needs pgrep and SIGSTOP)")
+        return
+
+    previous = os.environ.get("MLS_REQUEST_DEADLINE_MS")
+    os.environ["MLS_REQUEST_DEADLINE_MS"] = "800"
+    try:
+        with tempfile.TemporaryDirectory(prefix="mls-prog-orphan-") as directory:
+            root = Path(directory).resolve()
+            main, _, text = write_project(root, "progorphan", 5)
+            # a load slow enough to be interrupted part-way. The window scales
+            # with how loaded the machine is, and so does the time to stop the
+            # worker, so this does not get tighter under CI contention.
+            bulk = "".join(f"pub fun bulk_{i}(a: usize, b: usize) usize {{ ret a + b + {i}; }}\n"
+                           for i in range(20000))
+            body = "use std.types.size.usize;\n" + bulk + text
+            main.write_text(body, encoding="utf-8")
+
+            session = LspSession(server, root, timeout)
+            wedged = None
+            try:
+                session.request(
+                    "initialize",
+                    {"rootUri": root.as_uri(),
+                     "capabilities": {"window": {"workDoneProgress": True}}},
+                )
+                session.notify("initialized", {})
+
+                # resolved before the load starts, so stopping the worker is one
+                # syscall rather than a process lookup inside the window
+                for _ in range(200):
+                    children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                              capture_output=True, text=True).stdout.split()
+                    if children:
+                        wedged = int(children[0])
+                        break
+                    time.sleep(0.02)
+                require(wedged is not None, "no analysis worker to interrupt")
+
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                      "version": 1, "text": body}},
+                )
+                begin = session.wait_for(
+                    lambda item: (item.get("method") == "$/progress"
+                                  and item["params"]["value"]["kind"] == "begin"),
+                    "a progress report for the cold load")
+                os.kill(wedged, signal.SIGSTOP)
+                token = begin["params"]["token"]
+
+                # a request the stopped worker cannot read, so the deadline ends it
+                pending = session.next_id
+                session.next_id += 1
+                session._send({"jsonrpc": "2.0", "id": pending,
+                               "method": "textDocument/documentSymbol",
+                               "params": {"textDocument": {"uri": main.as_uri()}}})
+                session.wait_for(lambda item: item.get("id") == pending,
+                                 "an answer after the worker was ended")
+
+                closed = session.wait_for(
+                    lambda item: (item.get("method") == "$/progress"
+                                  and item["params"].get("token") == token
+                                  and item["params"]["value"]["kind"] == "end"),
+                    "the abandoned progress report being closed")
+                require(closed["params"]["value"].get("message"),
+                        f"an abandoned report closed without saying why: {closed!r}")
+            finally:
+                with contextlib.suppress(Exception):
+                    session.abort()
+                if wedged is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(wedged, signal.SIGKILL)
+    finally:
+        if previous is None:
+            os.environ.pop("MLS_REQUEST_DEADLINE_MS", None)
+        else:
+            os.environ["MLS_REQUEST_DEADLINE_MS"] = previous
+
+
 def run_trace_policy(server: Path, timeout: float) -> None:
     """Turning tracing on must not copy the user's source into a log.
 
@@ -2330,6 +2491,7 @@ def main() -> int:
         run_exit_paths(server, args.timeout)
         run_crash_containment(server, args.timeout)
         run_hung_worker(server, args.timeout)
+        run_progress_reporting(server, args.timeout)
         run_trace_policy(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
@@ -2356,6 +2518,7 @@ def main() -> int:
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and replayed into a replacement")
     print("  a wedged worker is ended, answered ServerCancelled, and recovered")
+    print("  a cold load reports progress once, and an abandoned report is closed")
     print("  tracing keeps source out of the log unless asked for, and caps it")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
