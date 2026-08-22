@@ -498,52 +498,123 @@ fun doc_emit(buf: *u8, off: usize, s: str) usize {
     ret off + n;
 }
 
-# copy a summary / description span into `buf`, folding each embedded
-# comment-line break (`\n` then the next line's `#`, whitespace, and an optional
-# single space) into a single rendered space. a span returned by `fe/doc.mach`
-# spans only the first line's leading `#`; continuation lines keep their `#`
-# prefix, so this strips them to leave clean prose. measures when `buf` is nil
+# copy a summary / description span into `buf`, keeping the line structure the
+# comment carries
+#
+# A doc comment is wrapped prose, so most line breaks are soft and have to fold
+# into a space or every hover arrives as a column of fragments. Not all of them
+# are: a bullet list is structure the author wrote deliberately, and folding it
+# into the surrounding sentence produced exactly one run-on paragraph with
+# `- item` markers stranded mid-sentence, which no renderer reads as a list.
+#
+# What separates the two is the indentation, which is why this keeps it rather
+# than skipping it as whitespace. A marker at any indent starts a line; a line
+# indented further than the marker above it is that item wrapping and folds; a
+# line back at the prose margin ends the list, and needs a blank line after it or
+# the paragraph that follows is absorbed into the final item.
+#
+# Nesting is emitted relative to the list's own first marker rather than
+# verbatim, so a comment that indents its top level by four spaces stays a list
+# instead of turning into an indented code block.
+#
+# A span from `fe/doc.mach` covers only the first line's leading `#`;
+# continuation lines keep their own, so those are stripped here. Measures when
+# `buf` is nil, by the same walk, so the two passes cannot disagree.
 fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
     val s: *u8 = source::*u8;
     val end: usize = sp.offset + sp.len;
     var i: usize = sp.offset;
     var at_break: bool = false;
+    var in_list:  bool = false;
+    var base:     usize = 0;
+    var item:     usize = 0;
+
     for (i < end) {
-        if (s[i] == '\n') {
+        if (s[i] != '\n') {
+            if (buf != nil) { buf[off] = s[i]; }
+            off = off + 1;
+            at_break = false;
             i = i + 1;
-            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
-            if (i < end && s[i] == '#') { i = i + 1; }
-            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+            cnt;
+        }
 
-            # a comment line with nothing after its `#` is a paragraph break, not
-            # a wrapped line. folding it to a space ran two paragraphs together
-            # and left the join marked only by a double space, which no renderer
-            # treats as a boundary
-            if (i >= end || s[i] == '\n') {
-                if (!at_break) {
-                    if (buf != nil) { buf[off] = '\n'; }
-                    if (buf != nil) { buf[off + 1] = '\n'; }
-                    off = off + 2;
-                    at_break = true;
-                }
-                cnt;
-            }
+        # step over the break and the next line's comment prefix, then measure
+        # the indentation that follows it
+        i = i + 1;
+        for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+        if (i < end && s[i] == '#') { i = i + 1; }
+        var indent: usize = 0;
+        for (i < end && (s[i] == ' ' || s[i] == '\t')) { indent = indent + 1; i = i + 1; }
 
-            # a paragraph break already separated these; the joining space a
-            # wrapped line needs would show as an indent on the new paragraph
+        # a comment line with nothing after its `#` is a paragraph break, not a
+        # wrapped line. Folding it to a space ran two paragraphs together and
+        # left the join marked only by a double space, which no renderer treats
+        # as a boundary
+        if (i >= end || s[i] == '\n') {
             if (!at_break) {
-                if (buf != nil) { buf[off] = ' '; }
-                off = off + 1;
+                off = doc_lf(buf, off);
+                off = doc_lf(buf, off);
+                at_break = true;
             }
+            in_list = false;
+            cnt;
+        }
+
+        if (marker_at(s, i, end)) {
+            if (in_list) { off = doc_lf(buf, off); }
+            or {
+                if (!at_break) { off = doc_lf(buf, off); off = doc_lf(buf, off); }
+                in_list = true;
+                base    = indent;
+            }
+            item = indent;
+            var k: usize = base;
+            for (k < indent) { off = doc_ch(buf, off, ' '); k = k + 1; }
             at_break = false;
             cnt;
         }
-        if (buf != nil) { buf[off] = s[i]; }
-        off = off + 1;
+
+        if (in_list && indent > item) {
+            off = doc_ch(buf, off, ' ');
+            at_break = false;
+            cnt;
+        }
+
+        if (in_list) {
+            off = doc_lf(buf, off);
+            off = doc_lf(buf, off);
+            in_list  = false;
+            at_break = true;
+            cnt;
+        }
+
+        if (!at_break) { off = doc_ch(buf, off, ' '); }
         at_break = false;
-        i = i + 1;
     }
     ret off;
+}
+
+# whether a list marker starts at `i`
+#
+# The bullet forms plus the ordered ones, because this renders whatever the
+# reader has open and not only the comments in this repository. A marker needs
+# the space after it: `-1` and `1.5` are text, not list items.
+fun marker_at(s: *u8, i: usize, end: usize) bool {
+    if (i >= end) { ret false; }
+    if (s[i] == '-' || s[i] == '*' || s[i] == '+') {
+        ret i + 1 < end && (s[i + 1] == ' ' || s[i + 1] == '\t');
+    }
+    if (s[i] < '0' || s[i] > '9') { ret false; }
+    var j: usize = i;
+    for (j < end && s[j] >= '0' && s[j] <= '9') { j = j + 1; }
+    if (j >= end || (s[j] != '.' && s[j] != ')')) { ret false; }
+    ret j + 1 < end && (s[j + 1] == ' ' || s[j + 1] == '\t');
+}
+
+# write one byte into `buf` when non-nil, returning the advanced offset
+fun doc_ch(buf: *u8, off: usize, c: u8) usize {
+    if (buf != nil) { buf[off] = c; }
+    ret off + 1;
 }
 
 # a `<kind> <name>` rendering for a symbol with no local
