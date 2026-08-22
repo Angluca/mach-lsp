@@ -142,6 +142,10 @@ var RELAY: Relay;
 #
 # `self` is this executable's path, re-spawned with `--worker`.
 pub fun run(alloc: *Allocator, self: str) i64 {
+    # the worker records the protocol; this process would only record it a
+    # second time, and two processes appending to one log overwrite each other
+    trace.mute_frames();
+
     var to_worker:   [2]i32;
     var from_worker: [2]i32;
 
