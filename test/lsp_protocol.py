@@ -2344,7 +2344,8 @@ def run_trace_policy(server: Path, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="mls-trace-on-") as directory:
         text = session_writing(Path(directory).resolve(), {"MLS_TRACE": "bodies"})
         require('"method":"textDocument/documentSymbol"' in text,
-                "the body opt-in recorded no bodies")
+                "the body opt-in recorded no bodies; log begins: "
+                + repr(text[:400]))
         # and even then it is capped, because a trace that pages in a whole
         # buffer per keystroke is unreadable as well as invasive
         caps = re.findall(r"\.\.\. \[(\d+) of (\d+) bytes\]", text)
