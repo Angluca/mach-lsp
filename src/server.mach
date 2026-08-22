@@ -250,19 +250,33 @@ fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
     ret handled;
 }
 
+# record which message this was, without recording what it carried
+#
+# The method and id are the parts a reader actually needs to follow a session -
+# what arrived, in what order, and which response answered which request - and
+# neither is user content, so they are recorded whether or not bodies are.
+fun trace_method(srv: *Server, root: *sj.Value) {
+    if (!trace.enabled()) { ret; }
+    val m: str = json.text(json.member(root, "method"), srv.alloc);
+    val i: str = json.id_text(json.member(root, "id"), srv.alloc);
+    if (m != nil && i != nil) { trace.logf("  method {} id {}", m, i); }
+    or (m != nil)            { trace.logf("  method {}", m); }
+    or (i != nil)            { trace.logf("  id {}", i); }
+    if (m != nil) { json.free_str(m, srv.alloc); }
+    if (i != nil) { json.free_str(i, srv.alloc); }
+}
+
 # handle one queued message on the analysis thread
 #
 # The parse arena and every compiler-owned structure belong to this thread.
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
 
-    trace.log("recv: ");
-    trace.log(body);
-    trace.log("\n");
+    trace.frame("recv:", body, len);
 
     val started_ns: i64 = trace.now_ns();
     var parsed: json.Message = json.read(?srv.rd, body, len);
-    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    if (parsed.valid) { trace_method(srv, ?parsed.root); dispatch(srv, ?parsed.root); }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
 

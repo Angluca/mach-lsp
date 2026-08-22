@@ -9,6 +9,7 @@ import signal
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,9 +30,16 @@ class ProtocolError(RuntimeError):
 class LspSession:
     """Drive one language-server process using LSP stdio framing."""
 
-    def __init__(self, server: Path, cwd: Path, timeout: float) -> None:
+    def __init__(self, server: Path, cwd: Path, timeout: float,
+                 env_extra: dict[str, str] | None = None) -> None:
         env = os.environ.copy()
+        # tracing is stripped so an operator's own MLS_TRACE cannot change what
+        # the tests exercise; a test that is ABOUT tracing asks for it back
         env.pop("MLS_TRACE", None)
+        env.pop("MLS_TRACE_BODIES", None)
+        env.pop("MLS_TRACE_FILE", None)
+        if env_extra:
+            env.update(env_extra)
         self.timeout = timeout
         self.started = time.monotonic()
         self.proc = subprocess.Popen(
@@ -2126,6 +2134,65 @@ def run_hung_worker(server: Path, timeout: float) -> None:
             os.environ["MLS_REQUEST_DEADLINE_MS"] = previous
 
 
+def run_trace_policy(server: Path, timeout: float) -> None:
+    """Turning tracing on must not copy the user's source into a log.
+
+    A message body is the user's code: every `didOpen` carries a whole file and
+    every `didChange` carries whatever they just typed. Tracing is usually
+    turned on to find out which requests arrived in which order, and that
+    question does not require any of it.
+
+    So this greps the log rather than reading the code that writes it: the
+    property is about what ends up on disk, and a test that inspected the call
+    sites would keep passing if a new one were added.
+    """
+    marker = "SECRET_IDENTIFIER_NOT_FOR_THE_LOG"
+
+    def session_writing(directory: Path, extra: dict[str, str]) -> str:
+        log = directory / "trace.log"
+        main, _, text = write_project(directory, "trace", 5)
+        body = text + f"\npub fun {marker}(n: i32) i32 {{ ret n; }}\n"
+        env = {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(log)}
+        env.update(extra)
+        session = LspSession(server, directory, timeout, env_extra=env)
+        try:
+            session.request("initialize", {"rootUri": directory.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": body}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            session.finish()
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+        require(log.exists(), "MLS_TRACE_FILE was ignored")
+        return log.read_text(encoding="utf-8", errors="replace")
+
+    with tempfile.TemporaryDirectory(prefix="mls-trace-off-") as directory:
+        text = session_writing(Path(directory).resolve(), {})
+        require(marker not in text,
+                "tracing wrote the document's source to the log by default")
+        require("method textDocument/documentSymbol" in text,
+                f"tracing recorded no method metadata: {text[:400]!r}")
+        require(re.search(r"(recv|send): \d+ bytes", text),
+                f"tracing recorded no frame sizes: {text[:400]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-trace-on-") as directory:
+        text = session_writing(Path(directory).resolve(), {"MLS_TRACE_BODIES": "1"})
+        require('"method":"textDocument/documentSymbol"' in text,
+                "the body opt-in recorded no bodies")
+        # and even then it is capped, because a trace that pages in a whole
+        # buffer per keystroke is unreadable as well as invasive
+        caps = re.findall(r"\.\.\. \[(\d+) of (\d+) bytes\]", text)
+        require(caps, f"a body larger than the cap was written whole: {len(text)} bytes")
+        for shown, total in caps:
+            require(int(shown) < int(total), f"truncation marker is wrong: {shown}/{total}")
+
+
 def run_exit_paths(server: Path, timeout: float) -> None:
     """Every lifecycle ending must terminate, with the documented code.
 
@@ -2263,6 +2330,7 @@ def main() -> int:
         run_exit_paths(server, args.timeout)
         run_crash_containment(server, args.timeout)
         run_hung_worker(server, args.timeout)
+        run_trace_policy(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -2288,6 +2356,7 @@ def main() -> int:
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and replayed into a replacement")
     print("  a wedged worker is ended, answered ServerCancelled, and recovered")
+    print("  tracing keeps source out of the log unless asked for, and caps it")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
