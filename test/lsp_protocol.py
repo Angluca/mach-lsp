@@ -1754,6 +1754,132 @@ def _run_doc_structure(server: Path, timeout: float, crlf: bool) -> None:
                 session.abort()
 
 
+def run_doc_components(server: Path, timeout: float) -> None:
+    """A doc block's component lines describe named parts, and hover must say so.
+
+    The spec gives each declaration element its own component identifier: a
+    parameter by name, a generic as `[T]`, a field by name, the return as `ret`.
+    Two things follow that were not being done.
+
+    A declaration's hover should present them as what they are. Listing `ret`
+    among the parameters read as though the function took an argument called
+    `ret`, and a bare `---` rule said nothing about what the list below it was.
+
+    And hovering one of those parts should show the line written for it. A field
+    already did; a parameter did not, so documentation an author wrote for an
+    argument was reachable only by hovering the function and reading the list.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-comp-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "comp", 1)
+        text = (
+            "# a documented record\n"
+            "# ---\n"
+            "# width:  how wide the thing is\n"
+            "# height: how tall the thing is\n"
+            "pub rec Box { width: i32; height: i32; }\n"
+            "\n"
+            "# a documented union\n"
+            "# ---\n"
+            "# left_:  the left one\n"
+            "# right_: the right one\n"
+            "pub uni Side { left_: i32; right_: i32; }\n"
+            "\n"
+            "# a documented function\n"
+            "# ---\n"
+            "# [T]:   the element type\n"
+            "# scale: how much to scale by, described\n"
+            "#        across two wrapped lines\n"
+            "# ret:   the scaled area\n"
+            "pub fun area[T](scale: i32) i32 {\n"
+            "    var copy: T;\n"
+            "    ret scale;\n"
+            "}\n"
+            "\n"
+            "# only a return is documented\n"
+            "# ---\n"
+            "# ret: just the answer\n"
+            "pub fun answer() i32 { ret 1; }\n"
+            "\n"
+            "pub fun main() i32 {\n"
+            "    var b: Box;\n"
+            "    b.width = 1;\n"
+            "    ret area[i32](b.width) + answer();\n"
+            "}\n"
+        )
+        main.write_text(text, encoding="utf-8")
+        lines = text.splitlines()
+
+        session = LspSession(server, root, timeout)
+        try:
+            session.request(
+                "initialize",
+                {"rootUri": root.as_uri(),
+                 "capabilities": {"textDocument": {"hover": {"contentFormat": ["markdown"]}}}},
+            )
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            def hover_at(linepat, needle, off=2):
+                ln = next(i for i, v in enumerate(lines) if linepat in v)
+                answer = session.request(
+                    "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": ln, "character": lines[ln].index(needle) + off}})
+                value = (answer.get("result") or {}).get("contents", {}).get("value")
+                require(value, f"no hover for {needle!r} on {linepat!r}: {answer!r}")
+                return value
+
+            EM = "\u2014"
+
+            # a declaration presents its components under the word that names them
+            fn = hover_at("ret area[i32](b.width)", "area")
+            require("**Parameters**" in fn, f"components were not named: {fn!r}")
+            require(f"- `scale` {EM} how much to scale by, described across two wrapped lines" in fn,
+                    f"a wrapped component did not fold under its own bullet: {fn!r}")
+            require("- `[T]`" in fn, f"the generic component was dropped: {fn!r}")
+            # the return is not one of the inputs
+            require(f"**Returns** {EM} the scaled area" in fn,
+                    f"the return was not given its own line: {fn!r}")
+            require("- `ret`" not in fn, f"the return was listed as a parameter: {fn!r}")
+
+            rec = hover_at("var b: Box;", "Box")
+            require("**Fields**" in rec, f"a record's components are fields: {rec!r}")
+            uni = hover_at("pub uni Side", "Side")
+            require("**Variants**" in uni, f"a union's components are variants: {uni!r}")
+
+            # a function with only a return gets no empty parameter heading
+            only = hover_at("ret area[i32](b.width) + answer()", "answer")
+            require(f"**Returns** {EM} just the answer" in only, f"missing return: {only!r}")
+            require("**Parameters**" not in only,
+                    f"an empty parameter list was announced: {only!r}")
+
+            # and each named part carries its own line, not the whole block
+            param = hover_at("ret scale;", "scale")
+            require("how much to scale by, described across two wrapped lines" in param,
+                    f"a parameter was not attributed: {param!r}")
+            require("**Parameters**" not in param,
+                    f"hovering a parameter dumped the whole block: {param!r}")
+
+            generic = hover_at("var copy: T;", "T", 0)
+            require("the element type" in generic,
+                    f"a generic was not attributed: {generic!r}")
+
+            field = hover_at("b.width = 1;", "width")
+            require("how wide the thing is" in field,
+                    f"a field was not attributed: {field!r}")
+
+            session.finish()
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+
 def run_hover_presentation(server: Path, timeout: float) -> None:
     """Hover renders what the client can read, and types the source never spells."""
     with tempfile.TemporaryDirectory(prefix="mls-hov-") as directory:
@@ -2605,6 +2731,7 @@ def main() -> int:
         run_code_actions(server, args.timeout)
         run_hover_presentation(server, args.timeout)
         run_doc_structure(server, args.timeout)
+        run_doc_components(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -2634,6 +2761,7 @@ def main() -> int:
     print("  codeAction offers the compiler's own fixes as applicable edits")
     print("  hover renders headers, expression types, and the client's format")
     print("  a doc comment's lists and paragraphs survive into the hover")
+    print("  doc components are named by kind, and each part carries its own line")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and replayed into a replacement")
