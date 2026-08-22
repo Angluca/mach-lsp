@@ -100,10 +100,10 @@ size, timing — and no bodies.
 | variable | effect |
 |---|---|
 | `MLS_TRACE` | enables tracing (any value) |
+| `MLS_TRACE=bodies` | also records message bodies, truncated at 512 bytes each |
 | `MLS_TRACE_FILE` | appends to this path instead of `/tmp/mach-lsp.log` |
-| `MLS_TRACE_BODIES` | also records message bodies, truncated at 512 bytes each |
 
-Set `MLS_TRACE_BODIES` only when you need the contents of a message, and be
+Use `MLS_TRACE=bodies` only when you need the contents of a message, and be
 aware that the log will then contain fragments of whatever you have open.
 
 ## How the compiler dependency is wired

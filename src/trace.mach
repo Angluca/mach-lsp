@@ -23,6 +23,7 @@
 
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.size.usize;
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -54,19 +55,23 @@ var PATH_BUF: [512]u8;
 # environment variable that enables tracing when set
 val TRACE_VAR: str = "MLS_TRACE";
 
-# environment variable that additionally permits message bodies in the log
-val BODIES_VAR: str = "MLS_TRACE_BODIES";
+# the value of MLS_TRACE that additionally permits message bodies in the log
+#
+# One variable answers both questions - whether to trace, and what a trace may
+# contain - because they are read at the same moment and a second variable was
+# a second thing to get wrong on a platform this cannot be tested on by hand.
+val BODIES_WORD: str = "bodies";
 
 # most bytes of any one body written to the log
 #
 # Enough to read a request and its arguments; far short of a source file.
 val BODY_CAP: usize = 512;
 
-# whether the MLS_TRACE_BODIES gate has been evaluated yet
-var BODIES_CHECKED: bool = false;
-
-# cached MLS_TRACE_BODIES gate
+# cached body gate, resolved with the enable gate
 var BODIES_ENABLED: bool = false;
+
+# storage for the MLS_TRACE value; read once alongside the gate
+var GATE_BUF: [32]u8;
 
 # whether the MLS_TRACE gate has been evaluated yet
 var LOG_CHECKED: bool = false;
@@ -83,8 +88,13 @@ var LOG_FD: i64 = -1;
 # ---
 # ret: true when MLS_TRACE is present in the environment
 fun trace_enabled() bool {
-    var buf: [1]u8;
-    ret env.get(TRACE_VAR, ?buf[0], 1) >= 0;
+    val n: i64 = env.get(TRACE_VAR, ?GATE_BUF[0], 31);
+    if (n < 0) { ret false; }
+    var len: usize = n::usize;
+    if (len > 31) { len = 31; }
+    GATE_BUF[len] = 0;
+    BODIES_ENABLED = str_equals((?GATE_BUF[0])::str, BODIES_WORD);
+    ret true;
 }
 
 # open the trace log for appending
@@ -140,11 +150,6 @@ pub fun enabled() bool {
 # it does not turn one on.
 pub fun bodies() bool {
     if (!enabled()) { ret false; }
-    if (!BODIES_CHECKED) {
-        BODIES_CHECKED = true;
-        var buf: [1]u8;
-        BODIES_ENABLED = env.get(BODIES_VAR, ?buf[0], 1) >= 0;
-    }
     ret BODIES_ENABLED;
 }
 

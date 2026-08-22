@@ -36,7 +36,6 @@ class LspSession:
         # tracing is stripped so an operator's own MLS_TRACE cannot change what
         # the tests exercise; a test that is ABOUT tracing asks for it back
         env.pop("MLS_TRACE", None)
-        env.pop("MLS_TRACE_BODIES", None)
         env.pop("MLS_TRACE_FILE", None)
         if env_extra:
             env.update(env_extra)
@@ -2343,7 +2342,7 @@ def run_trace_policy(server: Path, timeout: float) -> None:
                 f"tracing recorded no frame sizes: {text[:400]!r}")
 
     with tempfile.TemporaryDirectory(prefix="mls-trace-on-") as directory:
-        text = session_writing(Path(directory).resolve(), {"MLS_TRACE_BODIES": "1"})
+        text = session_writing(Path(directory).resolve(), {"MLS_TRACE": "bodies"})
         require('"method":"textDocument/documentSymbol"' in text,
                 "the body opt-in recorded no bodies")
         # and even then it is capped, because a trace that pages in a whole
