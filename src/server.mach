@@ -54,6 +54,7 @@ use actions:     mls.actions;
 use project:     mls.project;
 use trace:       mls.trace;
 use render:      mls.render;
+use progress:    mls.progress;
 use positions:   mls.positions;
 
 # lifecycle statuses
@@ -250,19 +251,33 @@ fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
     ret handled;
 }
 
+# record which message this was, without recording what it carried
+#
+# The method and id are the parts a reader actually needs to follow a session -
+# what arrived, in what order, and which response answered which request - and
+# neither is user content, so they are recorded whether or not bodies are.
+fun trace_method(srv: *Server, root: *sj.Value) {
+    if (!trace.enabled()) { ret; }
+    val m: str = json.text(json.member(root, "method"), srv.alloc);
+    val i: str = json.id_text(json.member(root, "id"), srv.alloc);
+    if (m != nil && i != nil) { trace.logf("  method {} id {}", m, i); }
+    or (m != nil)            { trace.logf("  method {}", m); }
+    or (i != nil)            { trace.logf("  id {}", i); }
+    if (m != nil) { json.free_str(m, srv.alloc); }
+    if (i != nil) { json.free_str(i, srv.alloc); }
+}
+
 # handle one queued message on the analysis thread
 #
 # The parse arena and every compiler-owned structure belong to this thread.
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
 
-    trace.log("recv: ");
-    trace.log(body);
-    trace.log("\n");
+    trace.frame("recv:", body, len);
 
     val started_ns: i64 = trace.now_ns();
     var parsed: json.Message = json.read(?srv.rd, body, len);
-    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    if (parsed.valid) { trace_method(srv, ?parsed.root); dispatch(srv, ?parsed.root); }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
 
@@ -362,6 +377,8 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     # asked for.
     srv.hover_markdown = accepts_markdown(
         json.member(json.member2(params, "capabilities", "textDocument"), "hover"), srv.alloc);
+    progress.configure(json.boolean(
+        json.member(json.member2(params, "capabilities", "window"), "workDoneProgress"), false));
 
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");

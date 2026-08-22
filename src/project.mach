@@ -67,6 +67,7 @@ use trace:     mls.trace;
 use mtypes:    mls.types;
 use documents: mls.documents;
 use positions: mls.positions;
+use progress:  mls.progress;
 
 # where a resolved symbol's declaration lives - the Ast and SourceFile to
 # read its spans from, and the document URI to report. for a buffer-local symbol
@@ -120,6 +121,7 @@ rec SourceFingerprint {
 pub rec Root {
     path:           str;
     loaded:         bool;
+    analyzed_once:  bool;
     p:              driver.Project;
     mod_paths:      *str;
     mod_path_count: u32;
@@ -533,6 +535,7 @@ fun vendored_under_ancestor(w: *Workspace, root_path: str) bool {
 fun reset_slot(r: *Root) {
     r.path           = nil;
     r.loaded         = false;
+    r.analyzed_once  = false;
     r.mod_paths      = nil;
     r.mod_path_count = 0;
     r.mod_fingerprints = nil;
@@ -583,6 +586,15 @@ fun alloc_slot(w: *Workspace) *Root {
 fun try_load(w: *Workspace, r: *Root) bool {
     val started_ns: i64 = trace.now_ns();
     fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
+
+    # Only the FIRST analysis of a root reports. A revalidation is a few
+    # hundred milliseconds, and a spinner on every keystroke teaches the reader
+    # to ignore the one that means something. `loaded` is the wrong test for
+    # this: every rebuild clears it, so it distinguishes "no snapshot right now"
+    # from "no snapshot ever", which are the same thing only once.
+    var token: str = nil;
+    if (!r.analyzed_once) { token = progress.start(w.alloc, "mach: analyzing project"); }
+    fin { progress.finish(w.alloc, token, nil); }
     record_mtimes(w, r);
     r.dirty = false;
     val sor: Result[bool, str] = sync_overlays(w, r);
@@ -667,6 +679,7 @@ fun try_load(w: *Workspace, r: *Root) bool {
         ret false;
     }
     r.snapshot_revision = r.input_revision;
+    r.analyzed_once = true;
     w.load_epoch = w.load_epoch + 1;
     w.sema_epoch = w.sema_epoch + 1;
     ret true;
