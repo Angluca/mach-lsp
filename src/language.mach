@@ -517,6 +517,9 @@ fun doc_emit(buf: *u8, off: usize, s: str) usize {
 # verbatim, so a comment that indents its top level by four spaces stays a list
 # instead of turning into an indented code block.
 #
+# A carriage return is treated as part of the line ending rather than as
+# content, so a file saved with CRLF renders the same as one saved with LF.
+#
 # A span from `fe/doc.mach` covers only the first line's leading `#`;
 # continuation lines keep their own, so those are stripped here. Measures when
 # `buf` is nil, by the same walk, so the two passes cannot disagree.
@@ -530,6 +533,12 @@ fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
     var item:     usize = 0;
 
     for (i < end) {
+        # a carriage return belongs to the line ending, not to the line. A file
+        # saved with CRLF put one at the end of every doc line, and copying it
+        # as content dropped a stray control byte into the middle of the
+        # rendered prose
+        if (s[i] == '\r') { i = i + 1; cnt; }
+
         if (s[i] != '\n') {
             if (buf != nil) { buf[off] = s[i]; }
             off = off + 1;
@@ -550,7 +559,7 @@ fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
         # wrapped line. Folding it to a space ran two paragraphs together and
         # left the join marked only by a double space, which no renderer treats
         # as a boundary
-        if (i >= end || s[i] == '\n') {
+        if (i >= end || s[i] == '\n' || s[i] == '\r') {
             if (!at_break) {
                 off = doc_lf(buf, off);
                 off = doc_lf(buf, off);

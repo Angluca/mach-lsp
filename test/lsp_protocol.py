@@ -1637,6 +1637,12 @@ def run_code_actions(server: Path, timeout: float) -> None:
 
 
 def run_doc_structure(server: Path, timeout: float) -> None:
+    """Doc structure survives into hover, with either line ending."""
+    for crlf in (False, True):
+        _run_doc_structure(server, timeout, crlf)
+
+
+def _run_doc_structure(server: Path, timeout: float, crlf: bool) -> None:
     """A doc comment's line structure has to survive into the hover.
 
     Doc comments are wrapped prose, so most line breaks are soft and must fold
@@ -1677,7 +1683,13 @@ def run_doc_structure(server: Path, timeout: float) -> None:
             "\n"
             "pub fun main() i32 { ret shapes(1) + tight(2) + plain(3); }\n"
         )
-        main.write_text(text, encoding="utf-8")
+        # Both line endings, because a carriage return belongs to the line
+        # ending and not to the line: a file saved with CRLF used to drop a
+        # stray control byte into the middle of the rendered prose, and on
+        # Windows `write_text` produces CRLF unless told otherwise, which is how
+        # this was found.
+        eol = "\r\n" if crlf else "\n"
+        main.write_text(text.replace("\n", eol), encoding="utf-8", newline="")
         lines = text.splitlines()
 
         session = LspSession(server, root, timeout)
@@ -1691,7 +1703,7 @@ def run_doc_structure(server: Path, timeout: float) -> None:
             session.notify(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
-                                  "version": 1, "text": text}},
+                                  "version": 1, "text": text.replace("\n", eol)}},
             )
             session.diagnostics(main.as_uri(), 1)
 
