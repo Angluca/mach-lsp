@@ -1636,6 +1636,124 @@ def run_code_actions(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_doc_structure(server: Path, timeout: float) -> None:
+    """Doc structure survives into hover, with either line ending."""
+    for crlf in (False, True):
+        _run_doc_structure(server, timeout, crlf)
+
+
+def _run_doc_structure(server: Path, timeout: float, crlf: bool) -> None:
+    """A doc comment's line structure has to survive into the hover.
+
+    Doc comments are wrapped prose, so most line breaks are soft and must fold
+    into a space or every hover arrives as a column of fragments. A bullet list
+    is not soft: it is structure the author wrote on purpose. Folding it in with
+    everything else produced one run-on paragraph with `- item` markers stranded
+    mid-sentence, which no renderer reads as a list.
+
+    The distinguishing signal is indentation, so the cases that matter are the
+    ones where indentation is the only difference: an item versus its own
+    wrapped continuation, and a line that returns to the prose margin and ends
+    the list. `-1` is checked too, because a marker test that ignores the space
+    after it turns arithmetic into bullets.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-doc-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "doc", 1)
+        text = (
+            "# a summary that wraps across\n"
+            "# two source lines\n"
+            "#\n"
+            "# the shapes it handles:\n"
+            "#   - a flat item that wraps onto\n"
+            "#     a continuation line\n"
+            "#   - a second item\n"
+            "#       - a nested item under it\n"
+            "#\n"
+            "# a closing paragraph after the list.\n"
+            "pub fun shapes(n: i32) i32 { ret n; }\n"
+            "\n"
+            "# prose then a list with no blank line between\n"
+            "#   - immediately after\n"
+            "# and prose right back at the margin.\n"
+            "pub fun tight(n: i32) i32 { ret n; }\n"
+            "\n"
+            "# not a list: -1 is a value and 1.5 is a number\n"
+            "pub fun plain(n: i32) i32 { ret n; }\n"
+            "\n"
+            "pub fun main() i32 { ret shapes(1) + tight(2) + plain(3); }\n"
+        )
+        # Both line endings, because a carriage return belongs to the line
+        # ending and not to the line: a file saved with CRLF used to drop a
+        # stray control byte into the middle of the rendered prose, and on
+        # Windows `write_text` produces CRLF unless told otherwise, which is how
+        # this was found.
+        eol = "\r\n" if crlf else "\n"
+        main.write_text(text.replace("\n", eol), encoding="utf-8", newline="")
+        lines = text.splitlines()
+
+        session = LspSession(server, root, timeout)
+        try:
+            session.request(
+                "initialize",
+                {"rootUri": root.as_uri(),
+                 "capabilities": {"textDocument": {"hover": {"contentFormat": ["markdown"]}}}},
+            )
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text.replace("\n", eol)}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            call = next(i for i, v in enumerate(lines) if v.startswith("pub fun main"))
+
+            def hover_of(name: str) -> str:
+                column = lines[call].index(name + "(") + 2
+                answer = session.request(
+                    "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": call, "character": column}})
+                value = (answer.get("result") or {}).get("contents", {}).get("value")
+                require(value, f"no hover for {name}: {answer!r}")
+                return value
+
+            shapes = hover_of("shapes")
+            body = shapes.split("```")[-1]
+            # the wrapped summary still folds: a hover of one-line fragments is
+            # the failure this renderer exists to avoid
+            require("a summary that wraps across two source lines" in body,
+                    f"a wrapped line was not folded: {body!r}")
+            # each item starts a line, and its own wrapped continuation folds
+            require("\n- a flat item that wraps onto a continuation line" in body,
+                    f"a list item did not start a line: {body!r}")
+            require("\n- a second item" in body, f"the second item was lost: {body!r}")
+            # indentation deeper than the item above it is a nested list, kept
+            # relative to the list's own first marker
+            require("\n    - a nested item under it" in body,
+                    f"nesting was flattened: {body!r}")
+            # and the list is closed before the paragraph that follows it, or
+            # that paragraph is absorbed into the final item
+            require("\n\na closing paragraph after the list." in body,
+                    f"the list did not end: {body!r}")
+
+            tight = hover_of("tight").split("```")[-1]
+            require("\n- immediately after" in tight,
+                    f"a list directly after prose was folded in: {tight!r}")
+            require("\n\nand prose right back at the margin." in tight,
+                    f"returning to the margin did not end the list: {tight!r}")
+
+            plain = hover_of("plain").split("```")[-1]
+            require("\n-" not in plain and "-1 is a value" in plain,
+                    f"arithmetic was rendered as a list: {plain!r}")
+
+            session.finish()
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+
 def run_hover_presentation(server: Path, timeout: float) -> None:
     """Hover renders what the client can read, and types the source never spells."""
     with tempfile.TemporaryDirectory(prefix="mls-hov-") as directory:
@@ -2486,6 +2604,7 @@ def main() -> int:
         run_incremental_sync(server, args.timeout)
         run_code_actions(server, args.timeout)
         run_hover_presentation(server, args.timeout)
+        run_doc_structure(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -2514,6 +2633,7 @@ def main() -> int:
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  codeAction offers the compiler's own fixes as applicable edits")
     print("  hover renders headers, expression types, and the client's format")
+    print("  a doc comment's lists and paragraphs survive into the hover")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and replayed into a replacement")
