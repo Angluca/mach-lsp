@@ -1807,7 +1807,12 @@ def run_doc_components(server: Path, timeout: float) -> None:
             "    ret area[i32](b.width) + answer();\n"
             "}\n"
         )
-        main.write_text(text, encoding="utf-8")
+        # written with the endings it is sent with. `write_text` translates on
+        # Windows, and a CRLF buffer currently gets no component block at all -
+        # mach's doc parser trims only spaces and tabs before matching `# ---`,
+        # so the `\r` defeats it (briar-systems/mach#3072). Testing the platform's
+        # newline translation is not what this is for.
+        main.write_text(text, encoding="utf-8", newline="")
         lines = text.splitlines()
 
         session = LspSession(server, root, timeout)
