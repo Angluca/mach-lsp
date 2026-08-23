@@ -1755,6 +1755,12 @@ def _run_doc_structure(server: Path, timeout: float, crlf: bool) -> None:
 
 
 def run_doc_components(server: Path, timeout: float) -> None:
+    """Doc components are named by kind and attributed, with either line ending."""
+    for crlf in (False, True):
+        _run_doc_components(server, timeout, crlf)
+
+
+def _run_doc_components(server: Path, timeout: float, crlf: bool) -> None:
     """A doc block's component lines describe named parts, and hover must say so.
 
     The spec gives each declaration element its own component identifier: a
@@ -1807,11 +1813,15 @@ def run_doc_components(server: Path, timeout: float) -> None:
             "    ret area[i32](b.width) + answer();\n"
             "}\n"
         )
-        # written with the endings it is sent with. `write_text` translates on
-        # Windows, and a CRLF buffer currently gets no component block at all -
-        # mach's doc parser trims only spaces and tabs before matching `# ---`,
-        # so the `\r` defeats it (briar-systems/mach#3072). Testing the platform's
-        # newline translation is not what this is for.
+        # Written with the endings it is sent with, and run under both. A CRLF
+        # buffer used to get no component block at all: mach's doc parser trimmed
+        # only spaces and tabs before matching `# ---`, so the `\r` left the
+        # separator four characters wide and it never matched, taking every
+        # parameter, field and return description out of hover on the platform
+        # where editors write CRLF. Fixed in briar-systems/mach#3072, and pinned
+        # here because nothing in this repository would notice it coming back.
+        eol = "\r\n" if crlf else "\n"
+        text = text.replace("\n", eol)
         main.write_text(text, encoding="utf-8", newline="")
         lines = text.splitlines()
 
