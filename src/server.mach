@@ -304,6 +304,12 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     val id: *sj.Value = json.member(root, "id");
     if (id == nil) { dispatch_inner(srv, root); ret; }
 
+    # A response with an id but no method is the client's reply to a server→client request.
+    # Responses are never answered, so fallback does not apply.
+    if (json.member(root, "method") == nil) {
+        dispatch_inner(srv, root);
+        ret;
+    }
     # every request owes exactly one response. A handler can fail to send one
     # for reasons it cannot report - a latched allocation failure in the
     # response buffer, a path that gives up without replying - and a client that
