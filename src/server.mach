@@ -310,6 +310,7 @@ fun dispatch(srv: *Server, root: *sj.Value) {
         dispatch_inner(srv, root);
         ret;
     }
+
     # every request owes exactly one response. A handler can fail to send one
     # for reasons it cannot report - a latched allocation failure in the
     # response buffer, a path that gives up without replying - and a client that
