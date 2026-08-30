@@ -135,6 +135,7 @@ pub rec Root {
     attempted_revision: u64;
     dirty:           bool;
     last_disk_scan_ns: i64;
+    last_rebuild_ns: i64;   # feature record rebuild time
 }
 
 # project roots and the standalone-editor fallback
@@ -548,6 +549,7 @@ fun reset_slot(r: *Root) {
     r.attempted_revision = 0;
     r.dirty = false;
     r.last_disk_scan_ns = 0;
+    r.last_rebuild_ns = 0;
 }
 
 # a reusable dead slot, growing the array when every slot is
@@ -586,6 +588,8 @@ fun alloc_slot(w: *Workspace) *Root {
 fun try_load(w: *Workspace, r: *Root) bool {
     val started_ns: i64 = trace.now_ns();
     fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
+
+    fin { r.last_rebuild_ns = chrono.time_unix_nsec(chrono.monotonic()); }
 
     # Only the FIRST analysis of a root reports. A revalidation is a few
     # hundred milliseconds, and a spinner on every keystroke teaches the reader
@@ -1278,6 +1282,19 @@ pub fun document_view_loaded(w: *Workspace, d: *documents.Document) Result[Docum
     if (root == nil || !root.loaded || root.input_revision != root.snapshot_revision
         || d.revision > root.snapshot_revision) {
         ret err[DocumentView, str]("project: no current loaded snapshot");
+    }
+    ret view_from_root(root, d);
+}
+
+# View of Language Function Request: Directly return the existing snapshot within a 3-second window (in milliseconds); if the snapshot is out of date or the window has passed, it will be automatically rebuilt based on this request. When the project is not loaded, it still follows the strict version of synchronous cold loading.
+pub fun document_view_feature(w: *Workspace, d: *documents.Document) Result[DocumentView, str] {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded) { ret document_view(w, d); }
+    val stale: bool = root.input_revision != root.snapshot_revision;
+    val due: bool = chrono.time_unix_nsec(chrono.monotonic()) - root.last_rebuild_ns >= 3000000000;
+    if (stale && due) {
+        refresh_inputs(w, root);
+        if (!root.loaded) { ret document_view(w, d); }
     }
     ret view_from_root(root, d);
 }
