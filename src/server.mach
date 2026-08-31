@@ -304,8 +304,7 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     val id: *sj.Value = json.member(root, "id");
     if (id == nil) { dispatch_inner(srv, root); ret; }
 
-    # A response with an id but no method is the client's reply to a server→client request.
-    # Responses are never answered, so fallback does not apply.
+    # an id-bearing message without a method is a client response
     if (json.member(root, "method") == nil) {
         dispatch_inner(srv, root);
         ret;
@@ -487,11 +486,6 @@ fun handle_did_open(srv: *Server, params: *sj.Value) {
     val version_v: *sj.Value = json.member(doc, "version");
     if (version_v != nil) { publish_for(srv, uri, text, json.number(version_v, 0), true); }
     json.free_str(text, srv.alloc);
-
-    # Opening the file is a low-frequency event: Rebuild the snapshot to the latest version and use the new snapshot to upgrade the diagnostics for all open documents.
-    val root: *project.Root = project.root_for(?srv.ws, uri);
-    if (root != nil) { republish_all(srv); }
-
     json.free_str(uri, srv.alloc);
 }
 
@@ -700,7 +694,7 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         ret;
     }
     srv.deferred = false;
-    republish_root(srv, project.root_for_loaded(?srv.ws, doc.uri), doc);
+    republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
 }
 
 # send a JSON-RPC error response for a request that carries an id

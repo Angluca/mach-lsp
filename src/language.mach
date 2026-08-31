@@ -69,6 +69,7 @@ use positions: mls.positions;
 use render:    mls.render;
 use project:   mls.project;
 use analysis:  mls.analysis;
+use mtypes:    mls.types;
 
 # the resolved analysis of one request's target document
 # ---
@@ -1596,50 +1597,112 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
     emit_document_symbols(an, alloc, id_raw);
 }
 
-# The position (line, character) is reported by the editor for the "current text", while an.text is a snapshot text within a 3-second window
-# It may lag a few key presses behind - the offset must be converted on the editor text. When the two texts are the same, follow the original precise path; when lagging, the offset has drifted, and switch to the fallback path as queried by the recipient's [name] (the name does not drift with the editor, see emit_member_completions_stale)
+# answer completion from the newest analysis already available
+#
+# a current project snapshot supplies dependency-aware names and members. when
+# input is queued ahead of a rebuild, the isolated editor analysis supplies an
+# exact view of the current buffer without blocking on the whole project. that
+# result is incomplete because imports cannot resolve in the isolated session.
+# snapshot and editor identities are never joined: offsets, Ast nodes, resolve
+# tables, sema types, and source text in one answer all come from one owner.
 pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
-    var an: analysis.Analyzed;
-    if (!analysis.analyze(ws, es, docs, uri, ?an)) {
-        reply_empty_completion(alloc, id_raw);
-        ret;
-    }
+
+    val doc: *documents.Document = documents.find(docs, uri);
+    if (doc == nil) { reply_empty_completion(alloc, id_raw, false); ret; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (!is_some[*src.SourceFile](fo)) { reply_empty_completion(alloc, id_raw, false); ret; }
+    val file: *src.SourceFile = unwrap[*src.SourceFile](fo);
+
     val pos: *sj.Value = json.member(params, "position");
     val line: i64 = json.number(json.member(pos, "line"), -1);
     val ch: i64 = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) {
-        emit_completions(an, alloc, id_raw, empty_span(), nil);
-        ret;
+        reply_empty_completion(alloc, id_raw, false); ret;
     }
-    # 编辑器 buffer 的当前文本(position 就是按它报的)
-    val doc: *documents.Document = documents.find(docs, uri);
-    if (doc == nil) { reply_empty_completion(alloc, id_raw); ret; }
-    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (!is_some[*src.SourceFile](fo)) { reply_empty_completion(alloc, id_raw); ret; }
-    val efile: *src.SourceFile = unwrap[*src.SourceFile](fo);
-    val oo: Option[usize] = positions.offset_at(positions.text_of(efile), line::usize, ch::usize);
+    val oo: Option[usize] = positions.offset_at(positions.text_of(file), line::usize, ch::usize);
     if (!is_some[usize](oo)) {
-        emit_completions(an, alloc, id_raw, empty_span(), nil);
-        ret;
+        reply_empty_completion(alloc, id_raw, false); ret;
     }
     val offset: usize = unwrap[usize](oo);
-    val prefix: token.Span = ident_prefix_before(efile, offset);
+    val prefix: token.Span = ident_prefix_before(file, offset);
     val dot: usize = prefix.offset;
-    if (dot > 0 && efile.text[dot - 1] == '.') {
-        if (str_equals(an.text.file.text, efile.text)) {
-            # 文本一致 → 快照就是当前代码,原精确路径,一行没变
+
+    var an: analysis.Analyzed;
+    val vr: Result[project.DocumentView, str] = project.document_view_loaded(ws, doc);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val view: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        an.interner = view.interner;
+        an.text = view.text;
+        an.sr = view.sr;
+        an.a = view.a;
+        an.rr = view.rr;
+        an.own = view.module;
+        an.root = view.root;
+
+        if (dot > 0 && file.text[dot - 1] == '.') {
             if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
-        } or {
-            # 快照落后 → offset 不可信,按接收者名字查
-            if (emit_member_completions_stale(ws, an, alloc, id_raw, efile, dot - 1)) { ret; }
+            reply_empty_completion(alloc, id_raw, false); ret;
         }
-        # 接收者查不出来就给空列表 —— 绝不把全文件符号塞给一个 `.`
-        reply_empty_completion(alloc, id_raw);
-        ret;
+        emit_completions(an, alloc, id_raw, prefix, file, false); ret;
     }
-    emit_completions(an, alloc, id_raw, prefix, efile);
+
+    if (project.root_for_loaded(ws, uri) == nil) {
+        if (!analysis.analyze(ws, es, docs, uri, ?an)) {
+            reply_empty_completion(alloc, id_raw, false); ret;
+        }
+        if (dot > 0 && file.text[dot - 1] == '.') {
+            if (an.root != nil) {
+                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            } or {
+                if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            }
+            reply_empty_completion(alloc, id_raw, false); ret;
+        }
+        emit_completions(an, alloc, id_raw, prefix, file, false); ret;
+    }
+
+    if (!editor_completion_analysis(es, doc, dot > 0 && file.text[dot - 1] == '.', ?an)) {
+        reply_empty_completion(alloc, id_raw, true); ret;
+    }
+    if (dot > 0 && file.text[dot - 1] == '.') {
+        if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+        reply_empty_completion(alloc, id_raw, true); ret;
+    }
+    emit_completions(an, alloc, id_raw, prefix, file, true);
+}
+
+# build one exact, isolated analysis from the current editor buffer
+fun editor_completion_analysis(es: *editor.EditorSession, doc: *documents.Document,
+                               with_sema: bool, out: *analysis.Analyzed) bool {
+    var rr: *res.ResolveResult = nil;
+    var sr: *sema.SemaResult = nil;
+    if (with_sema) {
+        val ar: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
+        if (!is_err[*sema.SemaResult, str](ar)) {
+            sr = unwrap_ok[*sema.SemaResult, str](ar);
+            rr = editor.resolve_of(es, doc.file_id);
+        }
+    } or {
+        val rr_result: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+        if (!is_err[*res.ResolveResult, str](rr_result)) {
+            rr = unwrap_ok[*res.ResolveResult, str](rr_result);
+        }
+    }
+    if (rr == nil) { ret false; }
+    val a: *ast.Ast = editor.ast_of(es, doc.file_id);
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (a == nil || !is_some[*src.SourceFile](fo)) { ret false; }
+
+    out.interner = ?es.s.interner;
+    out.text = positions.text_of(unwrap[*src.SourceFile](fo));
+    out.sr = sr;
+    out.a = a;
+    out.rr = rr;
+    out.own = doc.file_id::sess.ModuleId;
+    out.root = nil;
+    ret true;
 }
 
 
@@ -2145,9 +2208,10 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it
-fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, pfile: *src.SourceFile) {
+fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                     prefix: token.Span, pfile: *src.SourceFile, incomplete: bool) {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
 
     var emitted: usize = 0;
     var i: u32 = 0;
@@ -2206,12 +2270,7 @@ fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc
     ret emit_field_completions(ws, an, alloc, id_raw, prefix, eid);
 }
 
-# offer a module's public symbols
-#
-# 第一遍:本模块自己声明的 pub 符号(普通模块走这里,行为与原来一致)。
-# 头文件聚合模块(成员全是 `fwd 子模块.名字;` 转发)的转发符号 origin
-# 指向原子模块,第一遍一个都留不下 —— 第二遍只看 PUB 标记:fwd 转发保留
-# 公有标记,use 进来的是私有、没有标记,正好把要发布的那批筛出来
+# offer a module's public symbols, including `fwd` re-exports
 fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, mid: sess.ModuleId) bool {
     if (an.root == nil) { ret false; }
     val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
@@ -2219,56 +2278,42 @@ fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *A
     val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
     if (mv.rr == nil) { ret false; }
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, false);
     var emitted: usize = 0;
     var i: u32 = 0;
-    for (i < mv.rr.symbol_count) {
+    for (i < mv.rr.pub_count) {
         val sym: *res.Symbol = ?mv.rr.symbols[i];
-        if ((sym.flags & res.SYM_FLAG_PUB) != 0 && sym.origin == mid) {
-            val no: Option[str] = intern.lookup(?an.root.s.interner, sym.name);
-            if (is_some[str](no)) {
-                val name: str = unwrap[str](no);
-                if (span_is_prefix_of(an.text.file, prefix, name)) {
-                    push_completion_item(?b, name, features.lsp_completion_kind(sym.kind), features.kind_label(sym.kind), nil, emitted > 0);
-                    emitted = emitted + 1;
-                }
+        val no: Option[str] = intern.lookup(?an.root.s.interner, sym.name);
+        if (is_some[str](no)) {
+            val name: str = unwrap[str](no);
+            if (span_is_prefix_of(an.text.file, prefix, name)) {
+                push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
+                                     features.kind_label(sym.kind), nil, emitted > 0);
+                emitted = emitted + 1;
             }
         }
         i = i + 1;
-    }
-    if (emitted == 0) {
-        var j: u32 = 0;
-        for (j < mv.rr.symbol_count) {
-            val sym2: *res.Symbol = ?mv.rr.symbols[j];
-            if ((sym2.flags & res.SYM_FLAG_PUB) != 0) {
-                val no2: Option[str] = intern.lookup(?an.root.s.interner, sym2.name);
-                if (is_some[str](no2)) {
-                    val name2: str = unwrap[str](no2);
-                    if (span_is_prefix_of(an.text.file, prefix, name2)) {
-                        push_completion_item(?b, name2, features.lsp_completion_kind(sym2.kind), features.kind_label(sym2.kind), nil, emitted > 0);
-                        emitted = emitted + 1;
-                    }
-                }
-            }
-            j = j + 1;
-        }
     }
     push_completion_tail(?b, alloc, id_raw);
     ret true;
 }
 
-
-# whether an earlier pub symbol of the same module already carries this name, so
-# a name bound more than once is offered once
-fun name_already_emitted(rr: *res.ResolveResult, sid: res.SymbolId, mid: sess.ModuleId) bool {
-    val target: intern.StrId = (?rr.symbols[sid]).name;
-    var i: u32 = 0;
-    for (i < sid::u32) {
-        val other: *res.Symbol = ?rr.symbols[i];
-        if (other.name == target && (other.flags & res.SYM_FLAG_PUB) != 0 && other.origin == mid) { ret true; }
-        i = i + 1;
-    }
-    ret false;
+# offer fields resolved entirely inside the isolated editor session
+fun emit_editor_member_completions(es: *editor.EditorSession, an: analysis.Analyzed,
+                                   alloc: *Allocator, id_raw: str,
+                                   prefix: token.Span, dot: usize) bool {
+    if (an.sr == nil || dot == 0) { ret false; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
+    if (eid == id.EXPR_NIL) { ret false; }
+    val tid: type.TypeId = mtypes.type_of(an.sr, eid);
+    val no: Option[mtypes.Nominal] = mtypes.nominal_of(?es.s.types, tid);
+    if (!is_some[mtypes.Nominal](no)) { ret false; }
+    val nominal: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+    if (nominal.origin != an.own) { ret false; }
+    val rso: Option[project.RecordSite] =
+        project.record_site_at(nil, nil, an.own, an.a, an.text.file, nominal.decl);
+    if (!is_some[project.RecordSite](rso)) { ret false; }
+    ret emit_record_fields(an, alloc, id_raw, prefix, unwrap[project.RecordSite](rso), true);
 }
 
 # offer the fields of the record or union the receiver expression types to
@@ -2279,10 +2324,14 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
     val rso: Option[project.RecordSite] =
         project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, tid);
     if (!is_some[project.RecordSite](rso)) { ret false; }
-    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+    ret emit_record_fields(an, alloc, id_raw, prefix, unwrap[project.RecordSite](rso), false);
+}
 
+# emit one record or union's fields with the requested completeness marker
+fun emit_record_fields(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                       prefix: token.Span, rs: project.RecordSite, incomplete: bool) bool {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
 
     var emitted: usize = 0;
     var i: u32 = 0;
@@ -2309,17 +2358,20 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
 #
 # The same shape as a populated reply rather than a bare `[]`, so a client sees
 # one response type from this method whatever the cursor is on.
-fun reply_empty_completion(alloc: *Allocator, id_raw: str) {
+fun reply_empty_completion(alloc: *Allocator, id_raw: str, incomplete: bool) {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
     push_completion_tail(?b, alloc, id_raw);
 }
 
 # the response envelope every completion list shares
-fun push_completion_head(b: *json.Buf, id_raw: str) {
+fun push_completion_head(b: *json.Buf, id_raw: str, incomplete: bool) {
     json.buf_push(b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push(b, id_raw);
-    json.buf_push(b, ",\"result\":{\"isIncomplete\":false,\"items\":[");
+    json.buf_push(b, ",\"result\":{\"isIncomplete\":");
+    if (incomplete) { json.buf_push(b, "true"); }
+    or { json.buf_push(b, "false"); }
+    json.buf_push(b, ",\"items\":[");
 }
 
 # close the envelope, send it, and release the request id
@@ -2359,278 +2411,3 @@ fun completion_first(an: analysis.Analyzed, sid: res.SymbolId) bool {
     }
     ret true;
 }
-
-# Analyze the static type of the name chain ending with 'end' in the pfile (`h.camera`). More than 6 segments, any of which fails to be parsed, or if the chain contains calls (`foo().`), return TYPE_NIL. The base name checks the current module symbol table; the field segment matches the fields of the parent record by name, and the type of the field is resolved back to a TypeId within the scope of the module to which the record belongs — the index of typed_names is not decl id, and cannot be directly queried
-fun stale_type_at(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, pfile: *src.SourceFile, end: usize, depth: u32) type.TypeId {
-    if (depth > 9) { ret type.TYPE_NIL; }
-    val text: str = pfile.text;
-    var s: usize = end;
-    for (s > 0 && is_ident_byte(text[s - 1])) { s = s - 1; }
-    if (s == end) { ret type.TYPE_NIL; }
-    var seg: token.Span;
-    seg.offset = s;
-    seg.len = end - s;
-    if (s == 0 || text[s - 1] != '.') {
-        var i: u32 = 0;
-        for (i < an.rr.symbol_count) {
-            val sym: *res.Symbol = ?an.rr.symbols[i];
-            val no: Option[str] = intern.lookup(an.interner, sym.name);
-            if (is_some[str](no) && features.span_text_equals(pfile, seg, unwrap[str](no))) {
-                if (sym.decl != id.DECL_NIL && an.sr != nil) {
-                    var tid: type.TypeId = project.decl_type_of(an.sr, sym.decl);
-                    if (tid == type.TYPE_NIL && sym.origin != an.own) {
-                        val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym.origin);
-                        if (is_some[*sema.SemaResult](mso)) {
-                            tid = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym.decl);
-                        }
-                    }
-                    ret tid;
-                }
-                ret type.TYPE_NIL;
-            }
-            i = i + 1;
-        }
-        ret type.TYPE_NIL;
-    }
-    val ptid: type.TypeId = stale_type_at(ws, an, alloc, pfile, s - 1, depth + 1);
-    if (ptid == type.TYPE_NIL) { ret type.TYPE_NIL; }
-    val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, ptid);
-    if (!is_some[project.RecordSite](rso)) { ret type.TYPE_NIL; }
-    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
-    var i: u32 = 0;
-    for (i < rs.fields_len) {
-        val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
-        val fname: str = positions.span_text(rs.text, tn.name, alloc);
-        val segname: str = positions.span_text(positions.text_of(pfile), seg, alloc);
-        var matched: bool = false;
-        if (fname != nil && segname != nil) { matched = str_equals(segname, fname); }
-        if (segname != nil) { json.free_str(segname, alloc); }
-        if (fname != nil) { json.free_str(fname, alloc); }
-        if (matched) {
-            if (tn.ty == id.TYPE_NIL) { ret type.TYPE_NIL; }
-            val to: Option[*atype.Type] = ast.get_type(rs.a, tn.ty);
-            if (!is_some[*atype.Type](to)) { ret type.TYPE_NIL; }
-            val ttext: str = positions.span_text(rs.text, unwrap[*atype.Type](to).span, alloc);
-            if (ttext == nil) { ret type.TYPE_NIL; }
-            val ftid: type.TypeId = resolve_type_in_scope(ws, an, rs.origin, ttext);
-            json.free_str(ttext, alloc);
-            ret ftid;
-        }
-        i = i + 1;
-    }
-    ret type.TYPE_NIL;
-}
-
-# On the editor text, the recipient identifier immediately preceding the `.` (in `err.`)
-# The byte position of the `.` character itself. The scanning method is the same as ident_prefix_before
-fun receiver_name_before(file: *src.SourceFile, dot: usize) token.Span {
-    val text: str = file.text;
-    var start: usize = dot;
-    for (start > 0 && is_ident_byte(text[start - 1])) { start = start - 1; }
-    var s: token.Span;
-    s.offset = start;
-    s.len = dot - start;
-    ret s;
-}
-
-# List all the fields of a record/union, without prefix filtering (filtering is done by the editor itself).
-# Field names and types are read from the module source code at the declaration, the same as in emit_field_completions.
-fun emit_fields_all(alloc: *Allocator, id_raw: str, rs: project.RecordSite) bool {
-    var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
-    var emitted: usize = 0;
-    var i: u32 = 0;
-    for (i < rs.fields_len) {
-        val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
-        val fname: str = positions.span_text(rs.text, tn.name, alloc);
-        if (fname != nil) {
-            val ftype: str = field_type_text(rs, tn, alloc);
-            push_completion_item(?b, fname, LSP_COMPLETION_FIELD, "field", ftype, emitted > 0);
-            if (ftype != nil) { json.free_str(ftype, alloc); }
-            json.free_str(fname, alloc);
-            emitted = emitted + 1;
-        }
-        i = i + 1;
-    }
-    push_completion_tail(?b, alloc, id_raw);
-    ret true;
-}
-
-# Member completion when snapshot is lagging: The offset has drifted with the editing, but the "name chain" of the recipient does not.
-# The behavior of a single receiver (`err.`) remains unchanged; for multiple receivers (`g.camera.`), first parse the entire chain by name into types, and then list all the fields of the corresponding type record. If any parsing fails, return false, and the caller provides an empty list.
-fun emit_member_completions_stale(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str, pfile: *src.SourceFile, dot: usize) bool {
-    if (an.root == nil) { ret false; }
-    val text: str = pfile.text;
-    # 接收者末段 [s, dot)
-    var s: usize = dot;
-    for (s > 0 && is_ident_byte(text[s - 1])) { s = s - 1; }
-    if (s == dot) { ret false; }
-    if (s == 0 || text[s - 1] != '.') {
-        var rspan: token.Span;
-        rspan.offset = s;
-        rspan.len = dot - s;
-        var i: u32 = 0;
-        for (i < an.rr.symbol_count) {
-            val sym: *res.Symbol = ?an.rr.symbols[i];
-            val no: Option[str] = intern.lookup(an.interner, sym.name);
-            if (is_some[str](no) && features.span_text_equals(pfile, rspan, unwrap[str](no))) {
-                var mid: sess.ModuleId;
-                if (module_alias_target(sym, ?mid)) {
-                    ret emit_module_members(ws, an, alloc, id_raw, empty_span(), mid);
-                }
-                if (sym.decl != id.DECL_NIL && an.sr != nil) {
-                    var tid: type.TypeId = project.decl_type_of(an.sr, sym.decl);
-                    if (tid == type.TYPE_NIL && sym.origin != an.own) {
-                        val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym.origin);
-                        if (is_some[*sema.SemaResult](mso)) {
-                            tid = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym.decl);
-                        }
-                    }
-                    if (tid != type.TYPE_NIL) {
-                        val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, tid);
-                        if (is_some[project.RecordSite](rso)) {
-                            ret emit_fields_all(alloc, id_raw, unwrap[project.RecordSite](rso));
-                        }
-                    }
-                }
-            }
-            i = i + 1;
-        }
-        ret false;
-    }
-    val tid: type.TypeId = stale_type_at(ws, an, alloc, pfile, dot, 0);
-    if (tid == type.TYPE_NIL) { ret false; }
-    val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, tid);
-    if (!is_some[project.RecordSite](rso)) { ret false; }
-    ret emit_fields_all(alloc, id_raw, unwrap[project.RecordSite](rso));
-}
-
-# ttext 的 [start, start+len) 切片与 name 逐字节比较(免分配)
-fun text_range_equals(ttext: str, start: usize, len: usize, name: str) bool {
-    val nl: usize = str_len(name);
-    if (nl != len) { ret false; }
-    var i: usize = 0;
-    for (i < len) {
-        if (ttext[start + i] != name[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# In the scope of the mid module, look for symbols by name and obtain their declaration types. The own module directly uses the current analysis result; for other modules, follow the module_view + module_sema (forward the type of the symbol if it is not registered in mid, and then re-check it based on the symbol origin if it cannot be found in mid)
-fun resolve_name_in_module(ws: *project.Workspace, an: analysis.Analyzed, mid: sess.ModuleId, ttext: str, start: usize, len: usize) type.TypeId {
-    if (len == 0) { ret type.TYPE_NIL; }
-    if (mid == an.own) {
-        var j: u32 = 0;
-        for (j < an.rr.symbol_count) {
-            val sym: *res.Symbol = ?an.rr.symbols[j];
-            if (sym.decl != id.DECL_NIL) {
-                val no: Option[str] = intern.lookup(an.interner, sym.name);
-                if (is_some[str](no) && text_range_equals(ttext, start, len, unwrap[str](no))) {
-                    if (an.sr == nil) { ret type.TYPE_NIL; }
-                    var tid: type.TypeId = project.decl_type_of(an.sr, sym.decl);
-                    if (tid == type.TYPE_NIL && sym.origin != an.own) {
-                        val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym.origin);
-                        if (is_some[*sema.SemaResult](mso)) {
-                            tid = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym.decl);
-                        }
-                    }
-                    ret tid;
-                }
-            }
-            j = j + 1;
-        }
-        ret type.TYPE_NIL;
-    }
-    val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
-    if (!is_some[project.ModuleView](mvo)) { ret type.TYPE_NIL; }
-    val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
-    if (mv.rr == nil) { ret type.TYPE_NIL; }
-    var k: u32 = 0;
-    for (k < mv.rr.symbol_count) {
-        val sym2: *res.Symbol = ?mv.rr.symbols[k];
-        if (sym2.decl != id.DECL_NIL) {
-            val no2: Option[str] = intern.lookup(?an.root.s.interner, sym2.name);
-            if (is_some[str](no2) && text_range_equals(ttext, start, len, unwrap[str](no2))) {
-                var tid2: type.TypeId = type.TYPE_NIL;
-                val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, mid);
-                if (is_some[*sema.SemaResult](mso)) {
-                    tid2 = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym2.decl);
-                }
-                if (tid2 == type.TYPE_NIL && sym2.origin != mid) {
-                    val mso2: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym2.origin);
-                    if (is_some[*sema.SemaResult](mso2)) {
-                        tid2 = project.decl_type_of(unwrap[*sema.SemaResult](mso2), sym2.decl);
-                    }
-                }
-                ret tid2;
-            }
-        }
-        k = k + 1;
-    }
-    ret type.TYPE_NIL;
-}
-
-# Parse the written type text into TypeId within the scope of the mid module:
-# "gfx.Camera" → Lookup the alias segment in the mid scope to find the target module by using the alias, the name field in this module is searched; the bare name "Hello" is directly searched in the mid scope. The leading * and spaces are stripped; unsupported writing styles such as generic arguments and so on are all TYPE_NIL (indicating an empty list, without causing an error answer)
-fun resolve_type_in_scope(ws: *project.Workspace, an: analysis.Analyzed, mid: sess.ModuleId, ttext: str) type.TypeId {
-    val n: usize = str_len(ttext);
-    var start: usize = 0;
-    for (start < n && (ttext[start] == '*' || ttext[start] == ' ')) { start = start + 1; }
-    if (start >= n) { ret type.TYPE_NIL; }
-    var dot: usize = n;
-    var i: usize = start;
-    var scanning: bool = true;
-    for (i < n && scanning) {
-        if (ttext[i] == '.') { dot = i; scanning = false; }
-        i = i + 1;
-    }
-    if (dot == n) {
-        ret resolve_name_in_module(ws, an, mid, ttext, start, n - start);
-    }
-    # 别名段 [start, dot):在 mid 作用域的符号里找同名 use 别名
-    var amid: sess.ModuleId;
-    var found: bool = false;
-    if (mid == an.own) {
-        var j: u32 = 0;
-        for (j < an.rr.symbol_count && !found) {
-            val sym: *res.Symbol = ?an.rr.symbols[j];
-            val no: Option[str] = intern.lookup(an.interner, sym.name);
-            if (is_some[str](no)) {
-                var target: sess.ModuleId;
-                if (module_alias_target(sym, ?target) && text_range_equals(ttext, start, dot - start, unwrap[str](no))) {
-                    amid = target;
-                    found = true;
-                }
-            }
-            j = j + 1;
-        }
-    } or {
-        val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
-        if (is_some[project.ModuleView](mvo)) {
-            val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
-            if (mv.rr != nil) {
-                var k: u32 = 0;
-                for (k < mv.rr.symbol_count && !found) {
-                    val sym2: *res.Symbol = ?mv.rr.symbols[k];
-                    val no2: Option[str] = intern.lookup(?an.root.s.interner, sym2.name);
-                    if (is_some[str](no2)) {
-                        var target2: sess.ModuleId;
-                        if (module_alias_target(sym2, ?target2) && text_range_equals(ttext, start, dot - start, unwrap[str](no2))) {
-                            amid = target2;
-                            found = true;
-                        }
-                    }
-                    k = k + 1;
-                }
-            }
-        }
-    }
-    if (!found) { ret type.TYPE_NIL; }
-    ret resolve_name_in_module(ws, an, amid, ttext, dot + 1, n - (dot + 1));
-}
-
-
-
-
-

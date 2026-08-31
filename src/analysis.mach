@@ -76,7 +76,7 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val vr: Result[project.DocumentView, str] = project.document_view_feature(ws, doc);
+    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
     if (!is_err[project.DocumentView, str](vr)) {
         val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
         out.rr       = v.rr;
