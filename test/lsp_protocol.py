@@ -168,6 +168,35 @@ class LspSession:
                 return item
             self.pending.append(item)
 
+    def assert_no_message(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        description: str,
+        settle: float = 0.3,
+    ) -> None:
+        """Require that no matching message arrives during a short settle period."""
+        for message in self.pending:
+            if predicate(message):
+                raise ProtocolError(f"unexpected {description}: {message!r}")
+        deadline = time.monotonic() + settle
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                item = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                return
+            if item is None:
+                raise ProtocolError(f"server exited while waiting for {description}; stderr: {self.stderr_text()}")
+            if isinstance(item, BaseException):
+                raise ProtocolError(f"response reader failed: {item}") from item
+            assert isinstance(item, dict)
+            self.message_count += 1
+            if predicate(item):
+                raise ProtocolError(f"unexpected {description}: {item!r}")
+            self.pending.append(item)
+
     def diagnostics(self, uri: str, version: object = ANY_VERSION) -> dict[str, Any]:
         """Wait for the next diagnostics notification for a document."""
         return self.wait_for(
@@ -499,6 +528,10 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 "dynamic watcher registration",
             )
             session.respond_error(registration, -32601, "watch registration rejected")
+            session.assert_no_message(
+                lambda item: item.get("id") == registration.get("id"),
+                "reply to rejected watcher registration",
+            )
 
             session.notify(
                 "textDocument/didOpen",
@@ -2001,6 +2034,10 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
                 "watch registration",
             )
             session.respond_result(registration)
+            session.assert_no_message(
+                lambda item: item.get("id") == registration.get("id"),
+                "reply to accepted watcher registration",
+            )
             session.notify(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
@@ -2038,6 +2075,48 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             repaired = definition(session, main, text, "watched")
             require(repaired.get("uri") == defs.as_uri(),
                     f"failed root did not retry after disk source repair: {repaired!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_response_envelopes(server: Path, timeout: float) -> None:
+    """Responses of every legal id type are ignored, not answered."""
+    with tempfile.TemporaryDirectory(prefix="mls-response-") as directory:
+        root = Path(directory).resolve()
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            response_ids: tuple[str | int | None, ...] = ("foreign", 42, None)
+            session._send({"jsonrpc": "2.0", "id": response_ids[0], "result": None})
+            session._send({"jsonrpc": "2.0", "id": response_ids[1],
+                           "error": {"code": -32601, "message": "unknown request"}})
+            session._send({"jsonrpc": "2.0", "id": response_ids[2], "result": None})
+            session.assert_no_message(
+                lambda item: ("id" in item
+                              and any(item["id"] == response_id for response_id in response_ids)),
+                "reply to a server response",
+            )
+
+            invalid_requests = (
+                {"jsonrpc": "2.0", "result": None},
+                {"jsonrpc": "2.0", "id": "missing-method"},
+                {"jsonrpc": "2.0", "id": "both-response-fields", "result": None,
+                 "error": {"code": -32601, "message": "unknown request"}},
+            )
+            for invalid_request in invalid_requests:
+                invalid_id = invalid_request.get("id")
+                session._send(invalid_request)
+                invalid = session.wait_for(
+                    lambda item: item.get("id") == invalid_id,
+                    "invalid request response",
+                )
+                error = invalid.get("error")
+                require(isinstance(error, dict) and error.get("code") == -32600,
+                        f"a method-less non-response was not rejected: {invalid!r}")
             session.finish()
             finished = True
         finally:
@@ -2453,6 +2532,15 @@ def run_progress_reporting(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
+            create = session.wait_for(
+                lambda item: item.get("method") == "window/workDoneProgress/create",
+                "progress token creation",
+            )
+            session.respond_result(create)
+            session.assert_no_message(
+                lambda item: item.get("id") == create.get("id"),
+                "reply to progress token creation",
+            )
             for version in (2, 3):
                 session.notify(
                     "textDocument/didChange",
@@ -2733,6 +2821,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
+        run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_completion_context(server, args.timeout)
