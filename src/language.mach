@@ -1630,9 +1630,10 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val dot: usize = prefix.offset;
 
     var an: analysis.Analyzed;
-    val vr: Result[project.DocumentView, str] = project.document_view_loaded(ws, doc);
+    val vr: Result[project.DocumentView, str] = project.document_view_feature(ws, doc);
     if (!is_err[project.DocumentView, str](vr)) {
         val view: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        val drifted: bool = doc.revision > view.revision;
         an.interner = view.interner;
         an.text = view.text;
         an.sr = view.sr;
@@ -1640,12 +1641,16 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         an.rr = view.rr;
         an.own = view.module;
         an.root = view.root;
-
         if (dot > 0 && file.text[dot - 1] == '.') {
-            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
-            reply_empty_completion(alloc, id_raw, false); ret;
+            if (!drifted) {
+                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            }
+            if (emit_member_completions_stale(ws, alloc, id_raw, doc, file, prefix, dot)) { ret; }
+            reply_empty_completion(alloc, id_raw, false);
+            ret;
         }
-        emit_completions(an, alloc, id_raw, prefix, file, false); ret;
+        emit_completions(an, alloc, id_raw, prefix, file, drifted);
+        ret;
     }
 
     if (project.root_for_loaded(ws, uri) == nil) {
@@ -2411,3 +2416,261 @@ fun completion_first(an: analysis.Analyzed, sid: res.SymbolId) bool {
     }
     ret true;
 }
+
+# stale 快照上的成员补全。定位与符号名匹配全部用编辑器当前文本(efile),
+# 只借用快照的符号表/类型表,所以点号前的编辑不影响;给下游成员/字段列表
+# 的前缀是零长度 span(全放行),由客户端按光标前缀过滤
+fun emit_member_completions_stale(ws: *project.Workspace, alloc: *Allocator, id_raw: str, doc: *documents.Document, efile: *src.SourceFile, prefix: token.Span, dot: usize) bool {
+    if (dot == 0 || efile == nil || efile.text == nil) { ret false; }
+    val ctext: str = efile.text;
+    if (dot > str_len(ctext) || ctext[dot - 1] != '.') { ret false; }
+    var s: usize = dot - 1;
+    for (s > 0 && is_ident_byte(ctext[s - 1])) { s = s - 1; }
+    if (s == dot - 1) { ret false; }
+    var seg: token.Span;
+    seg.offset = s;
+    seg.len = (dot - 1) - s;
+    val vr: Result[project.DocumentView, str] = project.document_view_feature(ws, doc);
+    if (is_err[project.DocumentView, str](vr)) { ret false; }
+    val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+    var an: analysis.Analyzed;
+    an.interner = v.interner;
+    an.text = v.text;
+    an.sr = v.sr;
+    an.a = v.a;
+    an.rr = v.rr;
+    an.own = v.module;
+    an.root = v.root;
+    var open_prefix: token.Span;
+    open_prefix.offset = 0;
+    open_prefix.len = 0;
+    var i: u32 = 0;
+    for (i < an.rr.symbol_count) {
+        val sym: *res.Symbol = ?an.rr.symbols[i];
+        val no: Option[str] = intern.lookup(an.interner, sym.name);
+        if (is_some[str](no) && features.span_text_equals(efile, seg, unwrap[str](no))) {
+            var mid: sess.ModuleId;
+            if (module_alias_target(sym, ?mid)) {
+                ret emit_module_members(ws, an, alloc, id_raw, open_prefix, mid);
+            }
+            brk;
+        }
+        i = i + 1;
+    }
+    # end 用 dot-1(接收者名的末尾):点号刚输入时成员段为空,从 dot 扫描
+    # 会立刻命中空段返回 NIL —— 变量成员补全因此全灭
+    val tid: type.TypeId = stale_type_at(ws, an, alloc, efile, dot - 1, 0);
+    if (tid == type.TYPE_NIL) { ret false; }
+    val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, tid);
+    if (!is_some[project.RecordSite](rso)) { ret false; }
+    ret emit_record_fields(an, alloc, id_raw, open_prefix, unwrap[project.RecordSite](rso), true);
+}
+
+# ttext 的 [start, start+len) 切片与 name 逐字节比较(免分配)
+fun text_range_equals(ttext: str, start: usize, len: usize, name: str) bool {
+    val nl: usize = str_len(name);
+    if (nl != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (ttext[start + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# 解析当前文本里结束于 `end` 的名字链(`h.camera`)的静态类型。扫描与
+# 匹配用编辑器文本,类型表用快照
+fun stale_type_at(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, efile: *src.SourceFile, end: usize, depth: u32) type.TypeId {
+    if (depth > 10 || efile == nil || efile.text == nil) { ret type.TYPE_NIL; }
+    val ctext: str = efile.text;
+    var s: usize = end;
+    for (s > 0 && is_ident_byte(ctext[s - 1])) { s = s - 1; }
+    if (s == end) { ret type.TYPE_NIL; }
+    var seg: token.Span;
+    seg.offset = s;
+    seg.len = end - s;
+    if (s == 0 || ctext[s - 1] != '.') {
+        var i: u32 = 0;
+        for (i < an.rr.symbol_count) {
+            val sym: *res.Symbol = ?an.rr.symbols[i];
+            val no: Option[str] = intern.lookup(an.interner, sym.name);
+            if (is_some[str](no) && features.span_text_equals(efile, seg, unwrap[str](no))) {
+                if (sym.kind == res.SYM_PARAM && sym.decl != id.DECL_NIL) {
+                    ret param_type_of(ws, an, alloc, sym);
+                }
+                if (sym.decl != id.DECL_NIL && an.sr != nil) {
+                    var tid: type.TypeId = project.decl_type_of(an.sr, sym.decl);
+                    if (tid == type.TYPE_NIL && sym.origin != an.own) {
+                        val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym.origin);
+                        if (is_some[*sema.SemaResult](mso)) {
+                            tid = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym.decl);
+                        }
+                    }
+                    ret tid;
+                }
+                ret type.TYPE_NIL;
+            }
+            i = i + 1;
+        }
+        ret type.TYPE_NIL;
+    }
+    val ptid: type.TypeId = stale_type_at(ws, an, alloc, efile, s - 1, depth + 1);
+    if (ptid == type.TYPE_NIL) { ret type.TYPE_NIL; }
+    val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, ptid);
+    if (!is_some[project.RecordSite](rso)) { ret type.TYPE_NIL; }
+    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+    var i: u32 = 0;
+    for (i < rs.fields_len) {
+        val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
+        val fname: str = positions.span_text(rs.text, tn.name, alloc);
+        val segname: str = positions.span_text(positions.text_of(efile), seg, alloc);
+        var matched: bool = false;
+        if (fname != nil && segname != nil) { matched = str_equals(segname, fname); }
+        if (segname != nil) { json.free_str(segname, alloc); }
+        if (fname != nil) { json.free_str(fname, alloc); }
+        if (matched) {
+            if (tn.ty == id.TYPE_NIL) { ret type.TYPE_NIL; }
+            val to: Option[*atype.Type] = ast.get_type(rs.a, tn.ty);
+            if (!is_some[*atype.Type](to)) { ret type.TYPE_NIL; }
+            val ttext: str = positions.span_text(rs.text, unwrap[*atype.Type](to).span, alloc);
+            if (ttext == nil) { ret type.TYPE_NIL; }
+            val ftid: type.TypeId = resolve_type_in_scope(ws, an, rs.origin, ttext);
+            json.free_str(ttext, alloc);
+            ret ftid;
+        }
+        i = i + 1;
+    }
+    ret type.TYPE_NIL;
+}
+
+# 在 mid 模块作用域里按名字找符号并取其声明类型
+fun resolve_name_in_module(ws: *project.Workspace, an: analysis.Analyzed, mid: sess.ModuleId, ttext: str, start: usize, len: usize) type.TypeId {
+    if (len == 0) { ret type.TYPE_NIL; }
+    if (mid == an.own) {
+        var j: u32 = 0;
+        for (j < an.rr.symbol_count) {
+            val sym: *res.Symbol = ?an.rr.symbols[j];
+            if (sym.decl != id.DECL_NIL) {
+                val no: Option[str] = intern.lookup(an.interner, sym.name);
+                if (is_some[str](no) && text_range_equals(ttext, start, len, unwrap[str](no))) {
+                    if (an.sr == nil) { ret type.TYPE_NIL; }
+                    var tid: type.TypeId = project.decl_type_of(an.sr, sym.decl);
+                    if (tid == type.TYPE_NIL && sym.origin != an.own) {
+                        val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym.origin);
+                        if (is_some[*sema.SemaResult](mso)) {
+                            tid = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym.decl);
+                        }
+                    }
+                    ret tid;
+                }
+            }
+            j = j + 1;
+        }
+        ret type.TYPE_NIL;
+    }
+    val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
+    if (!is_some[project.ModuleView](mvo)) { ret type.TYPE_NIL; }
+    val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
+    if (mv.rr == nil) { ret type.TYPE_NIL; }
+    var k: u32 = 0;
+    for (k < mv.rr.symbol_count) {
+        val sym2: *res.Symbol = ?mv.rr.symbols[k];
+        if (sym2.decl != id.DECL_NIL) {
+            val no2: Option[str] = intern.lookup(?an.root.s.interner, sym2.name);
+            if (is_some[str](no2) && text_range_equals(ttext, start, len, unwrap[str](no2))) {
+                var tid2: type.TypeId = type.TYPE_NIL;
+                val mso: Option[*sema.SemaResult] = project.module_sema(ws, an.root, mid);
+                if (is_some[*sema.SemaResult](mso)) {
+                    tid2 = project.decl_type_of(unwrap[*sema.SemaResult](mso), sym2.decl);
+                }
+                if (tid2 == type.TYPE_NIL && sym2.origin != mid) {
+                    val mso2: Option[*sema.SemaResult] = project.module_sema(ws, an.root, sym2.origin);
+                    if (is_some[*sema.SemaResult](mso2)) {
+                        tid2 = project.decl_type_of(unwrap[*sema.SemaResult](mso2), sym2.decl);
+                    }
+                }
+                ret tid2;
+            }
+        }
+        k = k + 1;
+    }
+    ret type.TYPE_NIL;
+}
+
+# 把书写出来的类型文本(可含 `use` 别名前缀)在 mid 作用域里解析成 TypeId
+fun resolve_type_in_scope(ws: *project.Workspace, an: analysis.Analyzed, mid: sess.ModuleId, ttext: str) type.TypeId {
+    val n: usize = str_len(ttext);
+    var start: usize = 0;
+    for (start < n && (ttext[start] == '*' || ttext[start] == ' ')) { start = start + 1; }
+    if (start >= n) { ret type.TYPE_NIL; }
+    var dot: usize = n;
+    var i: usize = start;
+    var scanning: bool = true;
+    for (i < n && scanning) {
+        if (ttext[i] == '.') { dot = i; scanning = false; }
+        i = i + 1;
+    }
+    if (dot == n) {
+        ret resolve_name_in_module(ws, an, mid, ttext, start, n - start);
+    }
+    var amid: sess.ModuleId;
+    var found: bool = false;
+    if (mid == an.own) {
+        var j: u32 = 0;
+        for (j < an.rr.symbol_count && !found) {
+            val sym: *res.Symbol = ?an.rr.symbols[j];
+            val no: Option[str] = intern.lookup(an.interner, sym.name);
+            if (is_some[str](no)) {
+                var target: sess.ModuleId;
+                if (module_alias_target(sym, ?target) && text_range_equals(ttext, start, dot - start, unwrap[str](no))) {
+                    amid = target;
+                    found = true;
+                }
+            }
+            j = j + 1;
+        }
+    } or {
+        val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
+        if (is_some[project.ModuleView](mvo)) {
+            val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
+            if (mv.rr != nil) {
+                var k: u32 = 0;
+                for (k < mv.rr.symbol_count && !found) {
+                    val sym2: *res.Symbol = ?mv.rr.symbols[k];
+                    val no2: Option[str] = intern.lookup(?an.root.s.interner, sym2.name);
+                    if (is_some[str](no2)) {
+                        var target2: sess.ModuleId;
+                        if (module_alias_target(sym2, ?target2) && text_range_equals(ttext, start, dot - start, unwrap[str](no2))) {
+                            amid = target2;
+                            found = true;
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+    }
+    if (!found) { ret type.TYPE_NIL; }
+    ret resolve_name_in_module(ws, an, amid, ttext, dot + 1, n - (dot + 1));
+}
+
+# 参数的声明类型:按 (decl, slot) 从快照 Ast 的 TypedName 读类型注解文本,
+# 再在模块作用域里解析。Mach 的绑定都带注解,这条路不依赖 sema
+fun param_type_of(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, sym: *res.Symbol) type.TypeId {
+    if (sym.decl == id.DECL_NIL) { ret type.TYPE_NIL; }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret type.TYPE_NIL; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN) { ret type.TYPE_NIL; }
+    if (sym.slot >= d.data.fun_.params_len) { ret type.TYPE_NIL; }
+    val tn: *decl.TypedName = ?an.a.typed_names[d.data.fun_.params_start + sym.slot];
+    if (tn.ty == id.TYPE_NIL) { ret type.TYPE_NIL; }
+    val to: Option[*atype.Type] = ast.get_type(an.a, tn.ty);
+    if (!is_some[*atype.Type](to)) { ret type.TYPE_NIL; }
+    val ttext: str = positions.span_text(an.text, unwrap[*atype.Type](to).span, alloc);
+    if (ttext == nil) { ret type.TYPE_NIL; }
+    val tid: type.TypeId = resolve_type_in_scope(ws, an, an.own, ttext);
+    json.free_str(ttext, alloc);
+    ret tid;
+}
+
