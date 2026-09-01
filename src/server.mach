@@ -698,7 +698,10 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         ret;
     }
     srv.deferred = false;
-    republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
+    if (project.rebuild_due_roots(?srv.ws)) {
+        republish_all(srv);
+    }
+    republish_root(srv, project.root_for_loaded(?srv.ws, doc.uri), doc);
 }
 
 # send a JSON-RPC error response for a request that carries an id

@@ -135,6 +135,7 @@ pub rec Root {
     attempted_revision: u64;
     dirty:           bool;
     last_disk_scan_ns: i64;
+    last_rebuild_ns: i64;
 }
 
 # project roots and the standalone-editor fallback
@@ -548,6 +549,7 @@ fun reset_slot(r: *Root) {
     r.attempted_revision = 0;
     r.dirty = false;
     r.last_disk_scan_ns = 0;
+    r.last_rebuild_ns = 0;
 }
 
 # a reusable dead slot, growing the array when every slot is
@@ -585,6 +587,7 @@ fun alloc_slot(w: *Workspace) *Root {
 # load/resolve/sema snapshot for `r.path`
 fun try_load(w: *Workspace, r: *Root) bool {
     val started_ns: i64 = trace.now_ns();
+    fin { r.last_rebuild_ns = chrono.time_unix_nsec(chrono.monotonic()); }
     fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
 
     # Only the FIRST analysis of a root reports. A revalidation is a few
@@ -1015,7 +1018,6 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && (root_covers(w, norm, r.path)
             || is_some[sess.ModuleId](module_for_norm(r, norm)))) {
-            free_root_graph(w, r);
             r.man_mtime = 0 - 1;
             r.lock_mtime = 0 - 1;
             r.dirty = true;
@@ -1303,6 +1305,55 @@ fun view_from_root(root: *Root, d: *documents.Document) Result[DocumentView, str
     v.revision = root.snapshot_revision;
     v.file_id = m.file_id;
     ret ok[DocumentView, str](v);
+}
+
+# how stale a root may get before the didChange idle slot refreshes it.
+# rebuilds cost hundreds of ms at best, so they only happen here - never on a
+# publish, a diagnostic, or a feature request. raise for big projects
+# (30s = 30000000000, 60s = 60000000000)
+pub val REBUILD_WINDOW_NS: i64 = 60000000000;
+
+# the one place rebuilds happen from: the didChange processing slot (the last
+# message of a keystroke burst), at most once per window per root. maybe_reload
+# keeps the no-watcher disk-change fallback alive here instead of on hot paths;
+# refresh_inputs handles edit-advance, dirty, and failed-load retries
+pub fun rebuild_due_roots(w: *Workspace) bool {
+    var rebuilt: bool = false;
+    if (w.roots == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < w.root_cap) {
+        val r: *Root = ?w.roots[i];
+        if (r.path != nil && r.s != nil) {
+            maybe_reload(w, r);
+            if (r.dirty
+                || (r.loaded && r.input_revision != r.snapshot_revision)
+                || (!r.loaded && r.input_revision != r.attempted_revision)) {
+                val due: bool = chrono.time_unix_nsec(chrono.monotonic()) - r.last_rebuild_ns >= REBUILD_WINDOW_NS;
+                if (due) { refresh_inputs(w, r); rebuilt = true; }
+            }
+        }
+        i = i + 1;
+    }
+    ret rebuilt;
+}
+
+# the view for language features, diagnostics, completion, and quick fixes. a
+# LOADED root answers even when its snapshot is stale - the idle slot refreshes
+# it within the window - so nothing on these paths ever rebuilds. a document
+# missing from the snapshot entirely (newly opened file) is worth one
+# synchronous load; a root that already failed a load is not retried here (the
+# idle slot owns retries), and the caller falls back to the editor session
+pub fun document_view_feature(w: *Workspace, d: *documents.Document) Result[DocumentView, str] {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded) {
+        if (root != nil && root.analyzed_once) { ret err[DocumentView, str]("project: root not loaded"); }
+        ret document_view(w, d);
+    }
+    if (is_none[sess.ModuleId](module_for_norm(root, d.path))) {
+        refresh_inputs(w, root);
+        if (!root.loaded) { ret document_view(w, d); }
+    }
+    ret view_from_root(root, d);
 }
 
 # the number of loaded modules in `root`, or 0 when root is nil /
