@@ -1008,6 +1008,12 @@ pub fun document_closed(w: *Workspace, d: *documents.Document) {
 # ---
 # w:   the workspace
 # uri: the URI of the changed file
+
+# NOTE: never free the root graph here. a torn-down root (loaded=false,
+# analyzed_once=true) is unrecoverable in document_view_feature: the feature
+# path refuses the strict-rebuild fallback and answers empty until a rebuild.
+# invalidation is lazy: mark dirty and poison man_mtime; the stale snapshot
+# keeps serving until the next maybe_reload / idle-slot rebuild replaces it
 pub fun invalidate_uri(w: *Workspace, uri: str) {
     if (uri == nil || w.roots == nil) { ret; }
     val norm: str = uri_to_norm(w.alloc, uri);
@@ -1347,6 +1353,15 @@ pub fun document_view_feature(w: *Workspace, d: *documents.Document) Result[Docu
     val root: *Root = root_for_loaded(w, d.uri);
     if (root == nil || !root.loaded) {
         if (root != nil && root.analyzed_once) { ret err[DocumentView, str]("project: root not loaded"); }
+        ret document_view(w, d);
+    }
+    # disk-fallback: no-op unless manifest / deps actually changed on disk
+    # (internally throttled). required by the no-watcher fallback path
+    maybe_reload(w, root);
+    # coupled with invalidate_uri: it must never free the graph, so
+    # `!root.loaded && analyzed_once` stays unreachable from this path
+    if (!root.loaded) {
+        if (root.analyzed_once) { ret err[DocumentView, str]("project: root not loaded"); }
         ret document_view(w, d);
     }
     if (is_none[sess.ModuleId](module_for_norm(root, d.path))) {

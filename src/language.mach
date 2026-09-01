@@ -1645,8 +1645,17 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
             if (!drifted) {
                 if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
             }
+            # the snapshot lags the buffer, so its member list cannot name what
+            # this edit just added. answer from the editor's own analysis of the
+            # current text - isolated (incomplete=true), exact for the buffer -
+            # and keep the snapshot hybrid for receivers the editor cannot type
+            # (declared in a dependency the isolated session cannot resolve).
+            var ean: analysis.Analyzed;
+            if (editor_completion_analysis(es, doc, true, ?ean)) {
+                if (emit_editor_member_completions(es, ean, alloc, id_raw, prefix, dot - 1)) { ret; }
+            }
             if (emit_member_completions_stale(ws, alloc, id_raw, doc, file, prefix, dot)) { ret; }
-            reply_empty_completion(alloc, id_raw, false);
+            reply_empty_completion(alloc, id_raw, true);
             ret;
         }
         emit_completions(an, alloc, id_raw, prefix, file, drifted);
