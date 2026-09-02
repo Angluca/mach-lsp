@@ -1024,6 +1024,7 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && (root_covers(w, norm, r.path)
             || is_some[sess.ModuleId](module_for_norm(r, norm)))) {
+            free_root_graph(w, r);
             r.man_mtime = 0 - 1;
             r.lock_mtime = 0 - 1;
             r.dirty = true;
