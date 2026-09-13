@@ -371,6 +371,8 @@ abi = "sysv64"
 opt = 0
 debug = true
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -441,6 +443,8 @@ abi = "sysv64"
 opt = 0
 debug = true
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -459,7 +463,7 @@ path = "dep/vendorlib"
         """[project]
 id = "vendorlib"
 version = "0.1.0"
-src = "./src"
+src = "src"
 out = "out/{target.name}/{profile.name}"
 
 [artifact.lib]
@@ -533,11 +537,6 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
     with tempfile.TemporaryDirectory(prefix="mls-protocol-") as directory:
         root = Path(directory).resolve()
         alpha = write_project(root, "alpha", 11)
-        alpha_manifest_path = alpha[0].parents[1] / "mach.toml"
-        alpha_manifest_path.write_text(
-            alpha_manifest_path.read_text(encoding="utf-8").replace('src = "src"', 'src = "./src"'),
-            encoding="utf-8",
-        )
         beta = write_project(root, "beta", 22)
         shared_left = write_project(root / "left", "shared", 31)
         shared_right = write_project(root / "right", "shared", 41)
@@ -765,8 +764,8 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
 
             # A dependency opened before its ancestor graph is loaded must still
             # enter that graph through a filesystem overlay. Current `[dep.*]`
-            # routing, a raw `src = "./src"` spelling, sema, and read-only rename
-            # are all exercised by the unsaved i64 export.
+            # routing, sema, and read-only rename are all exercised by the
+            # unsaved i64 export.
             vendor_main, vendor_dep, vendor_text, vendor_live = vendored
             session.notify(
                 "textDocument/didOpen",
@@ -2161,8 +2160,10 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
             assert_definition(session, main, defs, text)
 
+            # the edit must keep the project compiling: mach 5.0 releases a
+            # project whose sema phase is rejected (briar-systems/mach#3337)
             changed = defs.read_text(encoding="utf-8").replace(
-                "pub val watched: i32", "pub val watched: i64")
+                "pub val watched: i32 = 9;", "pub val watched: i32 = 99;")
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
             lines = text.splitlines()
@@ -2172,7 +2173,7 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": line, "character": lines[line].index("watched") + 1}},
             )
-            require("i64" in json.dumps(hover.get("result")),
+            require("watched: i32 = 99" in json.dumps(hover.get("result")),
                     f"active watcher suppressed source fingerprint fallback: {hover!r}")
 
             broken = changed + "use watch.missing.nope;\n"

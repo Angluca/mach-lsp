@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Mach 5.0 migration. The server now builds against the mach v5.0.0 compiler and
+std 2.0.0, follows the 5.0 driver and type-table contracts, and drops the
+lockfile in favour of the committed dependency gitlinks.
+
+### Changed
+- build: `mach.toml` follows the 5.0 manifest rules (complete profiles, one
+  default target and profile, `[dep.std]` realized at `dep/std`, pins on
+  `tag/v5.0.0` and `tag/v2.0.0`); `mach.lock` is gone.
+- source: every `Result` / `Option` use is a `res` / `opt` tag read through
+  `sel` guards; std 2.0 signatures (allocation, paths, strings, env, clock,
+  writer sinks, toml/json optionals) are followed at each call site. The
+  server's own error payload stays `str`, since its errors are client-facing
+  messages.
+- analysis: the standalone buffer path runs `editor.analyze` per phase and
+  borrows the buffer's products for the request; diagnostics read the owned
+  `DiagnosticStore` (children, related, fixes are vectors).
+- types: the record back-link keys on the declaring file and interned name the
+  5.0 type table carries (`TypeOwner`), with `nominal_decl` recovering the
+  declaration from the file's Ast; `FieldKey` and `RecordSite` carry the same
+  identity.
+- project: `site_of` canonicalizes a `use` / `fwd` binding, which no longer
+  carries a DeclId, to the defining module's own symbol; every consumer of a
+  site reads `site.sym`.
+- test: protocol fixtures are 5.0 manifests; the on-disk edit in the watcher
+  case keeps the project compiling.
+
+### Known
+- A project whose frontend rejects a phase (any buffer with a parse or type
+  error mid-edit) loses its products under mach 5.0.0, so cross-module
+  features degrade to single-buffer analysis until briar-systems/mach#3337
+  ships a tolerant analysis entry point. The protocol suite fails from the
+  field-completion case onward for this reason.
+
 ## [0.17.0] - 2026-08-31
 
 Completion now stays responsive while project analysis catches up to edits,
