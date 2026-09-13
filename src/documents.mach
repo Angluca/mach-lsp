@@ -128,7 +128,7 @@ pub fun open(st: *Store, uri: str, path: str, text: str, version: i64) res[*Docu
         strutil.str_free(st.alloc, dup_path.ok);
         ret res[*Document, str].err{"documents: failed to copy text"};
     }
-    val fr: res[src.FileId, fail.Fail] = editor.open(st.es, uri, text);
+    val fr: res[src.FileId, fail.Fail] = editor.open(st.es, path, text);
     if (sel fr.err) {
         strutil.str_free(st.alloc, dup_uri.ok);
         strutil.str_free(st.alloc, dup_path.ok);

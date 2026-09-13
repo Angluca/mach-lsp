@@ -36,13 +36,16 @@ lockfile in favour of the committed dependency gitlinks.
   case keeps the project compiling.
 
 ### Requires
-- mach v5.0.1: the project load uses `driver.analyze_project_tolerant`, which
+- mach v5.0.2: the project load uses `driver.analyze_project_tolerant`, which
   keeps a project's trees, resolve results and sema results through a rejected
   frontend phase (briar-systems/mach#3337). The document view accepts a
   module without a sema product, so a buffer mid-edit keeps project-scoped
   diagnostics and navigation. Types in independent modules later in
   dependency order still go dark while another module is rejected
-  (briar-systems/mach#3340).
+  (briar-systems/mach#3340). Buffers are registered with the editor under
+  their filesystem path, as 5.0 requires; a project whose manifest cannot
+  load is analyzed standalone by the editor (briar-systems/mach#3343), which
+  keeps syntax features alive while a manifest is being edited.
 
 ## [0.17.0] - 2026-08-31
 

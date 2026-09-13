@@ -31,6 +31,7 @@ use mls.documents;
 use mls.json;
 use mls.positions;
 use mls.project;
+use mls.trace;
 use mls.transport;
 
 # LSP diagnostic severities (1 = Error ... 4 = Hint)
@@ -80,6 +81,9 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
         if (sel ar.err) {
             var f: outcome.Fail = ar.err;
+            trace.log("diagnostics: standalone analysis failed: ");
+            trace.log(outcome.describe(f));
+            trace.log("\n");
             editor.fail_dnit(es, ?f);
             clear(alloc, d.uri);
             ret;
