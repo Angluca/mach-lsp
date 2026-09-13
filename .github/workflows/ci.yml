@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Install mach
         env:
@@ -31,7 +31,7 @@ jobs:
           mach info
 
       - name: Pull dependencies
-        run: mach dep pull
+        run: mach dep pull .
 
       - name: Build (debug)
         run: mach build . --target linux-x86_64 --profile debug
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Install mach
         shell: pwsh
@@ -66,7 +66,7 @@ jobs:
           & "$PWD\machdl\mach.exe" info
 
       - name: Pull dependencies
-        run: mach dep pull
+        run: mach dep pull .
 
       - name: Build (debug)
         run: mach build . --target windows-x86_64 --profile debug

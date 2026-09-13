@@ -13,23 +13,19 @@
 # base string is all the input there is.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.none;
-use std.types.option.some;
-use std.types.option.is_some;
-use std.types.option.unwrap;
 
 use std.allocator.Allocator;
 
 use sj: std.data.json;
 
-use json:      mls.json;
-use positions: mls.positions;
+use mls.json;
+use mls.positions;
 
 # `base` with every change in `changes` applied, as owned text
 #
@@ -51,13 +47,13 @@ use positions: mls.positions;
 pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize) str {
     if (base == nil) { ret nil; }
 
-    var current: str = nil;
-    var owned: bool = false;
-    var i: usize = 0;
+    var current: str   = nil;
+    var owned:   bool  = false;
+    var i:       usize = 0;
     for (i < n) {
         val change: *sj.Value = json.element(changes, i);
-        val whole: *sj.Value = json.member(change, "range");
-        val piece: str = json.text(json.member(change, "text"), alloc);
+        val whole:  *sj.Value = json.member(change, "range");
+        val piece:  str       = json.text(json.member(change, "text"), alloc);
         if (piece == nil) {
             if (owned) { json.free_str(current, alloc); }
             ret nil;
@@ -67,17 +63,17 @@ pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize
             # a full-document change discards everything before it
             if (owned) { json.free_str(current, alloc); }
             current = piece;
-            owned = true;
+            owned   = true;
         }
         or {
             var from: str = current;
             if (!owned) { from = base; }
             val next: str = splice(alloc, from, whole, piece);
             json.free_str(piece, alloc);
-            if (owned) { json.free_str(current, alloc); }
+            if (owned)       { json.free_str(current, alloc); }
             if (next == nil) { ret nil; }
             current = next;
-            owned = true;
+            owned   = true;
         }
         i = i + 1;
     }
@@ -93,11 +89,12 @@ pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize
 # piece: the replacement text
 # ret:   owned patched text, or nil when the range does not resolve
 pub fun splice(alloc: *Allocator, from: str, range: *sj.Value, piece: str) str {
-    val so: Option[usize] = offset_of_position(from, json.member(range, "start"));
-    val eo: Option[usize] = offset_of_position(from, json.member(range, "end"));
-    if (!is_some[usize](so) || !is_some[usize](eo)) { ret nil; }
-    var lo: usize = unwrap[usize](so);
-    var hi: usize = unwrap[usize](eo);
+    val so: opt[usize] = offset_of_position(from, json.member(range, "start"));
+    val eo: opt[usize] = offset_of_position(from, json.member(range, "end"));
+    if (sel so.none) { ret nil; }
+    if (sel eo.none) { ret nil; }
+    var lo: usize = so.some;
+    var hi: usize = eo.some;
     if (hi < lo) { hi = lo; }
 
     var b: json.Buf = json.buf_init(alloc);
@@ -105,17 +102,20 @@ pub fun splice(alloc: *Allocator, from: str, range: *sj.Value, piece: str) str {
     json.buf_push(?b, piece);
     json.buf_push_range(?b, from, hi, str_len(from));
     val view: str = json.buf_str(?b);
-    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    if (view == nil) {
+        json.buf_dnit(?b);
+        ret nil;
+    }
     val out: str = json.dup(view, alloc);
     json.buf_dnit(?b);
     ret out;
 }
 
 # the byte offset of an LSP position object within `text`
-fun offset_of_position(text: str, pos: *sj.Value) Option[usize] {
-    if (pos == nil) { ret none[usize](); }
+fun offset_of_position(text: str, pos: *sj.Value) opt[usize] {
+    if (pos == nil) { ret opt[usize].none{}; }
     val line: i64 = json.number(json.member(pos, "line"), -1);
     val ch:   i64 = json.number(json.member(pos, "character"), -1);
-    if (line < 0 || ch < 0) { ret none[usize](); }
+    if (line < 0 || ch < 0) { ret opt[usize].none{}; }
     ret positions.offset_in_text(text, line::usize, ch::usize);
 }

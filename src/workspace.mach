@@ -13,28 +13,26 @@
 # worth considering later.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.unwrap;
 
 use std.allocator.Allocator;
 
-use sess:   mach.lang.session;
-use src:    mach.lang.source;
-use intern: mach.lang.intern;
-use res:    mach.lang.fe.resolve;
-use token:  mach.lang.fe.token;
+use rslv: mach.lang.fe.resolve;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
 
-use json:      mls.json;
-use render:    mls.render;
-use project:   mls.project;
-use features:  mls.features;
-use strutil:   std.text.string;
+use mls.features;
+use mls.json;
+use mls.project;
+use mls.render;
+use strutil: std.text.string;
 
 # most matches returned for one query
 #
@@ -79,15 +77,15 @@ pub fun symbols(ws: *project.Workspace, alloc: *Allocator, id_raw: str, query: s
 
 # append every matching symbol declared in `root`, returning the new count
 fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
-                      query: str, tier: u8, start_count: usize) usize {
+    query: str, tier: u8, start_count: usize) usize {
     var emitted: usize = start_count;
-    val n: u32 = project.module_count(root);
-    var mi: u32 = 0;
+    val n:       u32   = project.module_count(root);
+    var mi:      u32   = 0;
     for (mi < n && emitted < MAX_RESULTS) {
-        val mid: sess.ModuleId = mi::sess.ModuleId;
-        val mvo: Option[project.ModuleView] = project.module_view(ws, root, mid);
-        if (is_some[project.ModuleView](mvo)) {
-            val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
+        val mid: sess.ModuleId           = mi::sess.ModuleId;
+        val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
+        if (sel mvo.some) {
+            val mv: project.ModuleView = mvo.some;
             if (mv.rr != nil && mv.a != nil) {
                 val uri: str = project.module_uri(ws, root, mid);
                 if (uri != nil) {
@@ -104,24 +102,24 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
 
 # append every matching symbol `mid` declares, returning the new count
 fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
-                        mid: sess.ModuleId, mv: project.ModuleView, uri: str, fqn: str,
-                        query: str, tier: u8, start_count: usize) usize {
+    mid: sess.ModuleId, mv: project.ModuleView, uri: str, fqn: str,
+    query: str, tier: u8, start_count: usize) usize {
     var emitted: usize = start_count;
-    var i: u32 = 0;
+    var i:       u32   = 0;
     for (i < mv.rr.symbol_count && emitted < MAX_RESULTS) {
-        val sym: *res.Symbol = ?mv.rr.symbols[i];
+        val sym: *rslv.Symbol = ?mv.rr.symbols[i];
         # only declarations this module owns: an imported symbol is reported by
         # the module that declares it, so a name appears once per declaration
         # rather than once per importer
         if (sym.origin == mid && features.completion_candidate(mv.rr, i)) {
-            val no: Option[str] = intern.lookup(?root.s.interner, sym.name);
-            if (is_some[str](no)) {
-                val name: str = unwrap[str](no);
+            val no: opt[str] = intern.lookup(?root.s.interner, sym.name);
+            if (sel no.some) {
+                val name: str = no.some;
                 if (match_tier(query, name) == tier) {
-                    val spo: Option[token.Span] = features.decl_name_span_of(mv.a, sym);
-                    if (is_some[token.Span](spo)) {
-                        push_symbol(b, mv.text.file, uri, unwrap[token.Span](spo), name,
-                                    features.lsp_symbol_kind(sym.kind), fqn, emitted > 0);
+                    val spo: opt[token.Span] = features.decl_name_span_of(mv.a, sym);
+                    if (sel spo.some) {
+                        push_symbol(b, mv.text.file, uri, spo.some, name,
+                            features.lsp_symbol_kind(sym.kind), fqn, emitted > 0);
                         emitted = emitted + 1;
                     }
                 }
@@ -138,7 +136,7 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
 # identically-named symbols distinguishable - and roots with colliding FQNs are
 # explicitly supported, so this is not cosmetic.
 fun push_symbol(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span,
-                name: str, kind: i64, container: str, comma: bool) {
+    name: str, kind: i64, container: str, comma: bool) {
     if (comma) { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"name\":");
     json.buf_push_quoted(b, name);
@@ -170,14 +168,14 @@ fun match_tier(query: str, name: str) u8 {
     if (qn == 0 || qn > nn) { ret MATCH_NONE; }
     var start: usize = 0;
     for (start + qn <= nn) {
-        var i: usize = 0;
-        var same: bool = true;
+        var i:    usize = 0;
+        var same: bool  = true;
         for (i < qn && same) {
             if (lower(name[start + i]) != lower(query[i])) { same = false; }
             i = i + 1;
         }
         if (same) {
-            if (start == 0) { ret MATCH_PREFIX; }
+            if (start == 0)             { ret MATCH_PREFIX; }
             if (name[start - 1] == '_') { ret MATCH_WORD; }
             ret MATCH_INTERIOR;
         }
@@ -194,16 +192,16 @@ fun lower(c: u8) u8 {
 
 test "workspace: match rank prefers leading over interior hits" {
     var fail: bool = false;
-    if (match_tier("json", "json_buf_push") != MATCH_PREFIX)   { fail = true; }
-    if (match_tier("JSON", "json_buf_push") != MATCH_PREFIX)   { fail = true; }
-    if (match_tier("buf",  "json_buf_push") != MATCH_WORD)     { fail = true; }
-    if (match_tier("push", "json_buf_push") != MATCH_WORD)     { fail = true; }
-    if (match_tier("uf",   "json_buf_push") != MATCH_INTERIOR) { fail = true; }
+    if (match_tier("json", "json_buf_push") != MATCH_PREFIX) { fail = true; }
+    if (match_tier("JSON", "json_buf_push") != MATCH_PREFIX) { fail = true; }
+    if (match_tier("buf", "json_buf_push") != MATCH_WORD)    { fail = true; }
+    if (match_tier("push", "json_buf_push") != MATCH_WORD)   { fail = true; }
+    if (match_tier("uf", "json_buf_push") != MATCH_INTERIOR) { fail = true; }
     # the case that made raw substring matching noisy
     if (match_tier("read_", "thread_spawn") != MATCH_INTERIOR) { fail = true; }
-    if (match_tier("zzz", "json_buf_push")  != MATCH_NONE)     { fail = true; }
-    if (match_tier("", "anything")          != MATCH_NONE)     { fail = true; }
-    if (match_tier("toolong", "short")      != MATCH_NONE)     { fail = true; }
-    if (fail) { ret 1; }
+    if (match_tier("zzz", "json_buf_push") != MATCH_NONE)      { fail = true; }
+    if (match_tier("", "anything") != MATCH_NONE)              { fail = true; }
+    if (match_tier("toolong", "short") != MATCH_NONE)          { fail = true; }
+    if (fail)                                                  { ret 1; }
     ret 0;
 }
