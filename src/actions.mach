@@ -18,29 +18,29 @@
 # separate actions, because those are a choice a person makes.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
-use std.types.option.opt;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 
-use sess:  mach.lang.session;
-use src:   mach.lang.source;
-use diag:  mach.lang.diagnostic;
-use token: mach.lang.fe.token;
-use editor: mach.lang.editor;
-use sj:    std.data.json;
+use diag: mach.lang.diagnostic;
+use mach.lang.editor;
+use mach.lang.fe.token;
+use sess:    mach.lang.session;
+use src:     mach.lang.source;
+use sj:      std.data.json;
 use strutil: std.text.string;
 
-use json:      mls.json;
-use render:    mls.render;
-use project:   mls.project;
-use positions: mls.positions;
-use documents: mls.documents;
+use mls.documents;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.render;
 
 # LSP CodeActionKind.QuickFix, spelled as the protocol spells it
 val KIND_QUICKFIX: str = "quickfix";
@@ -51,34 +51,52 @@ val KIND_QUICKFIX: str = "quickfix";
 # and publishes nothing, which is the invariant #142 established for this
 # server - what the editor shows must not depend on what was asked for.
 pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
-                     docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
-    if (uri == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (uri == nil) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     val d: *documents.Document = documents.find(docs, uri);
-    if (d == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (d == nil) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     val vr: res[project.DocumentView, str] = project.document_view(ws, d);
-    if (sel vr.err) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (sel vr.err) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
     val v: project.DocumentView = vr.ok;
-    val s: *sess.Session = project.root_session(v.root);
-    if (s == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+    val s: *sess.Session        = project.root_session(v.root);
+    if (s == nil) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     var lo: usize = 0;
     var hi: usize = 0;
-    if (!request_range(params, v.text, ?lo, ?hi)) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (!request_range(params, v.text, ?lo, ?hi)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     # a client may ask for only certain kinds; this server offers quickfix alone,
     # so a filter that excludes it excludes everything
-    if (!wants_quickfix(params, alloc)) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (!wants_quickfix(params, alloc)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push_byte(?b, '[');
 
     var emitted: usize = 0;
-    var i: usize = 0;
+    var i:       usize = 0;
     for (i < s.diags.items.len) {
         val dg: *diag.Diagnostic = ?s.diags.items.data[i];
         if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
@@ -86,7 +104,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
             for (f < dg.fixes.len) {
                 push_action(?b, ws, alloc, ?s.sources, v.text.file, uri, dg, ?dg.fixes.data[f], emitted > 0);
                 emitted = emitted + 1;
-                f = f + 1;
+                f       = f + 1;
             }
         }
         i = i + 1;
@@ -101,7 +119,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 # The originating diagnostic rides along so a client can associate the action
 # with the squiggle it is offered under, and so applying it can clear that entry.
 fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-                file: *src.SourceFile, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) {
+    file: *src.SourceFile, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) {
     if (comma) { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"title\":");
     json.buf_push_quoted(b, fix.label);
@@ -129,12 +147,12 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
 # without a lookup; an edit naming another file resolves its own URI through the
 # source map rather than being silently dropped into the wrong document.
 fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-               file: *src.SourceFile, uri: str, fix: *diag.Fix) {
-    var wrote_group: bool = false;
-    var e: usize = 0;
+    file: *src.SourceFile, uri: str, fix: *diag.Fix) {
+    var wrote_group: bool  = false;
+    var e:           usize = 0;
     for (e < fix.edits.len) {
-        val ed: *diag.Edit = ?fix.edits.data[e];
-        val same: bool = edit_file(sources, ed) == file;
+        val ed:   *diag.Edit = ?fix.edits.data[e];
+        val same: bool       = edit_file(sources, ed) == file;
         if (same) {
             if (!wrote_group) {
                 json.buf_push_quoted(b, uri);
@@ -164,10 +182,10 @@ fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
 # offered even though nothing is selected.
 fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
     val start: usize = span.offset;
-    var end: usize = span.offset + span.len;
+    var end:   usize = span.offset + span.len;
     if (span.len == 0) { end = start; }
-    if (end < lo) { ret false; }
-    if (start > hi) { ret false; }
+    if (end < lo)      { ret false; }
+    if (start > hi)    { ret false; }
     ret true;
 }
 
@@ -186,9 +204,9 @@ fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usiz
 }
 
 fun offset_of(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
-    val p: *sj.Value = json.member(rng, key);
-    val line: i64 = json.number(json.member(p, "line"), -1);
-    val ch:   i64 = json.number(json.member(p, "character"), -1);
+    val p:    *sj.Value = json.member(rng, key);
+    val line: i64       = json.number(json.member(p, "line"), -1);
+    val ch:   i64       = json.number(json.member(p, "character"), -1);
     if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
     ret positions.offset_at(file, line::usize, ch::usize);
 }
@@ -199,7 +217,7 @@ fun offset_of(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
 # (or a prefix of it) means the client wants refactors or source actions, which
 # this server does not offer.
 fun wants_quickfix(params: *sj.Value, alloc: *Allocator) bool {
-    val ctx: *sj.Value = json.member(params, "context");
+    val ctx:  *sj.Value = json.member(params, "context");
     val only: *sj.Value = json.member(ctx, "only");
     if (only == nil) { ret true; }
     val n: usize = json.count(only);

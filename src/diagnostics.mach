@@ -8,30 +8,30 @@
 # clearing is the same notification with an empty array.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
-use std.types.result.res;
-use std.types.option.opt;
 
 use std.allocator.Allocator;
+use std.collections.vector;
 use std.collections.vector.Vector;
-use vector: std.collections.vector;
 
-use page: std.allocator.page;
+use std.allocator.page;
 
-use src:    mach.lang.source;
-use diag:   mach.lang.diagnostic;
-use editor: mach.lang.editor;
-use outcome: mach.lang.build.outcome;
+use mach.lang.build.outcome;
+use diag: mach.lang.diagnostic;
+use mach.lang.editor;
+use src: mach.lang.source;
 
-use transport: mls.transport;
-use json:      mls.json;
-use positions: mls.positions;
-use project:   mls.project;
-use documents: mls.documents;
+use mls.documents;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.transport;
 
 # LSP diagnostic severities (1 = Error ... 4 = Hint)
 val LSP_ERROR:   i64 = 1;
@@ -63,29 +63,29 @@ val MAX_DIAGNOSTICS: usize = 200;
 # alloc: message allocator
 # d:     live document and version
 pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, d: *documents.Document) {
-    var list: *diag.DiagnosticStore = nil;
+    var list:   *diag.DiagnosticStore = nil;
     var result: editor.AnalysisResult = editor.AnalysisResult{};
     result.alloc = nil;
-    var sources: *src.SourceMap = nil;
-    var own: src.FileId = d.file_id;
-    val vr: res[project.DocumentView, str] = project.document_view(w, d);
+    var sources: *src.SourceMap                 = nil;
+    var own:     src.FileId                     = d.file_id;
+    val vr:      res[project.DocumentView, str] = project.document_view(w, d);
     if (sel vr.ok) {
         val v: project.DocumentView = vr.ok;
-        list = ?v.root.s.diags;
+        list    = ?v.root.s.diags;
         sources = ?v.root.s.sources;
-        own = v.file_id;
+        own     = v.file_id;
     }
     or {
-        var req: editor.AnalysisRequest = editor.analysis_request(d.file_id, editor.PHASE_SEMA);
-        val ar: res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
+        var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, editor.PHASE_SEMA);
+        val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
         if (sel ar.err) {
             var f: outcome.Fail = ar.err;
             editor.fail_dnit(es, ?f);
             clear(alloc, d.uri);
             ret;
         }
-        result = ar.ok;
-        list = result.diagnostics;
+        result  = ar.ok;
+        list    = result.diagnostics;
         sources = ?es.s.sources;
     }
 
@@ -97,7 +97,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         json.buf_push_i64(?b, d.version);
     }
     json.buf_push(?b, ",\"diagnostics\":[");
-    var i: usize = 0;
+    var i:       usize = 0;
     var written: usize = 0;
     for (i < list.items.len && written < MAX_DIAGNOSTICS) {
         if (list.items.data[i].loc.file_id == own) {
@@ -162,8 +162,8 @@ fun push_range(b: *json.Buf, sources: *src.SourceMap, loc: *diag.Location) {
 
     val so: opt[*src.SourceFile] = src.get(sources, loc.file_id);
     if (sel so.some) {
-        val sf: *src.SourceFile = so.some;
-        val r: positions.LspRange = positions.range_of(sf, loc.span);
+        val sf: *src.SourceFile    = so.some;
+        val r:  positions.LspRange = positions.range_of(sf, loc.span);
         start_line = r.start_line;
         start_char = r.start_char;
         end_line   = r.end_line;
@@ -203,7 +203,7 @@ fun push_message(b: *json.Buf, d: *diag.Diagnostic) {
     }
     val text: str = json.buf_str(?m);
     if (text != nil) { json.buf_push_quoted(b, text); }
-    or             { json.buf_push_quoted(b, d.message); }
+    or               { json.buf_push_quoted(b, d.message); }
     json.buf_dnit(?m);
 }
 
@@ -217,13 +217,13 @@ fun push_related(b: *json.Buf, sources: *src.SourceMap, d: *diag.Diagnostic, all
     if (d.related.len == 0) { ret; }
 
     var written: usize = 0;
-    var r: usize = 0;
+    var r:       usize = 0;
     for (r < d.related.len) {
-        val rel: *diag.Related = ?d.related.data[r];
-        val so: opt[*src.SourceFile] = src.get(sources, rel.loc.file_id);
+        val rel: *diag.Related        = ?d.related.data[r];
+        val so:  opt[*src.SourceFile] = src.get(sources, rel.loc.file_id);
         if (sel so.some) {
             val sf: *src.SourceFile = so.some;
-            val u: str = project.uri_of_path(alloc, sf.path);
+            val u:  str             = project.uri_of_path(alloc, sf.path);
             if (u != nil) {
                 if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
                 or                { json.buf_push_byte(b, ','); }
@@ -288,7 +288,7 @@ fun stub_related(items: *diag.Related, n: usize) Vector[diag.Related] {
 test "diagnostics: a diagnostic with no note or help renders its message alone" {
     var pa: Allocator;
     page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
+    var b: json.Buf        = json.buf_init(?pa);
     var d: diag.Diagnostic = stub_diag("unresolved identifier `x`");
     push_message(?b, ?d);
 
@@ -304,14 +304,14 @@ test "diagnostics: a diagnostic with no note or help renders its message alone" 
 test "diagnostics: note and help ride the message as trailing lines" {
     var pa: Allocator;
     page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
-    var d: diag.Diagnostic = stub_diag("type mismatch");
+    var b:    json.Buf        = json.buf_init(?pa);
+    var d:    diag.Diagnostic = stub_diag("type mismatch");
     var kids: [2]diag.Child;
     kids[0].kind = diag.CHILD_NOTE;
     kids[0].text = "expected i32";
     kids[1].kind = diag.CHILD_HELP;
     kids[1].text = "cast with `v::i32`";
-    d.children = stub_children(?kids[0], 2);
+    d.children   = stub_children(?kids[0], 2);
     push_message(?b, ?d);
 
     var fail: bool = false;
@@ -325,12 +325,12 @@ test "diagnostics: note and help ride the message as trailing lines" {
 test "diagnostics: help alone still renders, without an empty note line" {
     var pa: Allocator;
     page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
-    var d: diag.Diagnostic = stub_diag("unknown key");
+    var b:    json.Buf        = json.buf_init(?pa);
+    var d:    diag.Diagnostic = stub_diag("unknown key");
     var kids: [1]diag.Child;
     kids[0].kind = diag.CHILD_HELP;
     kids[0].text = "did you mean `simd`?";
-    d.children = stub_children(?kids[0], 1);
+    d.children   = stub_children(?kids[0], 1);
     push_message(?b, ?d);
 
     var fail: bool = false;
@@ -343,9 +343,9 @@ test "diagnostics: help alone still renders, without an empty note line" {
 test "diagnostics: no secondary locations emits no relatedInformation key" {
     var pa: Allocator;
     page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
+    var b: json.Buf        = json.buf_init(?pa);
     var d: diag.Diagnostic = stub_diag("duplicate definition");
-    var m: src.SourceMap = stub_map(nil, 0);
+    var m: src.SourceMap   = stub_map(nil, 0);
     push_related(?b, ?m, ?d, ?pa);
 
     var fail: bool = false;

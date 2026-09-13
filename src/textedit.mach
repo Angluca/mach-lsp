@@ -13,19 +13,19 @@
 # base string is all the input there is.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
 
 use std.allocator.Allocator;
 
 use sj: std.data.json;
 
-use json:      mls.json;
-use positions: mls.positions;
+use mls.json;
+use mls.positions;
 
 # `base` with every change in `changes` applied, as owned text
 #
@@ -47,13 +47,13 @@ use positions: mls.positions;
 pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize) str {
     if (base == nil) { ret nil; }
 
-    var current: str = nil;
-    var owned: bool = false;
-    var i: usize = 0;
+    var current: str   = nil;
+    var owned:   bool  = false;
+    var i:       usize = 0;
     for (i < n) {
         val change: *sj.Value = json.element(changes, i);
-        val whole: *sj.Value = json.member(change, "range");
-        val piece: str = json.text(json.member(change, "text"), alloc);
+        val whole:  *sj.Value = json.member(change, "range");
+        val piece:  str       = json.text(json.member(change, "text"), alloc);
         if (piece == nil) {
             if (owned) { json.free_str(current, alloc); }
             ret nil;
@@ -63,17 +63,17 @@ pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize
             # a full-document change discards everything before it
             if (owned) { json.free_str(current, alloc); }
             current = piece;
-            owned = true;
+            owned   = true;
         }
         or {
             var from: str = current;
             if (!owned) { from = base; }
             val next: str = splice(alloc, from, whole, piece);
             json.free_str(piece, alloc);
-            if (owned) { json.free_str(current, alloc); }
+            if (owned)       { json.free_str(current, alloc); }
             if (next == nil) { ret nil; }
             current = next;
-            owned = true;
+            owned   = true;
         }
         i = i + 1;
     }
@@ -102,7 +102,10 @@ pub fun splice(alloc: *Allocator, from: str, range: *sj.Value, piece: str) str {
     json.buf_push(?b, piece);
     json.buf_push_range(?b, from, hi, str_len(from));
     val view: str = json.buf_str(?b);
-    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    if (view == nil) {
+        json.buf_dnit(?b);
+        ret nil;
+    }
     val out: str = json.dup(view, alloc);
     json.buf_dnit(?b);
     ret out;

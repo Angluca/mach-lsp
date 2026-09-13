@@ -14,40 +14,40 @@
 # expressions, types, and import paths independently and in no particular order.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
-use sort: std.collections.sort;
+use std.collections.sort;
 
-use src:   mach.lang.source;
-use token: mach.lang.fe.token;
-use ast:   mach.lang.fe.ast;
-use id:    mach.lang.fe.ast.id;
-use decl:  mach.lang.fe.ast.decl;
-use rslv:   mach.lang.fe.resolve;
-use editor: mach.lang.editor;
-use sj:    std.data.json;
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.id;
+use rslv: mach.lang.fe.resolve;
+use mach.lang.fe.token;
+use src: mach.lang.source;
+use sj:  std.data.json;
 
-use json:      mls.json;
-use render:    mls.render;
-use project:   mls.project;
-use features:  mls.features;
-use positions: mls.positions;
-use documents: mls.documents;
-use analysis:  mls.analysis;
+use mls.analysis;
+use mls.documents;
+use mls.features;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.render;
 
-use allocator: std.allocator;
+use std.allocator;
 # the legend, in the order the client is told about it at initialize. an index
 # into this list is what a token's `tokenType` field carries
-pub val TOKEN_TYPES: str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\"";
+pub val TOKEN_TYPES:     str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\"";
 pub val TOKEN_MODIFIERS: str = "\"declaration\",\"readonly\"";
 
 val T_NAMESPACE:      i64 = 0;
@@ -75,15 +75,21 @@ rec Tok {
 
 # answer textDocument/semanticTokens/full
 pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
-                        docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: analysis.Analyzed;
-    if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty(alloc, id_raw); ret; }
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) {
+        reply_empty(alloc, id_raw);
+        ret;
+    }
 
     val ta: res[*Tok, allocator.Error] = allocate[Tok](alloc, MAX_TOKENS);
-    if (sel ta.err) { reply_empty(alloc, id_raw); ret; }
+    if (sel ta.err) {
+        reply_empty(alloc, id_raw);
+        ret;
+    }
     val toks: *Tok = ta.ok;
 
     var n: usize = collect(an, toks, MAX_TOKENS);
@@ -115,11 +121,11 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
     for (di < an.a.decl_len && n < cap) {
         val d_opt: opt[*decl.Decl] = ast.get_decl(an.a, di::id.DeclId);
         if (sel d_opt.some) {
-            val d: *decl.Decl = d_opt.some;
+            val d:   *decl.Decl      = d_opt.some;
             val nso: opt[token.Span] = features.decl_name_span(d);
             if (sel nso.some) {
                 n = push(out, n, cap, nso.some,
-                         decl_token_type(d.kind), M_DECLARATION);
+                    decl_token_type(d.kind), M_DECLARATION);
             }
             n = collect_members(an, d, out, n, cap);
         }
@@ -130,7 +136,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
     for (ei < an.a.expr_len && n < cap) {
         val so: opt[rslv.SymbolId] = expr_symbol(an, ei::id.ExprId);
         if (sel so.some) {
-            val sid: rslv.SymbolId = so.some;
+            val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
             if (sel spo.some) {
                 n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
@@ -143,7 +149,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
     for (ti < an.a.type_len && n < cap) {
         val so: opt[rslv.SymbolId] = type_symbol(an, ti::id.TypeId);
         if (sel so.some) {
-            val sid: rslv.SymbolId = so.some;
+            val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
             if (sel spo.some) {
                 n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
@@ -158,24 +164,30 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 # a declaration's own members: record fields, union variants, parameters, and
 # generic parameters, which no side table records as references
 fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usize, cap: usize) usize {
-    var n: usize = count;
-    var fields_start: u32 = 0;
-    var fields_len:   u32 = 0;
-    var gen_start:    u32 = 0;
-    var gen_len:      u32 = 0;
-    var member_type:  i64 = T_PROPERTY;
+    var n:            usize = count;
+    var fields_start: u32   = 0;
+    var fields_len:   u32   = 0;
+    var gen_start:    u32   = 0;
+    var gen_len:      u32   = 0;
+    var member_type:  i64   = T_PROPERTY;
 
     if (d.kind == decl.DECL_KIND_REC) {
-        fields_start = d.data.rec_.fields_start; fields_len = d.data.rec_.fields_len;
-        gen_start = d.data.rec_.generics_start;  gen_len   = d.data.rec_.generics_len;
+        fields_start = d.data.rec_.fields_start;
+        fields_len   = d.data.rec_.fields_len;
+        gen_start    = d.data.rec_.generics_start;
+        gen_len      = d.data.rec_.generics_len;
     }
     or (d.kind == decl.DECL_KIND_UNI) {
-        fields_start = d.data.uni_.fields_start; fields_len = d.data.uni_.fields_len;
-        gen_start = d.data.uni_.generics_start;  gen_len   = d.data.uni_.generics_len;
+        fields_start = d.data.uni_.fields_start;
+        fields_len   = d.data.uni_.fields_len;
+        gen_start    = d.data.uni_.generics_start;
+        gen_len      = d.data.uni_.generics_len;
     }
     or (d.kind == decl.DECL_KIND_FUN) {
-        fields_start = d.data.fun_.params_start; fields_len = d.data.fun_.params_len;
-        gen_start = d.data.fun_.generics_start;  gen_len   = d.data.fun_.generics_len;
+        fields_start = d.data.fun_.params_start;
+        fields_len   = d.data.fun_.params_len;
+        gen_start    = d.data.fun_.generics_start;
+        gen_len      = d.data.fun_.generics_len;
         member_type  = T_PARAMETER;
     }
     or { ret n; }
@@ -184,7 +196,7 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     for (g < gen_len && n < cap) {
         if (an.a.generic_names != nil) {
             n = push(out, n, cap, an.a.generic_names[(gen_start + g)::usize],
-                     T_TYPE_PARAMETER, M_DECLARATION);
+                T_TYPE_PARAMETER, M_DECLARATION);
         }
         g = g + 1;
     }
@@ -213,8 +225,13 @@ fun type_symbol(an: analysis.Analyzed, tid: id.TypeId) opt[rslv.SymbolId] {
     ret some_sym(sid);
 }
 
-fun some_sym(s: rslv.SymbolId) opt[rslv.SymbolId] { ret opt[rslv.SymbolId].some{s}; }
-fun none_sym() opt[rslv.SymbolId] { ret opt[rslv.SymbolId].none{}; }
+fun some_sym(s: rslv.SymbolId) opt[rslv.SymbolId] {
+    ret opt[rslv.SymbolId].some{s};
+}
+
+fun none_sym() opt[rslv.SymbolId] {
+    ret opt[rslv.SymbolId].none{};
+}
 
 # the legend index for a resolved symbol
 fun symbol_token_type(an: analysis.Analyzed, sid: rslv.SymbolId) i64 {
@@ -268,7 +285,7 @@ fun drop_overlaps(toks: *Tok, n: usize) usize {
         val prev_end: usize = toks[w - 1].offset + toks[w - 1].len;
         if (toks[i].offset >= prev_end) {
             toks[w] = toks[i];
-            w = w + 1;
+            w       = w + 1;
         }
         i = i + 1;
     }
@@ -282,7 +299,7 @@ fun drop_overlaps(toks: *Tok, n: usize) usize {
 fun encode(b: *json.Buf, file: *src.SourceFile, toks: *Tok, n: usize) {
     var prev_line: usize = 0;
     var prev_char: usize = 0;
-    var i: usize = 0;
+    var i:         usize = 0;
     for (i < n) {
         var span: token.Span;
         span.offset = toks[i].offset;

@@ -17,22 +17,22 @@
 # value sleeps until someone bumps it.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 
-use mem:    std.memory;
-use os:     std.system.os;
-use atomic: std.sync.atomic;
-use mutex:  std.sync.mutex;
-use thread: std.sync.thread;
+use mem: std.memory;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
 
 # what the worker does with one dequeued body
 #
@@ -129,7 +129,7 @@ pub fun init(q: *Queue, alloc: *Allocator) bool {
     for (i < q.cap) {
         q.jobs[i].body = nil;
         q.jobs[i].len  = 0;
-        i = i + 1;
+        i              = i + 1;
     }
     ret true;
 }
@@ -180,7 +180,7 @@ pub fun push(q: *Queue, body: str, len: usize) bool {
     val slot: usize = (q.head + q.count) % q.cap;
     q.jobs[slot].body = copy::str;
     q.jobs[slot].len  = len;
-    q.count = q.count + 1;
+    q.count           = q.count + 1;
     atomic.store(?q.seq, atomic.load(?q.seq) + 1);
     mutex.unlock(?q.lock);
 
@@ -211,7 +211,7 @@ pub fun join(q: *Queue) {
 
 # release the ring and any body still queued
 pub fun dnit(q: *Queue) {
-    if (q.live) { join(q); }
+    if (q.live)        { join(q); }
     if (q.jobs == nil) { ret; }
     var i: usize = 0;
     for (i < q.count) {
@@ -257,11 +257,11 @@ fun pop_blocking(q: *Queue, out: *Job) bool {
 
         mutex.lock(?q.lock);
         if (q.count > 0) {
-            @out = q.jobs[q.head];
+            @out                = q.jobs[q.head];
             q.jobs[q.head].body = nil;
             q.jobs[q.head].len  = 0;
-            q.head  = (q.head + 1) % q.cap;
-            q.count = q.count - 1;
+            q.head              = (q.head + 1) % q.cap;
+            q.count             = q.count - 1;
             mutex.unlock(?q.lock);
             ret true;
         }
@@ -283,15 +283,15 @@ fun worker_main(arg: *u8) {
         j.body = nil;
         j.len  = 0;
         if (!pop_blocking(q, ?j)) { brk; }
-        if (j.body != nil) { b.f(b.fx, j.body, j.len); }
+        if (j.body != nil)        { b.f(b.fx, j.body, j.len); }
         free_job(q, ?j);
     }
 }
 
-use page: std.allocator.page;
+use std.allocator.page;
 use std.types.string.str_equals;
 
-use allocator: std.allocator;
+use std.allocator;
 # the queue's contract is that every accepted body reaches the callback exactly
 # once and in push order, so the tests assert the sequence rather than a count
 
@@ -302,7 +302,7 @@ var SEEN_SUM: i64 = 0;
 fun record(ctx: ptr, body: str, len: usize) {
     if (SEEN_LEN < 64) {
         SEEN[SEEN_LEN::usize] = body[0];
-        SEEN_LEN = SEEN_LEN + 1;
+        SEEN_LEN              = SEEN_LEN + 1;
     }
     SEEN_SUM = SEEN_SUM + len::i64;
 }
@@ -314,15 +314,27 @@ test "jobs: every pushed body reaches the worker once, in order" {
     if (!init(?q, ?pa)) { ret 1; }
     SEEN_LEN = 0;
     SEEN_SUM = 0;
-    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+    if (!start(?q, record, nil)) {
+        dnit(?q);
+        ret 1;
+    }
 
-    if (!push(?q, "a1", 2)) { dnit(?q); ret 1; }
-    if (!push(?q, "b22", 3)) { dnit(?q); ret 1; }
-    if (!push(?q, "c333", 4)) { dnit(?q); ret 1; }
+    if (!push(?q, "a1", 2)) {
+        dnit(?q);
+        ret 1;
+    }
+    if (!push(?q, "b22", 3)) {
+        dnit(?q);
+        ret 1;
+    }
+    if (!push(?q, "c333", 4)) {
+        dnit(?q);
+        ret 1;
+    }
     join(?q);
 
     var fail: bool = false;
-    if (SEEN_LEN != 3)   { fail = true; }
+    if (SEEN_LEN != 3) { fail = true; }
     or {
         if (SEEN[0] != 'a') { fail = true; }
         if (SEEN[1] != 'b') { fail = true; }
@@ -342,7 +354,10 @@ test "jobs: an idle worker joins without any job" {
     var q: Queue;
     if (!init(?q, ?pa)) { ret 1; }
     SEEN_LEN = 0;
-    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+    if (!start(?q, record, nil)) {
+        dnit(?q);
+        ret 1;
+    }
     join(?q);
     var fail: bool = false;
     if (SEEN_LEN != 0) { fail = true; }
@@ -364,15 +379,23 @@ test "jobs: a pushed body is copied, not borrowed" {
     scratch[0] = 'x';
     scratch[1] = 'y';
     scratch[2] = 0;
-    if (!push(?q, (?scratch[0])::str, 2)) { dnit(?q); ret 1; }
+    if (!push(?q, (?scratch[0])::str, 2)) {
+        dnit(?q);
+        ret 1;
+    }
     scratch[0] = 'z';
 
-    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+    if (!start(?q, record, nil)) {
+        dnit(?q);
+        ret 1;
+    }
     join(?q);
 
     var fail: bool = false;
-    if (SEEN_LEN != 1)  { fail = true; }
-    or { if (SEEN[0] != 'x') { fail = true; } }
+    if (SEEN_LEN != 1) { fail = true; }
+    or {
+        if (SEEN[0] != 'x') { fail = true; }
+    }
     dnit(?q);
     if (fail) { ret 1; }
     ret 0;
@@ -385,8 +408,8 @@ test "jobs: a full queue refuses a push instead of growing" {
     var q: Queue;
     if (!init(?q, ?pa)) { ret 1; }
 
-    var fail: bool = false;
-    var i: usize = 0;
+    var fail: bool  = false;
+    var i:    usize = 0;
     for (i < CAPACITY) {
         if (!push(?q, "j", 1)) { fail = true; }
         i = i + 1;
@@ -449,7 +472,11 @@ pub fun cancels_init(c: *Cancels, alloc: *Allocator) bool {
     c.ids = r.ok;
     c.cap = CANCEL_CAP;
     var i: usize = 0;
-    for (i < c.cap) { c.ids[i].body = nil; c.ids[i].len = 0; i = i + 1; }
+    for (i < c.cap) {
+        c.ids[i].body = nil;
+        c.ids[i].len  = 0;
+        i             = i + 1;
+    }
     ret true;
 }
 
@@ -461,8 +488,8 @@ pub fun cancels_dnit(c: *Cancels) {
         i = i + 1;
     }
     deallocate[Job](c.alloc, c.ids, c.cap);
-    c.ids = nil;
-    c.cap = 0;
+    c.ids   = nil;
+    c.cap   = 0;
     c.count = 0;
 }
 
@@ -473,8 +500,8 @@ pub fun cancels_dnit(c: *Cancels) {
 # ret:      true when recorded; false when full or out of memory
 pub fun cancel_add(c: *Cancels, id_token: str) bool {
     if (id_token == nil || c.ids == nil) { ret false; }
-    val len: usize = str_len(id_token);
-    val r: res[*u8, allocator.Error] = allocate[u8](c.alloc, len + 1);
+    val len: usize                     = str_len(id_token);
+    val r:   res[*u8, allocator.Error] = allocate[u8](c.alloc, len + 1);
     if (sel r.err) { ret false; }
     val copy: *u8 = r.ok;
     if (len > 0) { mem.raw_copy(copy::ptr, id_token::ptr, len); }
@@ -488,7 +515,7 @@ pub fun cancel_add(c: *Cancels, id_token: str) bool {
     }
     c.ids[c.count].body = copy::str;
     c.ids[c.count].len  = len;
-    c.count = c.count + 1;
+    c.count             = c.count + 1;
     mutex.unlock(?c.lock);
     ret true;
 }
@@ -505,10 +532,10 @@ pub fun cancel_take(c: *Cancels, id_token: str) bool {
     for (i < c.count && !found) {
         if (c.ids[i].body != nil && str_equals(c.ids[i].body, id_token)) {
             deallocate[u8](c.alloc, c.ids[i].body::*u8, c.ids[i].len + 1);
-            c.ids[i] = c.ids[c.count - 1];
+            c.ids[i]                = c.ids[c.count - 1];
             c.ids[c.count - 1].body = nil;
-            c.count = c.count - 1;
-            found = true;
+            c.count                 = c.count - 1;
+            found                   = true;
         }
         i = i + 1;
     }

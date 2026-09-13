@@ -11,30 +11,30 @@
 # scope test `root` for nil rather than assuming it.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
-use std.types.size.usize;
-use std.types.string.str;
+use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use sess:   mach.lang.session;
-use src:    mach.lang.source;
-use intern: mach.lang.intern;
-use ast:    mach.lang.fe.ast;
-use rslv:    mach.lang.fe.resolve;
-use sema:   mach.lang.fe.sema;
-use editor: mach.lang.editor;
-use fail:   mach.lang.fail;
-use outcome: mach.lang.build.outcome;
-use sj:     std.data.json;
+use mach.lang.build.outcome;
+use mach.lang.editor;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use rslv: mach.lang.fe.resolve;
+use mach.lang.fe.sema;
+use mach.lang.intern;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
+use sj:   std.data.json;
 
-use json:      mls.json;
-use positions: mls.positions;
-use project:   mls.project;
-use documents: mls.documents;
+use mls.documents;
+use mls.json;
+use mls.positions;
+use mls.project;
 
 # one document's analysis, as a request sees it
 # ---
@@ -90,14 +90,14 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     if (project.has_project(ws, uri)) { ret false; }
 
     if (!standalone(es, doc.file_id, editor.PHASE_SEMA, out)) { ret false; }
-    if (out.rr == nil) { ret false; }
+    if (out.rr == nil)                                        { ret false; }
     val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
     if (sel fo.none) { ret false; }
     out.interner = ?es.s.interner;
-    out.text = positions.text_of(fo.some);
-    out.root = nil;
-    out.own = doc.file_id::sess.ModuleId;
-    out.own_fid = doc.file_id;
+    out.text     = positions.text_of(fo.some);
+    out.root     = nil;
+    out.own      = doc.file_id::sess.ModuleId;
+    out.own_fid  = doc.file_id;
     ret true;
 }
 
@@ -114,18 +114,18 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
 # out:   receives `a`, `rr` and `sr`; a product the phase did not reach is nil
 # ret:   true when the frontend ran; the products may still be nil on a rejected phase
 pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.AnalysisPhase, out: *Analyzed) bool {
-    out.a = nil;
+    out.a  = nil;
     out.rr = nil;
     out.sr = nil;
-    var req: editor.AnalysisRequest = editor.analysis_request(fid, phase);
-    val ar: res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
+    var req: editor.AnalysisRequest                   = editor.analysis_request(fid, phase);
+    val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
     if (sel ar.err) {
         var f: outcome.Fail = ar.err;
         editor.fail_dnit(es, ?f);
         ret false;
     }
-    var result: editor.AnalysisResult = ar.ok;
-    val a: res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
+    var result: editor.AnalysisResult    = ar.ok;
+    val a:      res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
     if (sel a.ok) { out.a = a.ok; }
     if (phase >= editor.PHASE_RESOLVE) {
         val rr: res[*rslv.ResolveResult, fail.Fail] = editor.resolve_of(?result);
@@ -161,7 +161,7 @@ pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.As
 # out:    receives the analysis on success
 # ret:    the cursor's byte offset, or none
 pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store,
-               params: *sj.Value, uri: str, out: *Analyzed) opt[usize] {
+    params: *sj.Value, uri: str, out: *Analyzed) opt[usize] {
     if (!analyze(ws, es, docs, uri, out)) { ret opt[usize].none{}; }
     ret offset_of(params, out.text);
 }
@@ -173,9 +173,9 @@ pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documen
 # t:      the file the position indexes, paired with its length
 # ret:    the byte offset, or none
 pub fun offset_of(params: *sj.Value, t: positions.Text) opt[usize] {
-    val pos: *sj.Value = json.member(params, "position");
-    val line: i64 = json.number(json.member(pos, "line"), -1);
-    val ch:   i64 = json.number(json.member(pos, "character"), -1);
+    val pos:  *sj.Value = json.member(params, "position");
+    val line: i64       = json.number(json.member(pos, "line"), -1);
+    val ch:   i64       = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) { ret opt[usize].none{}; }
     ret positions.offset_at(t, line::usize, ch::usize);
 }

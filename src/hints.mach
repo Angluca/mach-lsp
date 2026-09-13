@@ -19,36 +19,36 @@
 # drives a rebuild.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 
-use sess:     mach.lang.session;
-use src:      mach.lang.source;
-use token:    mach.lang.fe.token;
-use ast:      mach.lang.fe.ast;
-use id:       mach.lang.fe.ast.id;
-use decl:     mach.lang.fe.ast.decl;
-use aexpr:    mach.lang.fe.ast.expr;
-use rslv:      mach.lang.fe.resolve;
-use stmt:     mach.lang.fe.ast.stmt;
-use type:     mach.lang.type;
-use typename: mach.lang.fe.sema.typename;
-use editor:   mach.lang.editor;
-use sj:       std.data.json;
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use aexpr: mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.stmt;
+use rslv: mach.lang.fe.resolve;
+use mach.lang.fe.sema.typename;
+use mach.lang.fe.token;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
+use mach.lang.type;
+use sj: std.data.json;
 
-use json:      mls.json;
-use render:    mls.render;
-use project:   mls.project;
-use positions: mls.positions;
-use documents: mls.documents;
-use analysis:  mls.analysis;
+use mls.analysis;
+use mls.documents;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.render;
 
 # LSP InlayHintKind.Type
 # LSP InlayHintKind.Parameter
@@ -60,12 +60,15 @@ val MAX_HINTS: usize = 512;
 
 # answer textDocument/inlayHint for the requested range
 pub fun inlay_hints(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
-                    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: analysis.Analyzed;
-    if (!analysis.analyze(ws, es, docs, uri, ?an)) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     var lo: usize = 0;
     var hi: usize = an.text.len;
@@ -74,17 +77,20 @@ pub fun inlay_hints(ws: *project.Workspace, es: *editor.EditorSession, alloc: *A
     # a hint needs both the inferred type and a session to render it against;
     # a standalone buffer has neither in a form this can use
     val s: *sess.Session = session_of(an);
-    if (an.sr == nil || s == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (an.sr == nil || s == nil) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
 
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push_byte(?b, '[');
 
     var emitted: usize = 0;
-    var ei: usize = 0;
+    var ei:      usize = 0;
     for (ei < an.a.expr_len && emitted < MAX_HINTS) {
         emitted = push_call_hints(?b, ws, an, uri, ei::id.ExprId, lo, hi, emitted, alloc);
-        ei = ei + 1;
+        ei      = ei + 1;
     }
 
     json.buf_push_byte(?b, ']');
@@ -99,7 +105,7 @@ fun session_of(an: analysis.Analyzed) *sess.Session {
 
 # append a parameter-name hint for each argument of the call at `eid`
 fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed, uri: str,
-                    eid: id.ExprId, lo: usize, hi: usize, count: usize, alloc: *Allocator) usize {
+    eid: id.ExprId, lo: usize, hi: usize, count: usize, alloc: *Allocator) usize {
     val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, eid);
     if (sel eo.none) { ret count; }
     val e: *aexpr.Expr = eo.some;
@@ -111,8 +117,8 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     # through the same pivot definition uses
     val d_opt: opt[*decl.Decl] = callee_decl(ws, an, uri, e.data.call.callee);
     if (sel d_opt.none) { ret count; }
-    val d: *decl.Decl = d_opt.some;
-    val site_a: *ast.Ast = callee_ast(ws, an, uri, e.data.call.callee);
+    val d:      *decl.Decl     = d_opt.some;
+    val site_a: *ast.Ast       = callee_ast(ws, an, uri, e.data.call.callee);
     val site_f: positions.Text = callee_file(ws, an, uri, e.data.call.callee);
     if (site_a == nil || site_f.file == nil) { ret count; }
 
@@ -121,10 +127,10 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     if (d.data.fun_.params_len < 2) { ret count; }
 
     var emitted: usize = count;
-    var i: u32 = 0;
+    var i:       u32   = 0;
     for (i < nargs && i < d.data.fun_.params_len && emitted < MAX_HINTS) {
-        val arg: id.ExprId = an.a.expr_ids[(e.data.call.args_start + i)::usize];
-        val ao: opt[*aexpr.Expr] = ast.get_expr(an.a, arg);
+        val arg: id.ExprId        = an.a.expr_ids[(e.data.call.args_start + i)::usize];
+        val ao:  opt[*aexpr.Expr] = ast.get_expr(an.a, arg);
         if (sel ao.some) {
             val at: usize = ao.some.span.offset;
             if (at >= lo && at <= hi && wants_hint(ao.some)) {
@@ -147,13 +153,13 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
 fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) opt[*decl.Decl] {
     val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
     if (sel so.none) { ret opt[*decl.Decl].none{}; }
-    val sym: *rslv.Symbol = so.some;
+    val sym:    *rslv.Symbol      = so.some;
     val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
     if (sel site_o.none) { ret opt[*decl.Decl].none{}; }
-    var site: project.Site = site_o.some;
-    val d: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
+    var site: project.Site    = site_o.some;
+    val d:    opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
     project.free_site(ws, ?site);
-    if (sel d.none) { ret opt[*decl.Decl].none{}; }
+    if (sel d.none)                        { ret opt[*decl.Decl].none{}; }
     if (d.some.kind != decl.DECL_KIND_FUN) { ret opt[*decl.Decl].none{}; }
     ret d;
 }
@@ -166,28 +172,28 @@ fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: 
         project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
     if (sel site_o.none) { ret nil; }
     var site: project.Site = site_o.some;
-    val a: *ast.Ast = site.a;
+    val a:    *ast.Ast     = site.a;
     project.free_site(ws, ?site);
     ret a;
 }
 
 # the source file backing the callee's declaration
 fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) positions.Text {
-    var empty: positions.Text = positions.text_of(nil);
-    val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
+    var empty: positions.Text    = positions.text_of(nil);
+    val so:    opt[*rslv.Symbol] = callee_symbol(an, callee);
     if (sel so.none) { ret empty; }
     val site_o: opt[project.Site] =
         project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
     if (sel site_o.none) { ret empty; }
-    var site: project.Site = site_o.some;
-    val f: positions.Text = site.text;
+    var site: project.Site   = site_o.some;
+    val f:    positions.Text = site.text;
     project.free_site(ws, ?site);
     ret f;
 }
 
 # the symbol the callee expression binds
 fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) opt[*rslv.Symbol] {
-    if (an.rr == nil || an.rr.expr_resolved == nil) { ret opt[*rslv.Symbol].none{}; }
+    if (an.rr == nil || an.rr.expr_resolved == nil)               { ret opt[*rslv.Symbol].none{}; }
     if (callee == id.EXPR_NIL || callee::u32 >= an.rr.expr_count) { ret opt[*rslv.Symbol].none{}; }
     val sid: rslv.SymbolId = an.rr.expr_resolved[callee];
     if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
@@ -255,7 +261,7 @@ fun push_hint(b: *json.Buf, file: *src.SourceFile, offset: usize, text: str, com
 
 # whether the renderer produced a placeholder rather than a spelling
 fun is_placeholder(text: str) bool {
-    if (text == nil) { ret true; }
+    if (text == nil)        { ret true; }
     if (str_len(text) == 0) { ret true; }
     ret text[0] == '<';
 }
@@ -282,9 +288,9 @@ fun range_bounds(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize
 }
 
 fun offset_of_member(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
-    val p: *sj.Value = json.member(rng, key);
-    val line: i64 = json.number(json.member(p, "line"), -1);
-    val ch:   i64 = json.number(json.member(p, "character"), -1);
+    val p:    *sj.Value = json.member(rng, key);
+    val line: i64       = json.number(json.member(p, "line"), -1);
+    val ch:   i64       = json.number(json.member(p, "character"), -1);
     if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
     ret positions.offset_at(file, line::usize, ch::usize);
 }

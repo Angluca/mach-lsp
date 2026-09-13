@@ -9,36 +9,37 @@
 # text, so this registry stores only the URI/FileId association.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
-use std.allocator.reallocate;
 use std.allocator.deallocate;
+use std.allocator.reallocate;
 
 use strutil: std.text.string;
 
-use src:    mach.lang.source;
-use editor: mach.lang.editor;
+use mach.lang.editor;
+use src: mach.lang.source;
 
-use allocator: std.allocator;
-use fail:   mach.lang.fail;
-use outcome: mach.lang.build.outcome;
+use mach.lang.build.outcome;
+use mach.lang.fail;
+use std.allocator;
+
 # one tracked open document
 # ---
-# uri:       owned document URI
-# path:      owned canonical filesystem path
-# text:      owned current buffer text
-# file_id:   editor FileId used only for the single-file fallback
-# revision:  server-assigned monotonic input revision
-# version:   latest client document version, or -1 when omitted
-# in_use:    whether this slot holds a live document
+# uri:      owned document URI
+# path:     owned canonical filesystem path
+# text:     owned current buffer text
+# file_id:  editor FileId used only for the single-file fallback
+# revision: server-assigned monotonic input revision
+# version:  latest client document version, or -1 when omitted
+# in_use:   whether this slot holds a live document
 pub rec Document {
     uri:      str;
     path:     str;
@@ -56,10 +57,10 @@ pub rec Document {
 # docs:  contiguous array of Document slots
 # len:   number of slots in `docs`
 pub rec Store {
-    es:    *editor.EditorSession;
-    alloc: *Allocator;
-    docs:  *Document;
-    len:   usize;
+    es:       *editor.EditorSession;
+    alloc:    *Allocator;
+    docs:     *Document;
+    len:      usize;
     revision: u64;
 }
 
@@ -70,10 +71,10 @@ pub rec Store {
 # ret:   an empty Store
 pub fun init(es: *editor.EditorSession, alloc: *Allocator) Store {
     var st: Store;
-    st.es = es;
-    st.alloc = alloc;
-    st.docs = nil;
-    st.len = 0;
+    st.es       = es;
+    st.alloc    = alloc;
+    st.docs     = nil;
+    st.len      = 0;
     st.revision = 0;
     ret st;
 }
@@ -92,8 +93,8 @@ pub fun dnit(st: *Store) {
         }
         deallocate[Document](st.alloc, st.docs, st.len);
     }
-    st.docs = nil;
-    st.len = 0;
+    st.docs     = nil;
+    st.len      = 0;
     st.revision = 0;
 }
 
@@ -135,14 +136,14 @@ pub fun open(st: *Store, uri: str, path: str, text: str, version: i64) res[*Docu
         ret res[*Document, str].err{fail.describe(fr.err)};
     }
     val fid: src.FileId = fr.ok;
-    d.uri = dup_uri.ok;
-    d.path = dup_path.ok;
-    d.text = dup_text.ok;
-    d.file_id = fid;
+    d.uri       = dup_uri.ok;
+    d.path      = dup_path.ok;
+    d.text      = dup_text.ok;
+    d.file_id   = fid;
     st.revision = st.revision + 1;
-    d.revision = st.revision;
-    d.version = version;
-    d.in_use = true;
+    d.revision  = st.revision;
+    d.version   = version;
+    d.in_use    = true;
     ret res[*Document, str].ok{d};
 }
 
@@ -166,10 +167,10 @@ pub fun change(st: *Store, uri: str, text: str, version: i64) res[*Document, str
         ret res[*Document, str].err{fail.describe(ur.err)};
     }
     strutil.str_free(st.alloc, d.text);
-    d.text = dup.ok;
+    d.text      = dup.ok;
     st.revision = st.revision + 1;
-    d.revision = st.revision;
-    d.version = version;
+    d.revision  = st.revision;
+    d.version   = version;
     ret res[*Document, str].ok{d};
 }
 
@@ -191,11 +192,11 @@ fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) res[*D
     }
     strutil.str_free(st.alloc, d.path);
     strutil.str_free(st.alloc, d.text);
-    d.path = dp.ok;
-    d.text = dt.ok;
+    d.path      = dp.ok;
+    d.text      = dt.ok;
     st.revision = st.revision + 1;
-    d.revision = st.revision;
-    d.version = version;
+    d.revision  = st.revision;
+    d.version   = version;
     ret res[*Document, str].ok{d};
 }
 
@@ -222,15 +223,15 @@ pub fun closing(st: *Store, uri: str) *Document {
     val d: *Document = find(st, uri);
     if (d == nil) { ret nil; }
     st.revision = st.revision + 1;
-    d.revision = st.revision;
+    d.revision  = st.revision;
     ret d;
 }
 
 fun free_owned(st: *Store, d: *Document) {
-    if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
+    if (d.uri != nil)  { strutil.str_free(st.alloc, d.uri); }
     if (d.path != nil) { strutil.str_free(st.alloc, d.path); }
     if (d.text != nil) { strutil.str_free(st.alloc, d.text); }
-    d.uri = nil;
+    d.uri  = nil;
     d.path = nil;
     d.text = nil;
 }
@@ -297,14 +298,14 @@ fun ensure_slot(st: *Store) res[*Document, str] {
     var z: usize = st.len;
     for (z < new_len) {
         val nb: *Document = ?st.docs[z];
-        nb.uri = nil;
-        nb.path = nil;
-        nb.text = nil;
-        nb.file_id = 0::src.FileId;
+        nb.uri      = nil;
+        nb.path     = nil;
+        nb.text     = nil;
+        nb.file_id  = 0::src.FileId;
         nb.revision = 0;
-        nb.version = 0 - 1;
-        nb.in_use = false;
-        z = z + 1;
+        nb.version  = 0 - 1;
+        nb.in_use   = false;
+        z           = z + 1;
     }
     val slot: *Document = ?st.docs[st.len];
     st.len = new_len;

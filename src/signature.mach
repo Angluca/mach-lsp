@@ -12,32 +12,32 @@
 # commas at that same nesting depth give the active parameter.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
 
 use std.allocator.Allocator;
 
-use src:   mach.lang.source;
-use token: mach.lang.fe.token;
-use ast:   mach.lang.fe.ast;
-use id:    mach.lang.fe.ast.id;
-use decl:  mach.lang.fe.ast.decl;
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.id;
 use atype: mach.lang.fe.ast.type;
-use rslv:   mach.lang.fe.resolve;
-use editor: mach.lang.editor;
-use sj:    std.data.json;
+use rslv:  mach.lang.fe.resolve;
+use mach.lang.fe.token;
+use src: mach.lang.source;
+use sj:  std.data.json;
 
-use json:      mls.json;
-use render:    mls.render;
-use project:   mls.project;
-use features:  mls.features;
-use positions: mls.positions;
-use documents: mls.documents;
-use analysis:  mls.analysis;
+use mls.analysis;
+use mls.documents;
+use mls.features;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.render;
 
 # the call the cursor sits inside
 # ---
@@ -50,41 +50,58 @@ rec CallSite {
 
 # answer textDocument/signatureHelp for the call surrounding the cursor
 pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
-                       docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: analysis.Analyzed;
+    var an:    analysis.Analyzed;
     val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
-    if (sel off_o.none) { render.reply_null(alloc, id_raw); ret; }
+    if (sel off_o.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     val offset: usize = off_o.some;
 
     val co: opt[CallSite] = enclosing_call(an.text, offset);
-    if (sel co.none) { render.reply_null(alloc, id_raw); ret; }
+    if (sel co.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     val call: CallSite = co.some;
 
     val ro: opt[features.SymbolRef] =
         features.ref_at(an.a, an.rr, an.own, an.text.file, call.callee_offset);
-    if (sel ro.none) { render.reply_null(alloc, id_raw); ret; }
+    if (sel ro.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     val sr: features.SymbolRef = ro.some;
 
     val so: opt[*rslv.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (sel so.none) { render.reply_null(alloc, id_raw); ret; }
+    if (sel so.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     val sym: *rslv.Symbol = so.some;
 
     val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
-    if (sel site_o.none) { render.reply_null(alloc, id_raw); ret; }
+    if (sel site_o.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     var site: project.Site = site_o.some;
 
     val d_opt: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
     if (sel d_opt.none) {
         project.free_site(ws, ?site);
-        render.reply_null(alloc, id_raw); ret;
+        render.reply_null(alloc, id_raw);
+        ret;
     }
     val d: *decl.Decl = d_opt.some;
     if (d.kind != decl.DECL_KIND_FUN) {
         project.free_site(ws, ?site);
-        render.reply_null(alloc, id_raw); ret;
+        render.reply_null(alloc, id_raw);
+        ret;
     }
 
     emit(alloc, id_raw, site.a, site.text, d, call.active);
@@ -93,7 +110,7 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
 
 # send the SignatureHelp for function declaration `d`
 fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
-         d: *decl.Decl, active: usize) {
+    d: *decl.Decl, active: usize) {
     val n: u32 = d.data.fun_.params_len;
 
     var b: json.Buf = json.buf_init(alloc);
@@ -105,13 +122,13 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
     # recomputed against a finished string
     var starts: [64]usize;
     var ends:   [64]usize;
-    var label: json.Buf = json.buf_init(alloc);
-    val name: str = decl_name_text(file, d, alloc);
+    var label:  json.Buf = json.buf_init(alloc);
+    val name:   str      = decl_name_text(file, d, alloc);
     if (name != nil) { json.buf_push(?label, name); }
     json.buf_push_byte(?label, '(');
     var i: u32 = 0;
     for (i < n) {
-        if (i > 0) { json.buf_push(?label, ", "); }
+        if (i > 0)         { json.buf_push(?label, ", "); }
         if (i::usize < 64) { starts[i::usize] = json.buf_len(?label); }
         push_param_text(?label, a, file, d.data.fun_.params_start + i, alloc);
         if (i::usize < 64) { ends[i::usize] = json.buf_len(?label); }
@@ -148,7 +165,7 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
     # a cursor past the last parameter clamps rather than pointing at nothing,
     # which is what a variadic or an over-long argument list produces
     var act: usize = active;
-    if (n == 0) { act = 0; }
+    if (n == 0)          { act = 0; }
     or (act >= n::usize) { act = (n - 1)::usize; }
     json.buf_push_usize(?b, act);
     json.buf_push_byte(?b, '}');
@@ -160,8 +177,8 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
 # `name: Type` for the parameter in `typed_names` slot `slot`
 fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) {
     if (a.typed_names == nil) { ret; }
-    val tn: *decl.TypedName = ?a.typed_names[slot::usize];
-    val pname: str = positions.span_text(file, tn.name, alloc);
+    val tn:    *decl.TypedName = ?a.typed_names[slot::usize];
+    val pname: str             = positions.span_text(file, tn.name, alloc);
     if (pname != nil) {
         json.buf_push(b, pname);
         json.free_str(pname, alloc);
@@ -218,9 +235,9 @@ fun enclosing_call(t: positions.Text, offset: usize) opt[CallSite] {
 
         if (c == '"' || c == '\'') {
             # skip the literal this quote closes, honouring escapes
-            val quote: u8 = c;
-            var j: usize = i;
-            var closed: bool = false;
+            val quote:  u8    = c;
+            var j:      usize = i;
+            var closed: bool  = false;
             for (j > 0 && !closed) {
                 j = j - 1;
                 if (text[j] == quote && !escaped_at(text, j)) { closed = true; }
@@ -240,7 +257,9 @@ fun enclosing_call(t: positions.Text, offset: usize) opt[CallSite] {
             }
             depth = depth - 1;
         }
-        or (c == ',') { if (depth == 0) { commas = commas + 1; } }
+        or (c == ',') {
+            if (depth == 0) { commas = commas + 1; }
+        }
         or (c == ';' || c == '{' || c == '}') {
             # a statement boundary at depth zero means the cursor is not inside
             # a call at all; without this the scan runs to the top of the file
@@ -269,8 +288,8 @@ fun escaped_at(text: str, i: usize) bool {
 # A generic call spells the type arguments between the name and the paren -
 # `take[i32](b)` - so the identifier is not necessarily adjacent to the paren.
 fun ident_end_before(text: str, paren: usize) opt[usize] {
-    var i: usize = paren;
-    var skipped_generics: bool = false;
+    var i:                usize = paren;
+    var skipped_generics: bool  = false;
     for (i > 0) {
         i = i - 1;
         val c: u8 = text[i];
@@ -278,11 +297,11 @@ fun ident_end_before(text: str, paren: usize) opt[usize] {
         or (c == ']' && !skipped_generics) {
             val bo: opt[usize] = matching_bracket_before(text, i);
             if (sel bo.none) { ret opt[usize].none{}; }
-            i = bo.some;
+            i                = bo.some;
             skipped_generics = true;
         }
         or (is_ident_byte(c)) { ret opt[usize].some{i}; }
-        or { ret opt[usize].none{}; }
+        or                    { ret opt[usize].none{}; }
     }
     ret opt[usize].none{};
 }

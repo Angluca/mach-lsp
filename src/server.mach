@@ -9,62 +9,62 @@
 # language-feature requests are answered with a `method not found` error.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
-use std.types.string.str_equals;
 use std.types.string.str_contains;
-use std.types.result.res;
-use std.types.option.opt;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 
-use mem: std.memory;
+use mem:     std.memory;
 use strutil: std.text.string;
 
-use sess:   mach.lang.session;
-use src:    mach.lang.source;
-use editor: mach.lang.editor;
+use mach.lang.editor;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
 
-use transport:   mls.transport;
-use json:        mls.json;
-use sj:          std.data.json;
-use jobs:        mls.jobs;
-use atomic:      std.sync.atomic;
-use exec:        std.process.exec;
-use documents:   mls.documents;
-use textedit:    mls.textedit;
-use diagnostics: mls.diagnostics;
-use language:    mls.language;
-use workspace:   mls.workspace;
-use signature:   mls.signature;
-use hints:       mls.hints;
-use tokens:      mls.tokens;
-use actions:     mls.actions;
-use project:     mls.project;
-use trace:       mls.trace;
-use render:      mls.render;
-use progress:    mls.progress;
-use positions:   mls.positions;
+use mls.actions;
+use mls.diagnostics;
+use mls.documents;
+use mls.hints;
+use mls.jobs;
+use mls.json;
+use mls.language;
+use mls.positions;
+use mls.progress;
+use mls.project;
+use mls.render;
+use mls.signature;
+use mls.textedit;
+use mls.tokens;
+use mls.trace;
+use mls.transport;
+use mls.workspace;
+use sj: std.data.json;
+use std.process.exec;
+use std.sync.atomic;
 
-use fail:   mach.lang.fail;
+use mach.lang.fail;
 # lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;
 pub val STATUS_SHUTTING_DOWN: u8 = 2;
 pub val STATUS_EXITED:        u8 = 3;
 # language features, as dispatch selectors
-val FEATURE_HOVER:           u8 = 0;
-val FEATURE_DEFINITION:      u8 = 1;
-val FEATURE_REFERENCES:      u8 = 2;
-val FEATURE_RENAME:          u8 = 3;
-val FEATURE_PREPARE_RENAME:  u8 = 4;
-val FEATURE_DOCUMENT_SYMBOL: u8 = 5;
-val FEATURE_COMPLETION:      u8 = 6;
+val FEATURE_HOVER:              u8 = 0;
+val FEATURE_DEFINITION:         u8 = 1;
+val FEATURE_REFERENCES:         u8 = 2;
+val FEATURE_RENAME:             u8 = 3;
+val FEATURE_PREPARE_RENAME:     u8 = 4;
+val FEATURE_DOCUMENT_SYMBOL:    u8 = 5;
+val FEATURE_COMPLETION:         u8 = 6;
 val FEATURE_DOCUMENT_HIGHLIGHT: u8 = 7;
 val FEATURE_SIGNATURE_HELP:     u8 = 8;
 val FEATURE_INLAY_HINT:         u8 = 9;
@@ -83,40 +83,40 @@ val WATCH_ACTIVE:   u8 = 2;
 
 # the long-lived server state
 # ---
-# status:        current lifecycle phase
-# exit_code:     process exit code to return from `run`
-# alloc:         allocator backing all server-owned memory
-# s:             compiler session (SourceMap + DiagList)
-# es:            editor session over `s` (per-buffer analysis)
-# docs:          URI -> editor buffer registry
-# ws:            per-root project graphs backing cross-module analysis
-# rd:            per-message JSON parse arena, owned by the analysis thread
-# q:             message queue feeding the analysis thread
-# cancels:       ids the client has withdrawn, written by the reading thread
-# rd_client:     the READING thread's parse arena, private to it
-# stop:          set once the reading thread should stop; read atomically
-# deferred:      a document changed but its analysis was postponed behind newer
-#                input, and must run once the queue drains
+# status:         current lifecycle phase
+# exit_code:      process exit code to return from `run`
+# alloc:          allocator backing all server-owned memory
+# s:              compiler session (SourceMap + DiagList)
+# es:             editor session over `s` (per-buffer analysis)
+# docs:           URI -> editor buffer registry
+# ws:             per-root project graphs backing cross-module analysis
+# rd:             per-message JSON parse arena, owned by the analysis thread
+# q:              message queue feeding the analysis thread
+# cancels:        ids the client has withdrawn, written by the reading thread
+# rd_client:      the READING thread's parse arena, private to it
+# stop:           set once the reading thread should stop; read atomically
+# deferred:       a document changed but its analysis was postponed behind newer
+#                 input, and must run once the queue drains
 # hover_markdown: whether the client renders markdown hover content
-# watch_dynamic: whether the client supports dynamic file-watch registration
-#                (`workspace/didChangeWatchedFiles`), advertised at initialize
+# watch_dynamic:  whether the client supports dynamic file-watch registration
+#                 (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
-    status:        u8;
-    exit_code:     i64;
-    alloc:         *Allocator;
-    s:             sess.Session;
-    es:            editor.EditorSession;
-    docs:          documents.Store;
-    ws:            project.Workspace;
-    rd:            json.Reader;
-    q:             jobs.Queue;
-    cancels:       jobs.Cancels;
-    rd_client:     json.Reader;
-    stop:          i64;
-    deferred:      bool;
+    status:         u8;
+    exit_code:      i64;
+    alloc:          *Allocator;
+    s:              sess.Session;
+    es:             editor.EditorSession;
+    docs:           documents.Store;
+    ws:             project.Workspace;
+    rd:             json.Reader;
+    q:              jobs.Queue;
+    cancels:        jobs.Cancels;
+    rd_client:      json.Reader;
+    stop:           i64;
+    deferred:       bool;
     hover_markdown: bool;
-    watch_dynamic: bool;
-    watch_state:   u8;
+    watch_dynamic:  bool;
+    watch_state:    u8;
 }
 
 # build a server over the given allocator
@@ -125,26 +125,26 @@ pub rec Server {
 # alloc: allocator backing all server-owned memory; must outlive the server
 # ret:   true on success, false when the compiler session fails to initialize
 pub fun init(srv: *Server, alloc: *Allocator) bool {
-    srv.status = STATUS_UNINITIALIZED;
-    srv.exit_code = 0;
-    srv.alloc = alloc;
+    srv.status        = STATUS_UNINITIALIZED;
+    srv.exit_code     = 0;
+    srv.alloc         = alloc;
     srv.watch_dynamic = false;
-    srv.watch_state = WATCH_FALLBACK;
+    srv.watch_state   = WATCH_FALLBACK;
 
     val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
     if (sel sr.err) { ret false; }
     srv.s = sr.ok;
 
-    srv.es = editor.init(?srv.s);
+    srv.es   = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
-    srv.ws = project.init(?srv.s, alloc);
+    srv.ws   = project.init(?srv.s, alloc);
     project.attach_documents(?srv.ws, ?srv.docs);
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
-    srv.stop = 0;
-    srv.deferred = false;
+    srv.stop           = 0;
+    srv.deferred       = false;
     srv.hover_markdown = true;
-    if (!jobs.init(?srv.q, alloc)) { ret false; }
-    if (!jobs.cancels_init(?srv.cancels, alloc)) { ret false; }
+    if (!jobs.init(?srv.q, alloc))                { ret false; }
+    if (!jobs.cancels_init(?srv.cancels, alloc))  { ret false; }
     if (!json.reader_init(?srv.rd_client, alloc)) { ret false; }
     ret true;
 }
@@ -190,9 +190,9 @@ pub fun run(srv: *Server) i64 {
         var msg: transport.Message;
         last_read = transport.read_message(?msg, srv.alloc);
         if (last_read != transport.READ_OK) {
-            if (last_read == transport.READ_EOF)        { trace.log("transport: input closed\n"); }
-            or (last_read == transport.READ_MALFORMED)  { trace.log("transport: malformed input frame\n"); }
-            or                                          { trace.log("transport: input error\n"); }
+            if (last_read == transport.READ_EOF)       { trace.log("transport: input closed\n"); }
+            or (last_read == transport.READ_MALFORMED) { trace.log("transport: malformed input frame\n"); }
+            or                                         { trace.log("transport: input error\n"); }
             brk;
         }
 
@@ -201,7 +201,7 @@ pub fun run(srv: *Server) i64 {
         if (!intercept_cancel(srv, msg.body, msg.body_len)) {
             if (!jobs.push(?srv.q, msg.body, msg.body_len)) {
                 trace.logf("server: analysis queue full at {} messages, dropping input",
-                           jobs.depth(?srv.q)::i64);
+                    jobs.depth(?srv.q)::i64);
             }
         }
         transport.message_free(?msg, srv.alloc);
@@ -212,8 +212,8 @@ pub fun run(srv: *Server) i64 {
     jobs.join(?srv.q);
     trace.log("=== mach-lsp exiting ===\n");
 
-    if (transport.write_failed()) { ret 1; }
-    if (srv.status == STATUS_EXITED)       { ret srv.exit_code; }
+    if (transport.write_failed())                                              { ret 1; }
+    if (srv.status == STATUS_EXITED)                                           { ret srv.exit_code; }
     if (last_read == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) { ret 0; }
     ret 1;
 }
@@ -225,11 +225,11 @@ pub fun run(srv: *Server) i64 {
 # body that contains the text is still parsed and checked structurally, so a
 # document whose own source mentions the method cannot be mistaken for one.
 fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
-    if (body == nil) { ret false; }
+    if (body == nil)                            { ret false; }
     if (!str_contains(body, "$/cancelRequest")) { ret false; }
 
-    var parsed: json.Message = json.read(?srv.rd_client, body, len);
-    var handled: bool = false;
+    var parsed:  json.Message = json.read(?srv.rd_client, body, len);
+    var handled: bool         = false;
     if (parsed.valid) {
         if (json.text_equals(json.member(?parsed.root, "method"), "$/cancelRequest", srv.alloc)) {
             val id_token: str = json.id_text(
@@ -256,10 +256,10 @@ fun trace_method(srv: *Server, root: *sj.Value) {
     val m: str = json.text(json.member(root, "method"), srv.alloc);
     val i: str = json.id_text(json.member(root, "id"), srv.alloc);
     if (m != nil && i != nil) { trace.logf("  method {} id {}", m, i); }
-    or (m != nil)            { trace.logf("  method {}", m); }
-    or (i != nil)            { trace.logf("  id {}", i); }
-    if (m != nil) { json.free_str(m, srv.alloc); }
-    if (i != nil) { json.free_str(i, srv.alloc); }
+    or (m != nil)             { trace.logf("  method {}", m); }
+    or (i != nil)             { trace.logf("  id {}", i); }
+    if (m != nil)             { json.free_str(m, srv.alloc); }
+    if (i != nil)             { json.free_str(i, srv.alloc); }
 }
 
 # handle one queued message on the analysis thread
@@ -270,9 +270,12 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 
     trace.frame("recv:", body, len);
 
-    val started_ns: i64 = trace.now_ns();
-    var parsed: json.Message = json.read(?srv.rd, body, len);
-    if (parsed.valid) { trace_method(srv, ?parsed.root); dispatch(srv, ?parsed.root); }
+    val started_ns: i64          = trace.now_ns();
+    var parsed:     json.Message = json.read(?srv.rd, body, len);
+    if (parsed.valid) {
+        trace_method(srv, ?parsed.root);
+        dispatch(srv, ?parsed.root);
+    }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
 
@@ -292,10 +295,10 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 
 # a response has an id, no method, and exactly one of `result` or `error`.
 fun is_response(root: *sj.Value) bool {
-    if (json.member(root, "id") == nil) { ret false; }
+    if (json.member(root, "id") == nil)     { ret false; }
     if (json.member(root, "method") != nil) { ret false; }
     val result: *sj.Value = json.member(root, "result");
-    val error: *sj.Value = json.member(root, "error");
+    val error:  *sj.Value = json.member(root, "error");
     ret (result != nil && error == nil) || (result == nil && error != nil);
 }
 
@@ -304,10 +307,16 @@ fun is_response(root: *sj.Value) bool {
 # an unknown method gets a JSON-RPC method-not-found error when it carries an
 # id, and is dropped when it does not - a notification owes no response.
 fun dispatch(srv: *Server, root: *sj.Value) {
-    if (is_response(root)) { handle_response(srv, root); ret; }
+    if (is_response(root)) {
+        handle_response(srv, root);
+        ret;
+    }
 
     val id: *sj.Value = json.member(root, "id");
-    if (id == nil) { dispatch_inner(srv, root); ret; }
+    if (id == nil) {
+        dispatch_inner(srv, root);
+        ret;
+    }
 
     # every request owes exactly one response. A handler can fail to send one
     # for reasons it cannot report - a latched allocation failure in the
@@ -323,17 +332,39 @@ fun dispatch(srv: *Server, root: *sj.Value) {
 }
 
 fun dispatch_inner(srv: *Server, root: *sj.Value) {
-    val a: *Allocator = srv.alloc;
-    val method_v: *sj.Value = json.member(root, "method");
-    if (method_v == nil) { reply_invalid_request(srv, root); ret; }
+    val a:        *Allocator = srv.alloc;
+    val method_v: *sj.Value  = json.member(root, "method");
+    if (method_v == nil) {
+        reply_invalid_request(srv, root);
+        ret;
+    }
     val method: str = json.text(method_v, a);
-    if (method == nil) { reply_invalid_request(srv, root); ret; }
+    if (method == nil) {
+        reply_invalid_request(srv, root);
+        ret;
+    }
     val params: *sj.Value = json.member(root, "params");
 
-    if (str_equals(method, "initialize"))  { json.free_str(method, a); handle_initialize(srv, root, params); ret; }
-    if (str_equals(method, "initialized")) { json.free_str(method, a); handle_initialized(srv); ret; }
-    if (str_equals(method, "shutdown"))    { json.free_str(method, a); handle_shutdown(srv, root); ret; }
-    if (str_equals(method, "exit"))        { json.free_str(method, a); handle_exit(srv); ret; }
+    if (str_equals(method, "initialize")) {
+        json.free_str(method, a);
+        handle_initialize(srv, root, params);
+        ret;
+    }
+    if (str_equals(method, "initialized")) {
+        json.free_str(method, a);
+        handle_initialized(srv);
+        ret;
+    }
+    if (str_equals(method, "shutdown")) {
+        json.free_str(method, a);
+        handle_shutdown(srv, root);
+        ret;
+    }
+    if (str_equals(method, "exit")) {
+        json.free_str(method, a);
+        handle_exit(srv);
+        ret;
+    }
 
     if (srv.status != STATUS_RUNNING) {
         json.free_str(method, a);
@@ -341,26 +372,101 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         ret;
     }
 
-    if (str_equals(method, "textDocument/didOpen"))   { json.free_str(method, a); handle_did_open(srv, params); ret; }
-    if (str_equals(method, "textDocument/didChange")) { json.free_str(method, a); handle_did_change(srv, params); ret; }
-    if (str_equals(method, "textDocument/didClose"))  { json.free_str(method, a); handle_did_close(srv, params); ret; }
-    if (str_equals(method, "textDocument/didSave"))   { json.free_str(method, a); handle_did_save(srv, params); ret; }
-    if (str_equals(method, "workspace/didChangeConfiguration")) { json.free_str(method, a); ret; }
-    if (str_equals(method, "workspace/didChangeWatchedFiles"))  { json.free_str(method, a); handle_did_change_watched_files(srv, params); ret; }
+    if (str_equals(method, "textDocument/didOpen")) {
+        json.free_str(method, a);
+        handle_did_open(srv, params);
+        ret;
+    }
+    if (str_equals(method, "textDocument/didChange")) {
+        json.free_str(method, a);
+        handle_did_change(srv, params);
+        ret;
+    }
+    if (str_equals(method, "textDocument/didClose")) {
+        json.free_str(method, a);
+        handle_did_close(srv, params);
+        ret;
+    }
+    if (str_equals(method, "textDocument/didSave")) {
+        json.free_str(method, a);
+        handle_did_save(srv, params);
+        ret;
+    }
+    if (str_equals(method, "workspace/didChangeConfiguration")) {
+        json.free_str(method, a);
+        ret;
+    }
+    if (str_equals(method, "workspace/didChangeWatchedFiles")) {
+        json.free_str(method, a);
+        handle_did_change_watched_files(srv, params);
+        ret;
+    }
 
-    if (str_equals(method, "textDocument/hover"))          { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_HOVER); ret; }
-    if (str_equals(method, "textDocument/definition"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DEFINITION); ret; }
-    if (str_equals(method, "textDocument/references"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_REFERENCES); ret; }
-    if (str_equals(method, "textDocument/rename"))         { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_RENAME); ret; }
-    if (str_equals(method, "textDocument/prepareRename"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_PREPARE_RENAME); ret; }
-    if (str_equals(method, "textDocument/documentSymbol")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL); ret; }
-    if (str_equals(method, "textDocument/completion"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_COMPLETION); ret; }
-    if (str_equals(method, "textDocument/documentHighlight")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT); ret; }
-    if (str_equals(method, "textDocument/signatureHelp"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SIGNATURE_HELP); ret; }
-    if (str_equals(method, "textDocument/inlayHint"))      { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_INLAY_HINT); ret; }
-    if (str_equals(method, "textDocument/semanticTokens/full")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SEMANTIC_TOKENS); ret; }
-    if (str_equals(method, "textDocument/codeAction"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_CODE_ACTION); ret; }
-    if (str_equals(method, "workspace/symbol"))            { json.free_str(method, a); handle_workspace_symbol(srv, root, params); ret; }
+    if (str_equals(method, "textDocument/hover")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_HOVER);
+        ret;
+    }
+    if (str_equals(method, "textDocument/definition")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_DEFINITION);
+        ret;
+    }
+    if (str_equals(method, "textDocument/references")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_REFERENCES);
+        ret;
+    }
+    if (str_equals(method, "textDocument/rename")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_RENAME);
+        ret;
+    }
+    if (str_equals(method, "textDocument/prepareRename")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_PREPARE_RENAME);
+        ret;
+    }
+    if (str_equals(method, "textDocument/documentSymbol")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL);
+        ret;
+    }
+    if (str_equals(method, "textDocument/completion")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_COMPLETION);
+        ret;
+    }
+    if (str_equals(method, "textDocument/documentHighlight")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT);
+        ret;
+    }
+    if (str_equals(method, "textDocument/signatureHelp")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_SIGNATURE_HELP);
+        ret;
+    }
+    if (str_equals(method, "textDocument/inlayHint")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_INLAY_HINT);
+        ret;
+    }
+    if (str_equals(method, "textDocument/semanticTokens/full")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_SEMANTIC_TOKENS);
+        ret;
+    }
+    if (str_equals(method, "textDocument/codeAction")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CODE_ACTION);
+        ret;
+    }
+    if (str_equals(method, "workspace/symbol")) {
+        json.free_str(method, a);
+        handle_workspace_symbol(srv, root, params);
+        ret;
+    }
 
     trace.logf("server: unhandled method {}", method);
     json.free_str(method, a);
@@ -414,9 +520,12 @@ fun handle_initialized(srv: *Server) {
 # accept dynamic watching only after the client acknowledges registration;
 # rejection keeps conservative fallback invalidation enabled
 fun handle_response(srv: *Server, root: *sj.Value) {
-    if (srv.watch_state != WATCH_PENDING) { ret; }
+    if (srv.watch_state != WATCH_PENDING)                                              { ret; }
     if (!json.text_equals(json.member(root, "id"), "mls/registerWatchers", srv.alloc)) { ret; }
-    if (json.member(root, "error") != nil) { srv.watch_state = WATCH_FALLBACK; ret; }
+    if (json.member(root, "error") != nil) {
+        srv.watch_state = WATCH_FALLBACK;
+        ret;
+    }
     srv.watch_state = WATCH_ACTIVE;
 }
 
@@ -433,8 +542,8 @@ fun handle_did_save(srv: *Server, params: *sj.Value) {
 # array is invalidated in turn
 fun handle_did_change_watched_files(srv: *Server, params: *sj.Value) {
     val changes: *sj.Value = json.member(params, "changes");
-    val n: usize = json.count(changes);
-    var i: usize = 0;
+    val n:       usize     = json.count(changes);
+    var i:       usize     = 0;
     for (i < n) {
         val uri: str = json.text(json.member(json.element(changes, i), "uri"), srv.alloc);
         if (uri != nil) {
@@ -460,7 +569,7 @@ fun handle_shutdown(srv: *Server, root: *sj.Value) {
 # exit the process, with code 0 only after a clean shutdown
 fun handle_exit(srv: *Server) {
     if (srv.status == STATUS_SHUTTING_DOWN) { srv.exit_code = 0; }
-    or { srv.exit_code = 1; }
+    or                                      { srv.exit_code = 1; }
     srv.status = STATUS_EXITED;
     atomic.store(?srv.stop, 1);
 
@@ -478,10 +587,13 @@ fun handle_exit(srv: *Server) {
 # register the opened document and publish its diagnostics
 fun handle_did_open(srv: *Server, params: *sj.Value) {
     val doc: *sj.Value = json.member(params, "textDocument");
-    val uri: str = json.text(json.member(doc, "uri"), srv.alloc);
+    val uri: str       = json.text(json.member(doc, "uri"), srv.alloc);
     if (uri == nil) { ret; }
     val text: str = json.text(json.member(doc, "text"), srv.alloc);
-    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
+    if (text == nil) {
+        json.free_str(uri, srv.alloc);
+        ret;
+    }
     val version_v: *sj.Value = json.member(doc, "version");
     if (version_v != nil) { publish_for(srv, uri, text, json.number(version_v, 0), true); }
     json.free_str(text, srv.alloc);
@@ -493,15 +605,21 @@ fun handle_did_open(srv: *Server, params: *sj.Value) {
 # entry carries the entire new text
 fun handle_did_change(srv: *Server, params: *sj.Value) {
     val doc: *sj.Value = json.member(params, "textDocument");
-    val uri: str = json.text(json.member(doc, "uri"), srv.alloc);
+    val uri: str       = json.text(json.member(doc, "uri"), srv.alloc);
     if (uri == nil) { ret; }
-    val changes: *sj.Value = json.member(params, "contentChanges");
-    val n: usize = json.count(changes);
+    val changes:   *sj.Value = json.member(params, "contentChanges");
+    val n:         usize     = json.count(changes);
     val version_v: *sj.Value = json.member(doc, "version");
-    if (n == 0 || version_v == nil) { json.free_str(uri, srv.alloc); ret; }
+    if (n == 0 || version_v == nil) {
+        json.free_str(uri, srv.alloc);
+        ret;
+    }
 
     val text: str = apply_changes(srv, uri, changes, n);
-    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
+    if (text == nil) {
+        json.free_str(uri, srv.alloc);
+        ret;
+    }
     publish_for(srv, uri, text, json.number(version_v, 0), false);
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
@@ -551,18 +669,18 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
-    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
-    or (which == FEATURE_DEFINITION)      { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_REFERENCES)      { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_RENAME)          { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_PREPARE_RENAME)  { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_DOCUMENT_SYMBOL) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_COMPLETION)      { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    if (which == FEATURE_HOVER)              { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
+    or (which == FEATURE_DEFINITION)         { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_REFERENCES)         { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_RENAME)             { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_PREPARE_RENAME)     { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_DOCUMENT_SYMBOL)    { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_COMPLETION)         { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_HIGHLIGHT) { language.document_highlight(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_SIGNATURE_HELP)  { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_INLAY_HINT)      { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_SEMANTIC_TOKENS) { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_CODE_ACTION)     { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SIGNATURE_HELP)     { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_INLAY_HINT)         { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SEMANTIC_TOKENS)    { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CODE_ACTION)        { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
@@ -665,7 +783,7 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
     if (path == nil) { ret; }
     var dr: res[*documents.Document, str];
     if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }
-    or { dr = documents.change(?srv.docs, uri, text, version); }
+    or           { dr = documents.change(?srv.docs, uri, text, version); }
     json.free_str(path, srv.alloc);
 
     if (sel dr.err) {
@@ -675,7 +793,7 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         ret;
     }
     val doc: *documents.Document = dr.ok;
-    val cr: res[bool, str] = project.document_changed(?srv.ws, doc);
+    val cr:  res[bool, str]      = project.document_changed(?srv.ws, doc);
     if (sel cr.err) {
         trace.log("project: failed to mirror document overlay\n");
         ret;

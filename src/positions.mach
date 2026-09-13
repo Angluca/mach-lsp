@@ -16,21 +16,21 @@
 # server advertises no `positionEncoding`, so the client's UTF-16 default holds.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
-use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 
 use mem: std.memory;
 
-use src:   mach.lang.source;
-use token: mach.lang.fe.token;
+use mach.lang.fe.token;
+use src: mach.lang.source;
 
 # a 0-based LSP range, the form a `Location` / hover range needs
 # ---
@@ -106,7 +106,7 @@ pub fun offset_at(t: Text, line: usize, ch: usize) opt[usize] {
 # span: the byte range to convert
 # ret:  the equivalent 0-based LSP range
 pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
-    var r: LspRange;
+    var r:  LspRange;
     val sp: src.Position = src.position(file, span.offset);
     r.start_line = dec(sp.line);
     r.start_char = u16_col(file, sp.line, span.offset);
@@ -127,9 +127,9 @@ pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
 # name: the text to compare against
 # ret:  true when the span is in bounds and spells `name` exactly
 pub fun span_equals(t: Text, span: token.Span, name: str) bool {
-    if (name == nil || t.file == nil) { ret false; }
+    if (name == nil || t.file == nil)                           { ret false; }
     if (span.offset >= t.len || span.offset + span.len > t.len) { ret false; }
-    if (span.len != str_len(name)) { ret false; }
+    if (span.len != str_len(name))                              { ret false; }
     var i: usize = 0;
     for (i < span.len) {
         if (t.file.text[span.offset + i] != name[i]) { ret false; }
@@ -148,7 +148,7 @@ pub fun span_equals(t: Text, span: token.Span, name: str) bool {
 # ret:   owned copy of the span text, or nil
 pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
     if (span.len == 0 || t.file == nil) { ret nil; }
-    if (span.offset >= t.len) { ret nil; }
+    if (span.offset >= t.len)           { ret nil; }
     var len: usize = span.len;
     if (span.offset + len > t.len) { len = t.len - span.offset; }
 
@@ -168,12 +168,12 @@ pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
 # offset: byte offset whose column is measured
 # ret:    0-based UTF-16 code-unit column
 fun u16_col(file: *src.SourceFile, line: usize, offset: usize) usize {
-    var o: usize = file.line_starts[line - 1];
+    var o:     usize = file.line_starts[line - 1];
     var units: usize = 0;
     for (o < offset) {
         val b: u8 = file.text[o];
         units = units + u16_units(b);
-        o = o + u8_seq_len(b);
+        o     = o + u8_seq_len(b);
     }
     ret units;
 }
@@ -188,14 +188,14 @@ fun u16_col(file: *src.SourceFile, line: usize, offset: usize) usize {
 # col:   0-based UTF-16 code-unit column to locate
 # ret:   the byte offset at that column, clamped to `end`
 fun u16_col_to_byte(file: *src.SourceFile, start: usize, end: usize, col: usize) usize {
-    var o: usize = start;
+    var o:     usize = start;
     var units: usize = 0;
     for (o < end) {
-        val b: u8 = file.text[o];
+        val b: u8    = file.text[o];
         val u: usize = u16_units(b);
         if (units + u > col) { brk; }
         units = units + u;
-        o = o + u8_seq_len(b);
+        o     = o + u8_seq_len(b);
     }
     ret o;
 }
@@ -258,19 +258,20 @@ pub fun offset_in_text(text: str, line: usize, ch: usize) opt[usize] {
     var o:     usize = start;
     var units: usize = 0;
     for (o < end) {
-        val b: u8 = text[o];
+        val b: u8    = text[o];
         val u: usize = u16_units(b);
         if (units + u > ch) { brk; }
         units = units + u;
-        o = o + u8_seq_len(b);
+        o     = o + u8_seq_len(b);
     }
     ret opt[usize].some{o};
 }
 
-use page: std.allocator.page;
+use std.allocator.page;
 use std.types.string.str_equals;
 
-use allocator: std.allocator;
+use std.allocator;
+
 # test helpers over an optional offset, since a call result cannot be guarded
 fun some_is(o: opt[usize], want: usize) bool {
     if (sel o.some) { ret o.some == want; }
@@ -283,7 +284,7 @@ fun some_present(o: opt[usize]) bool {
 
 test "positions: a text offset resolves line and utf-16 column" {
     var fail: bool = false;
-    val t: str = "ab\ncdef\n";
+    val t:    str  = "ab\ncdef\n";
     if (!some_is(offset_in_text(t, 0, 0), 0)) { fail = true; }
     if (!some_is(offset_in_text(t, 0, 2), 2)) { fail = true; }
     if (!some_is(offset_in_text(t, 1, 0), 3)) { fail = true; }
@@ -291,9 +292,9 @@ test "positions: a text offset resolves line and utf-16 column" {
     # a column past the end of its line clamps to the line's end
     if (!some_is(offset_in_text(t, 0, 99), 2)) { fail = true; }
     # the position one past the final newline is where an append lands
-    if (!some_is(offset_in_text(t, 2, 0), 8)) { fail = true; }
-    if (some_present(offset_in_text(t, 9, 0)))     { fail = true; }
-    if (fail) { ret 1; }
+    if (!some_is(offset_in_text(t, 2, 0), 8))  { fail = true; }
+    if (some_present(offset_in_text(t, 9, 0))) { fail = true; }
+    if (fail)                                  { ret 1; }
     ret 0;
 }
 
@@ -305,7 +306,7 @@ test "positions: an astral codepoint counts as two utf-16 units" {
     val t: str = "a\xF0\x9F\x98\x80b";
     if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
     if (!some_is(offset_in_text(t, 0, 3), 5)) { fail = true; }
-    if (fail) { ret 1; }
+    if (fail)                                 { ret 1; }
     ret 0;
 }
 
@@ -314,17 +315,19 @@ test "positions: an astral codepoint counts as two utf-16 units" {
 # properties are invisible at a call site, so they are pinned here.
 test "positions: a text pairs a file with its own length" {
     var starts: [3]usize;
-    starts[0] = 0; starts[1] = 3; starts[2] = 6;
-    var f: src.SourceFile = t_file("ab\ncd\nef", ?starts[0], 3);
-    val t: Text = text_of(?f);
-    var fail: bool = false;
-    if (t.len != 8)      { fail = true; }
-    if (t.file != (?f))  { fail = true; }
+    starts[0] = 0;
+    starts[1] = 3;
+    starts[2] = 6;
+    var f:    src.SourceFile = t_file("ab\ncd\nef", ?starts[0], 3);
+    val t:    Text           = text_of(?f);
+    var fail: bool           = false;
+    if (t.len != 8)     { fail = true; }
+    if (t.file != (?f)) { fail = true; }
     # a nil file is a well-formed empty pairing, not a crash: `callee_file`
     # returns one when a call's target cannot be resolved
     val e: Text = text_of(nil);
     if (e.file != nil || e.len != 0) { fail = true; }
-    if (fail) { ret 1; }
+    if (fail)                        { ret 1; }
     ret 0;
 }
 
@@ -335,9 +338,9 @@ test "positions: span text stays inside the file it is bounded by" {
     page.make(?pa);
     var starts: [1]usize;
     starts[0] = 0;
-    var f: src.SourceFile = t_file("abcdef", ?starts[0], 1);
-    val t: Text = text_of(?f);
-    var fail: bool = false;
+    var f:    src.SourceFile = t_file("abcdef", ?starts[0], 1);
+    val t:    Text           = text_of(?f);
+    var fail: bool           = false;
 
     val whole: str = span_text(t, t_span(0, 6), ?pa);
     if (whole == nil || !str_equals(whole, "abcdef")) { fail = true; }
@@ -347,8 +350,8 @@ test "positions: span text stays inside the file it is bounded by" {
     if (over == nil || !str_equals(over, "ef")) { fail = true; }
 
     # a span starting past the end has nothing to copy
-    if (span_text(t, t_span(6, 1), ?pa) != nil)  { fail = true; }
-    if (span_text(t, t_span(0, 0), ?pa) != nil)  { fail = true; }
+    if (span_text(t, t_span(6, 1), ?pa) != nil)            { fail = true; }
+    if (span_text(t, t_span(0, 0), ?pa) != nil)            { fail = true; }
     if (span_text(text_of(nil), t_span(0, 1), ?pa) != nil) { fail = true; }
 
     if (fail) { ret 1; }
@@ -358,15 +361,16 @@ test "positions: span text stays inside the file it is bounded by" {
 # `offset_at` reads the final line's end from the pairing rather than rescanning
 test "positions: the last line ends at the paired length" {
     var starts: [2]usize;
-    starts[0] = 0; starts[1] = 3;
-    var f: src.SourceFile = t_file("ab\ncdef", ?starts[0], 2);
-    val t: Text = text_of(?f);
-    var fail: bool = false;
-    if (!some_is(offset_at(t, 1, 4), 7))  { fail = true; }
+    starts[0] = 0;
+    starts[1] = 3;
+    var f:    src.SourceFile = t_file("ab\ncdef", ?starts[0], 2);
+    val t:    Text           = text_of(?f);
+    var fail: bool           = false;
+    if (!some_is(offset_at(t, 1, 4), 7)) { fail = true; }
     # a column past the last line's end clamps to that end, not to the file's
-    if (!some_is(offset_at(t, 1, 99), 7)) { fail = true; }
+    if (!some_is(offset_at(t, 1, 99), 7))            { fail = true; }
     if (some_present(offset_at(text_of(nil), 0, 0))) { fail = true; }
-    if (fail) { ret 1; }
+    if (fail)                                        { ret 1; }
     ret 0;
 }
 

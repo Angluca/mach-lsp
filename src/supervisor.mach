@@ -39,29 +39,29 @@
 # answered with an error straight away, and that is what the client reacts to.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
 use std.types.string.str_equals;
-use std.types.result.res;
-use std.types.option.opt;
+use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
-use os:     std.system.os;
-use exec:   std.process.exec;
-use env:    std.process.env;
-use thread: std.sync.thread;
-use mutex:  std.sync.mutex;
-use atomic: std.sync.atomic;
+use std.process.env;
+use std.process.exec;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
 
-use sj:        std.data.json;
-use json:      mls.json;
-use mirror:    mls.mirror;
-use transport: mls.transport;
-use trace:     mls.trace;
+use mls.json;
+use mls.mirror;
+use mls.trace;
+use mls.transport;
+use sj: std.data.json;
 
 # the argument that selects the worker role
 pub val WORKER_FLAG: str = "--worker";
@@ -116,22 +116,22 @@ val WATCH_TICK_NS: i64 = 200000000;
 # `to_worker` and `mir` are written by whichever thread holds `mu`; the atomics
 # are read across threads without it.
 rec Relay {
-    alloc:      *Allocator;
-    mu:         mutex.Mutex;
-    to_worker:  i32;
-    mir:        mirror.Mirror;
-    stop:       i64;
-    last_id:    i64;
-    have_id:    i64;
+    alloc:       *Allocator;
+    mu:          mutex.Mutex;
+    to_worker:   i32;
+    mir:         mirror.Mirror;
+    stop:        i64;
+    last_id:     i64;
+    have_id:     i64;
     need_replay: i64;
-    swallow:    i64;
-    pid:        i64;
-    req_at:     i64;
-    exit_at:    i64;
-    down_seen:  i64;
-    deadline:   i64;
-    timed_out:  i64;
-    open_token: str;
+    swallow:     i64;
+    pid:         i64;
+    req_at:      i64;
+    exit_at:     i64;
+    down_seen:   i64;
+    deadline:    i64;
+    timed_out:   i64;
+    open_token:  str;
 }
 
 # one relay per process; the pump thread is handed its address
@@ -195,8 +195,8 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     var reading:  i32 = from_worker[0];
 
     for (true) {
-        var frames: i64 = 0;
-        val clean: bool = pump_worker(alloc, reading, ?frames);
+        var frames: i64  = 0;
+        val clean:  bool = pump_worker(alloc, reading, ?frames);
 
         # the watchdog must not be able to signal this pid once it is being
         # reaped: the kernel is free to reuse the number the moment wait
@@ -206,7 +206,10 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         var child: exec.Child;
         child.pid = pid;
         val wr: res[exec.ExitStatus, exec.Error] = exec.wait(child);
-        if (sel wr.err) { code = 1; brk; }
+        if (sel wr.err) {
+            code = 1;
+            brk;
+        }
         var status: exec.ExitStatus = wr.ok;
 
         if (!exec.signaled(status)) {
@@ -231,12 +234,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         }
 
         if (frames == 0) { barren = barren + 1; }
-        or { barren = 0; }
+        or               { barren = 0; }
 
         val may_retry: bool = restarts < MAX_RESTARTS
-                           && barren < MAX_BARREN
-                           && mirror.has_session(?RELAY.mir)
-                           && atomic.load(?RELAY.stop) == 0;
+            && barren < MAX_BARREN
+            && mirror.has_session(?RELAY.mir)
+            && atomic.load(?RELAY.stop) == 0;
         if (!may_retry) {
             report_crash(alloc, sig, false);
             code = EXIT_WORKER_CRASHED;
@@ -295,8 +298,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
 # and the child's ends are closed here, because holding them past the child's
 # exit would keep the pipes open and turn a crash into a hang.
 fun start_worker(self: str, to: *i32, from: *i32) i64 {
-    if (os.pipe(to) < 0)   { ret -1; }
-    if (os.pipe(from) < 0) { os.close(to[0]); os.close(to[1]); ret -1; }
+    if (os.pipe(to) < 0) { ret -1; }
+    if (os.pipe(from) < 0) {
+        os.close(to[0]);
+        os.close(to[1]);
+        ret -1;
+    }
 
     var argv: [3]*u8;
     argv[0] = self::*u8;
@@ -308,7 +315,7 @@ fun start_worker(self: str, to: *i32, from: *i32) i64 {
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
     val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
-                                       to[0], from[1], 2);
+        to[0], from[1], 2);
     os.close(to[0]);
     os.close(from[1]);
     if (pid < 0) {
@@ -377,18 +384,18 @@ fun now_ns() i64 {
 # the request deadline, from the environment when it names one
 fun configured_deadline() i64 {
     var buf: [24]u8;
-    val r: res[opt[usize], env.EnvError] = env.get(DEADLINE_VAR, ?buf[0], 24);
+    val r:   res[opt[usize], env.EnvError] = env.get(DEADLINE_VAR, ?buf[0], 24);
     if (sel r.err) { ret DEFAULT_DEADLINE_NS; }
     val n_o: opt[usize] = r.ok;
     if (sel n_o.none) { ret DEFAULT_DEADLINE_NS; }
     val n: usize = n_o.some;
     if (n == 0) { ret DEFAULT_DEADLINE_NS; }
-    var ms: i64 = 0;
-    var i: usize = 0;
+    var ms: i64   = 0;
+    var i:  usize = 0;
     for (i < n) {
         if (buf[i] < '0' || buf[i] > '9') { ret DEFAULT_DEADLINE_NS; }
         ms = ms * 10 + (buf[i]::i64 - '0'::i64);
-        i = i + 1;
+        i  = i + 1;
     }
     if (ms <= 0) { ret DEFAULT_DEADLINE_NS; }
     ret ms * 1000000;
@@ -403,7 +410,7 @@ fun pump_client(arg: *u8) {
     val r: *Relay = arg::*Relay;
     for (atomic.load(?r.stop) == 0) {
         var msg: transport.Message;
-        val st: transport.ReadStatus = transport.read_message(?msg, r.alloc);
+        val st:  transport.ReadStatus = transport.read_message(?msg, r.alloc);
         if (st != transport.READ_OK) { brk; }
 
         note_request(r, msg.body, msg.body_len);
@@ -452,14 +459,14 @@ fun pump_client(arg: *u8) {
 # keep. The parent must know what is actually outstanding, not what was recent.
 fun note_response(r: *Relay, body: str, len: usize) bool {
     var relay: bool = true;
-    var rd: json.Reader;
+    var rd:    json.Reader;
     if (!json.reader_init(?rd, r.alloc)) { ret relay; }
     var parsed: json.Message = json.read(?rd, body, len);
     if (parsed.valid) {
         note_progress(r, ?parsed.root);
-        val idv: *sj.Value = json.member(?parsed.root, "id");
-        val answered: bool = json.member(?parsed.root, "result") != nil
-                          || json.member(?parsed.root, "error") != nil;
+        val idv:      *sj.Value = json.member(?parsed.root, "id");
+        val answered: bool      = json.member(?parsed.root, "result") != nil
+            || json.member(?parsed.root, "error") != nil;
         if (idv != nil && answered) {
             val id: str = json.id_text(idv, r.alloc);
             if (id != nil) {
@@ -501,11 +508,11 @@ fun note_response(r: *Relay, body: str, len: usize) bool {
 fun note_progress(r: *Relay, root: *sj.Value) {
     if (!json.text_equals(json.member(root, "method"), "$/progress", r.alloc)) { ret; }
     val params: *sj.Value = json.member(root, "params");
-    val kind: *sj.Value = json.member2(params, "value", "kind");
+    val kind:   *sj.Value = json.member2(params, "value", "kind");
 
     if (json.text_equals(kind, "begin", r.alloc)) {
         val token: str = json.text(json.member(params, "token"), r.alloc);
-        if (token == nil) { ret; }
+        if (token == nil)        { ret; }
         if (r.open_token != nil) { close_progress(r); }
         r.open_token = token;
         ret;
@@ -568,7 +575,7 @@ fun note_request(r: *Relay, body: str, len: usize) {
 # would mean re-escaping it from a thread that is about to exit, and the message
 # is diagnostic rather than protocol.
 fun parse_id(token: str) i64 {
-    var v: i64 = 0;
+    var v: i64   = 0;
     var i: usize = 0;
     val n: usize = str_len(token);
     for (i < n) {
@@ -592,7 +599,7 @@ fun parse_id(token: str) i64 {
 fun pump_worker(alloc: *Allocator, fd: i32, frames: *i64) bool {
     for (true) {
         var msg: transport.Message;
-        val st: transport.ReadStatus = transport.read_message_from(fd, ?msg, alloc);
+        val st:  transport.ReadStatus = transport.read_message_from(fd, ?msg, alloc);
         if (st == transport.READ_EOF) { ret true; }
         if (st != transport.READ_OK)  { ret false; }
         @frames = @frames + 1;
@@ -647,7 +654,7 @@ fun report_crash(alloc: *Allocator, sig: i64, recovering: bool) {
     var n: json.Buf = json.buf_init(alloc);
     json.buf_push(?n, "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":");
     if (recovering) { json.buf_push(?n, "2"); }
-    or             { json.buf_push(?n, "1"); }
+    or              { json.buf_push(?n, "1"); }
     json.buf_push(?n, ",\"message\":");
     var text: json.Buf = json.buf_init(alloc);
     if (hung) { json.buf_push(?text, "mach-lsp: the analysis worker stopped responding and was ended (signal "); }

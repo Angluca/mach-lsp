@@ -21,21 +21,21 @@
 # deliberate second decision and still capped, because a trace that pages in a
 # 40 KB buffer per keystroke is unreadable as well as invasive.
 
-use std.types.string.str;
-use std.types.string.str_len;
-use std.types.string.str_equals;
-use std.types.size.usize;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
-use std.types.result.res;
+use std.types.bool.true;
 use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
-use os:     std.system.os;
-use env:    std.process.env;
 use chrono: std.chrono.time;
 use fmtstr: std.format;
-use writer: std.io.writer;
+use std.io.writer;
+use std.process.env;
+use std.system.os;
 
 # file the trace log is appended to when nothing overrides it
 val LOG_PATH: str = "/tmp/mach-lsp.log";
@@ -110,7 +110,7 @@ fun trace_enabled() bool {
     if (sel n.none) { ret false; }
     var len: usize = n.some;
     if (len > 31) { len = 31; }
-    GATE_BUF[len] = 0;
+    GATE_BUF[len]  = 0;
     BODIES_ENABLED = str_equals((?GATE_BUF[0])::str, BODIES_WORD);
     ret true;
 }
@@ -119,8 +119,8 @@ fun trace_enabled() bool {
 # ---
 # ret: a live descriptor, or a negative value on failure
 fun trace_open() i64 {
-    val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
-    val r: res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
+    val flags: i32                           = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
+    val r:     res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
     if (sel r.ok) {
         val n: opt[usize] = r.ok;
         if (sel n.some) {
@@ -147,8 +147,8 @@ pub fun log(msg: str) {
     }
 
     if (!LOG_ENABLED) { ret; }
-    if (LOG_FD < 0) { ret; }
-    if (msg == nil) { ret; }
+    if (LOG_FD < 0)   { ret; }
+    if (msg == nil)   { ret; }
     val len: usize = str_len(msg);
     if (len == 0) { ret; }
 
@@ -189,7 +189,7 @@ pub fun bodies() bool {
 # body:  the frame body
 # len:   its length in bytes
 pub fun frame(label: str, body: str, len: usize) {
-    if (!FRAMES) { ret; }
+    if (!FRAMES)    { ret; }
     if (!enabled()) { ret; }
     if (!bodies()) {
         logf("{} {} bytes", label, len);
@@ -234,7 +234,7 @@ fun trace_sink(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
 pub fun logf(fmt: str, va: ...) {
     if (!enabled()) { ret; }
     var w: writer.Writer;
-    w.ctx = nil;
+    w.ctx     = nil;
     w.f_write = trace_sink;
     fmtstr.vformat(?w, fmt, va...);
     os.write(LOG_FD::i32, "\n"::*u8, 1);

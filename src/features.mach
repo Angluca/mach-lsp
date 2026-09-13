@@ -18,40 +18,41 @@
 # confined to symbols whose `origin` is this buffer's module.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.opt;
-use std.types.result.res;
-use std.types.error.err;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
-use page: std.allocator.page;
+use std.allocator.page;
 
-use sess:   mach.lang.session;
-use src:    mach.lang.source;
-use intern: mach.lang.intern;
-use type:   mach.lang.type;
-use token:  mach.lang.fe.token;
-use ast:    mach.lang.fe.ast;
-use id:     mach.lang.fe.ast.id;
-use module: mach.lang.fe.ast.module;
-use decl:   mach.lang.fe.ast.decl;
-use stmt:   mach.lang.fe.ast.stmt;
-use expr:   mach.lang.fe.ast.expr;
-use atype:  mach.lang.fe.ast.type;
-use fedoc:  mach.lang.fe.doc;
-use rslv:    mach.lang.fe.resolve;
-use sema:   mach.lang.fe.sema;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.module;
+use mach.lang.fe.ast.stmt;
+use atype: mach.lang.fe.ast.type;
+use fedoc: mach.lang.fe.doc;
+use rslv:  mach.lang.fe.resolve;
+use mach.lang.fe.sema;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
+use mach.lang.type;
 
 use mtypes: mls.types;
 
-use allocator: std.allocator;
-use fail:   mach.lang.fail;
+use mach.lang.fail;
+use std.allocator;
+
 # a symbol a position references, joined with the location of the
 # name token that referenced it
 # ---
@@ -151,7 +152,7 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, file: *
 # offset: cursor byte offset
 # ret:    some(ref) when the cursor is on an import path or alias, else none
 fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
-    if (file == nil) { ret opt[SymbolRef].none{}; }
+    if (file == nil)                                        { ret opt[SymbolRef].none{}; }
     if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[SymbolRef].none{}; }
     val sid: rslv.SymbolId = rr.decl_symbol[did];
     if (sid == rslv.SYMBOL_NIL || sid >= rr.symbol_count) { ret opt[SymbolRef].none{}; }
@@ -162,8 +163,14 @@ fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId,
 
     var path:  token.Span;
     var alias: token.Span;
-    if (d.kind == decl.DECL_KIND_USE) { path = d.data.use_.path; alias = d.data.use_.alias; }
-    or (d.kind == decl.DECL_KIND_FWD) { path = d.data.fwd_.path; alias = d.data.fwd_.alias; }
+    if (d.kind == decl.DECL_KIND_USE) {
+        path  = d.data.use_.path;
+        alias = d.data.use_.alias;
+    }
+    or (d.kind == decl.DECL_KIND_FWD) {
+        path  = d.data.fwd_.path;
+        alias = d.data.fwd_.alias;
+    }
     or { ret opt[SymbolRef].none{}; }
 
     val on_path:  bool = ast.span_contains(path, offset);
@@ -184,7 +191,7 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId
 
     val gstart: u32 = generics_start_of(d);
     val glen:   u32 = generics_len_of(d);
-    var gi: u32 = 0;
+    var gi:     u32 = 0;
     for (gi < glen) {
         val gname: token.Span = a.generic_names[gstart + gi];
         if (ast.span_contains(gname, offset)) {
@@ -218,6 +225,7 @@ fun generics_start_of(d: *decl.Decl) u32 {
     if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.generics_start; }
     ret 0;
 }
+
 fun generics_len_of(d: *decl.Decl) u32 {
     if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.generics_len; }
     if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.generics_len; }
@@ -248,7 +256,7 @@ fun find_binding_symbol(rr: *rslv.ResolveResult, kind: rslv.SymKind, did: id.Dec
 # ret: some(name span) of the binding, or none
 pub fun binding_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
     if (sym.kind != rslv.SYM_PARAM && sym.kind != rslv.SYM_GENERIC) { ret opt[token.Span].none{}; }
-    if (sym.decl == id.DECL_NIL) { ret opt[token.Span].none{}; }
+    if (sym.decl == id.DECL_NIL)                                    { ret opt[token.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
     if (sel d_opt.none) { ret opt[token.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
@@ -278,7 +286,7 @@ pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.ModuleId, sid: rslv.S
     if (sid >= rr.symbol_count) { ret false; }
     val sym: *rslv.Symbol = ?rr.symbols[sid];
     if (sym.kind == rslv.SYM_PRIM) { ret false; }
-    if (sym.decl == id.DECL_NIL) { ret false; }
+    if (sym.decl == id.DECL_NIL)   { ret false; }
     ret sym.origin == own;
 }
 
@@ -323,8 +331,8 @@ pub fun top_level_count(a: *ast.Ast) u32 {
 # flat `Ast.decls` array, so nested declarations (a `val` inside a function
 # body) are excluded
 # ---
-# a: the buffer's parsed Ast
-# i: index into the module's top-level decl list
+# a:   the buffer's parsed Ast
+# i:   index into the module's top-level decl list
 # ret: the DeclId, or DECL_NIL
 pub fun top_level_decl(a: *ast.Ast, i: u32) id.DeclId {
     val mo: opt[*module.Module] = ast.get_module(a, a.root_module);
@@ -453,9 +461,9 @@ pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) op
 # removed, or none when `stop` does not occur
 fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) opt[token.Span] {
     if (file == nil || file.text == nil) { ret opt[token.Span].none{}; }
-    val text: str = file.text;
-    var i: usize = span.offset;
-    val end: usize = span.offset + span.len;
+    val text: str   = file.text;
+    var i:    usize = span.offset;
+    val end:  usize = span.offset + span.len;
     for (i < end) {
         if (text[i] == stop) {
             var n: usize = i - span.offset;
@@ -474,9 +482,9 @@ fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) opt[token.Spa
 # whether `span` covers a line break
 fun spans_multiple_lines(file: *src.SourceFile, span: token.Span) bool {
     if (file == nil || file.text == nil) { ret false; }
-    val text: str = file.text;
-    var i: usize = span.offset;
-    val end: usize = span.offset + span.len;
+    val text: str   = file.text;
+    var i:    usize = span.offset;
+    val end:  usize = span.offset + span.len;
     for (i < end) {
         if (text[i] == '\n') { ret true; }
         i = i + 1;
@@ -528,7 +536,7 @@ fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # ret: some(span) covering the doc block within the file text, or none
 pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
     if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret opt[token.Span].none{}; }
-    if (sym.decl == id.DECL_NIL) { ret opt[token.Span].none{}; }
+    if (sym.decl == id.DECL_NIL)                                    { ret opt[token.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
     if (sel d_opt.none) { ret opt[token.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
@@ -551,7 +559,7 @@ pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) opt[token.Span] {
     if (doc.len == 0 || field_name.len == 0) { ret opt[token.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
-    var c: fedoc.DocComponent;
+    var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
         if (same_source_span_equal(source, c.name_span, field_name)) {
             if (c.desc_span.len == 0) { ret opt[token.Span].none{}; }
@@ -579,7 +587,7 @@ pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) opt
 pub fun component_desc_named(source: str, doc: token.Span, name: str, is_generic: bool) opt[token.Span] {
     if (doc.len == 0 || name == nil) { ret opt[token.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
-    var c: fedoc.DocComponent;
+    var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
         val ident: token.Span = component_ident(source, c.name_span, is_generic);
         if (ident.len == 0) { cnt; }
@@ -594,14 +602,20 @@ pub fun component_desc_named(source: str, doc: token.Span, name: str, is_generic
 # whether component identifier `ident` names the binding `name`, ignoring a
 # leading `$` on either side
 fun ident_names(source: str, ident: token.Span, name: str) bool {
-    val s: *u8 = source::*u8;
-    val n: *u8 = name::*u8;
+    val s:  *u8   = source::*u8;
+    val n:  *u8   = name::*u8;
     var io: usize = ident.offset;
     var il: usize = ident.len;
-    if (il > 0 && s[io] == '$') { io = io + 1; il = il - 1; }
+    if (il > 0 && s[io] == '$') {
+        io = io + 1;
+        il = il - 1;
+    }
     var no: usize = 0;
     var nl: usize = str_len(name);
-    if (nl > 0 && n[0] == '$') { no = 1; nl = nl - 1; }
+    if (nl > 0 && n[0] == '$') {
+        no = 1;
+        nl = nl - 1;
+    }
     if (il != nl) { ret false; }
     var i: usize = 0;
     for (i < il) {
@@ -653,15 +667,15 @@ pub fun kind_label(kind: rslv.SymKind) str {
 # kind: a rslv.SYM_* value
 # ret:  the LSP SymbolKind code
 pub fun lsp_symbol_kind(kind: rslv.SymKind) i64 {
-    if (kind == rslv.SYM_FUN)      { ret 12; }
-    if (kind == rslv.SYM_REC)      { ret 23; }
-    if (kind == rslv.SYM_UNI)      { ret 10; }
-    if (kind == rslv.SYM_DEF)      { ret 26; }
-    if (kind == rslv.SYM_VAL)      { ret 14; }
-    if (kind == rslv.SYM_VAR)      { ret 13; }
-    if (kind == rslv.SYM_PARAM)    { ret 13; }
-    if (kind == rslv.SYM_GENERIC)  { ret 26; }
-    if (kind == rslv.SYM_TEST)     { ret 12; }
+    if (kind == rslv.SYM_FUN)     { ret 12; }
+    if (kind == rslv.SYM_REC)     { ret 23; }
+    if (kind == rslv.SYM_UNI)     { ret 10; }
+    if (kind == rslv.SYM_DEF)     { ret 26; }
+    if (kind == rslv.SYM_VAL)     { ret 14; }
+    if (kind == rslv.SYM_VAR)     { ret 13; }
+    if (kind == rslv.SYM_PARAM)   { ret 13; }
+    if (kind == rslv.SYM_GENERIC) { ret 26; }
+    if (kind == rslv.SYM_TEST)    { ret 12; }
     ret 13;
 }
 
@@ -697,7 +711,7 @@ pub fun lsp_completion_kind(kind: rslv.SymKind) i64 {
 # ret:    some(name span) when eid references target, or none
 pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, target: rslv.SymbolId) opt[token.Span] {
     if (rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret opt[token.Span].none{}; }
-    if (rr.expr_resolved[eid] != target) { ret opt[token.Span].none{}; }
+    if (rr.expr_resolved[eid] != target)                      { ret opt[token.Span].none{}; }
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
     if (sel eo.none) { ret opt[token.Span].none{}; }
     ret opt[token.Span].some{name_span_of_expr(eo.some)};
@@ -713,7 +727,7 @@ pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, targ
 # ret:    some(name span) when tid references target, or none
 pub fun type_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, tid: id.TypeId, target: rslv.SymbolId) opt[token.Span] {
     if (rr.type_resolved == nil || tid::u32 >= rr.type_count) { ret opt[token.Span].none{}; }
-    if (rr.type_resolved[tid] != target) { ret opt[token.Span].none{}; }
+    if (rr.type_resolved[tid] != target)                      { ret opt[token.Span].none{}; }
     ret type_name_span(a, tid);
 }
 
@@ -730,7 +744,7 @@ pub fun type_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, tid: id.TypeId, targ
 pub fun completion_candidate(rr: *rslv.ResolveResult, sid: rslv.SymbolId) bool {
     if (sid >= rr.symbol_count) { ret false; }
     val sym: *rslv.Symbol = ?rr.symbols[sid];
-    if (sym.name == intern.STR_NIL) { ret false; }
+    if (sym.name == intern.STR_NIL)   { ret false; }
     if (sym.kind == rslv.SYM_PARAM)   { ret false; }
     if (sym.kind == rslv.SYM_GENERIC) { ret false; }
     if (sym.kind == rslv.SYM_TEST)    { ret false; }
@@ -749,7 +763,7 @@ pub fun completion_candidate(rr: *rslv.ResolveResult, sid: rslv.SymbolId) bool {
 # ret:    some(name span) when did declares target, or none
 pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId) opt[token.Span] {
     if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[token.Span].none{}; }
-    if (rr.decl_symbol[did] != target) { ret opt[token.Span].none{}; }
+    if (rr.decl_symbol[did] != target)                      { ret opt[token.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret opt[token.Span].none{}; }
     ret decl_name_span(d_opt.some);
@@ -765,18 +779,25 @@ pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, targ
 # path: byte span covering the dotted import path
 # ret:  the leaf segment span
 pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
-    val s: *u8 = file.text::*u8;
+    val s:     *u8   = file.text::*u8;
     val start: usize = path.offset;
     val end:   usize = path.offset + path.len;
     var dot:   usize = start;
     var found: bool  = false;
     var i:     usize = start;
     for (i < end) {
-        if (s[i] == '.') { dot = i; found = true; }
+        if (s[i] == '.') {
+            dot   = i;
+            found = true;
+        }
         i = i + 1;
     }
     var out: token.Span;
-    if (!found) { out.offset = path.offset; out.len = path.len; ret out; }
+    if (!found) {
+        out.offset = path.offset;
+        out.len    = path.len;
+        ret out;
+    }
     out.offset = dot + 1;
     out.len    = end - (dot + 1);
     ret out;
@@ -796,7 +817,7 @@ pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
 # ret:    some(leaf span) when did imports target, or none
 pub fun import_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId, file: *src.SourceFile) opt[token.Span] {
     if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[token.Span].none{}; }
-    if (rr.decl_symbol[did] != target) { ret opt[token.Span].none{}; }
+    if (rr.decl_symbol[did] != target)                      { ret opt[token.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret opt[token.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
@@ -818,7 +839,7 @@ pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) boo
     if (name == nil) { ret false; }
     val nlen: usize = str_len(name);
     if (span.len != nlen) { ret false; }
-    val s: *u8 = file.text::*u8;
+    val s: *u8   = file.text::*u8;
     var i: usize = 0;
     for (i < nlen) {
         if (s[span.offset + i] != name[i]) { ret false; }
@@ -892,7 +913,7 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) opt[FieldRef] {
     if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
         val start: u32 = e.data.struct_lit.fields_start;
         val len:   u32 = e.data.struct_lit.fields_len;
-        var i: u32 = 0;
+        var i:     u32 = 0;
         for (i < len) {
             val fi: *expr.FieldInit = ?a.field_inits[start + i];
             if (ast.span_contains(fi.name, offset)) {
@@ -992,20 +1013,20 @@ pub rec FieldKey {
 # of the record matches the same key. pure over (`a`, `sr`, `ti`) - the caller
 # walks `[0, a.expr_len)` feeding the spans this returns to a sink
 # ---
-# a:    the module's parsed Ast
-# sr:   the module's SemaResult (per-expr typing)
-# ti:   the session type interner (for nominal peeling)
-# eid:  the expr id to test
-# qf:   the SourceFile backing `a` (the referenced name bytes)
-# key:  the field identity to match
-# ret:  some(name span) when `eid` references the keyed field, or none
+# a:   the module's parsed Ast
+# sr:  the module's SemaResult (per-expr typing)
+# ti:  the session type interner (for nominal peeling)
+# eid: the expr id to test
+# qf:  the SourceFile backing `a` (the referenced name bytes)
+# key: the field identity to match
+# ret: some(name span) when `eid` references the keyed field, or none
 pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[token.Span] {
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
     if (sel eo.none) { ret opt[token.Span].none{}; }
     val e: *expr.Expr = eo.some;
 
     if (e.kind == expr.EXPR_KIND_MEMBER) {
-        if (!host_matches(sr, ti, e.data.member.object, key)) { ret opt[token.Span].none{}; }
+        if (!host_matches(sr, ti, e.data.member.object, key))                         { ret opt[token.Span].none{}; }
         if (!span_bytes_equal(qf, e.data.member.name, key.decl_file, key.field_name)) { ret opt[token.Span].none{}; }
         ret opt[token.Span].some{e.data.member.name};
     }
@@ -1014,7 +1035,7 @@ pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInter
         if (!host_matches(sr, ti, eid, key)) { ret opt[token.Span].none{}; }
         val start: u32 = e.data.struct_lit.fields_start;
         val len:   u32 = e.data.struct_lit.fields_len;
-        var i: u32 = 0;
+        var i:     u32 = 0;
         for (i < len) {
             val fi: *expr.FieldInit = ?a.field_inits[start + i];
             if (span_bytes_equal(qf, fi.name, key.decl_file, key.field_name)) {
@@ -1033,8 +1054,8 @@ pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInter
 # the same record across modules, regardless of pointer / generic-instance wrapping
 # (peeled by `nominal_of`)
 fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, key: FieldKey) bool {
-    val tid: type.TypeId = mtypes.type_of(sr, eid);
-    val no: opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
+    val tid: type.TypeId         = mtypes.type_of(sr, eid);
+    val no:  opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
     if (sel no.none) { ret false; }
     val n: mtypes.Nominal = no.some;
     ret n.file == key.file && n.name == key.name;
@@ -1064,19 +1085,25 @@ fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, k
 # cap:       capacity of `out`
 # ret:       number of spans written
 pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, qf: *src.SourceFile, key: FieldKey, declaring: bool, want_doc: bool, decl_src: str, doc: token.Span, out: *token.Span, cap: usize) usize {
-    var n: usize = 0;
+    var n:  usize = 0;
     var ei: usize = 0;
     for (ei < a.expr_len && n < cap) {
         val so: opt[token.Span] = field_ref_span_at(a, sr, ti, ei::id.ExprId, qf, key);
-        if (sel so.some) { out[n] = so.some; n = n + 1; }
+        if (sel so.some) {
+            out[n] = so.some;
+            n      = n + 1;
+        }
         ei = ei + 1;
     }
     if (declaring && n < cap) {
         out[n] = key.field_name;
-        n = n + 1;
+        n      = n + 1;
         if (want_doc && doc.len != 0 && n < cap) {
             val co: opt[token.Span] = doc_component_name_span(decl_src, doc, key.decl_file, key.field_name, false);
-            if (sel co.some) { out[n] = co.some; n = n + 1; }
+            if (sel co.some) {
+                out[n] = co.some;
+                n      = n + 1;
+            }
         }
     }
     ret n;
@@ -1093,19 +1120,19 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInt
 # component carries no bracketed identifier. matching compares the inner identifier
 # against `query` so a `# [T]:` head matches the generic named `T`
 # ---
-# source:      the declaring module's source text (the doc block points into it)
-# doc:         the owning decl's `Decl.doc` span
-# qf:          the SourceFile backing `query`
-# query:       byte span of the field / param / generic binding name
-# is_generic:  true to match / rewrite the bracket form `# [T]:`
-# ret:         some(span to rewrite) for the matching component, or none
+# source:     the declaring module's source text (the doc block points into it)
+# doc:        the owning decl's `Decl.doc` span
+# qf:         the SourceFile backing `query`
+# query:      byte span of the field / param / generic binding name
+# is_generic: true to match / rewrite the bracket form `# [T]:`
+# ret:        some(span to rewrite) for the matching component, or none
 pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFile, query: token.Span, is_generic: bool) opt[token.Span] {
     if (doc.len == 0 || query.len == 0) { ret opt[token.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
-    var c: fedoc.DocComponent;
+    var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
         val ident: token.Span = component_ident(source, c.name_span, is_generic);
-        if (ident.len == 0) { cnt; }
+        if (ident.len == 0)                               { cnt; }
         if (span_bytes_equal_2(source, ident, qf, query)) { ret opt[token.Span].some{ident}; }
     }
     ret opt[token.Span].none{};
@@ -1117,7 +1144,7 @@ pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFil
 # identifier. the narrowing `doc_component_name_span` applies so a generic rename
 # rewrites `T` inside `[T]` without disturbing the brackets
 fun component_ident(source: str, name: token.Span, is_generic: bool) token.Span {
-    if (!is_generic) { ret name; }
+    if (!is_generic)  { ret name; }
     if (name.len < 3) { ret empty_span(); }
     val lo: usize = name.offset;
     val hi: usize = name.offset + name.len;
@@ -1142,7 +1169,7 @@ fun empty_span() token.Span {
 # binding name) - bridging `same_source_span_equal` and `span_bytes_equal`
 fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
     if (sa.len != sb.len) { ret false; }
-    val b: *u8 = fb.text::*u8;
+    val b: *u8   = fb.text::*u8;
     var i: usize = 0;
     for (i < sa.len) {
         if (source[sa.offset + i] != b[sb.offset + i]) { ret false; }
@@ -1156,15 +1183,15 @@ fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: tok
 # field name against the referencing token with - the two may sit in different
 # source files (a field declared in a dependency, referenced in the buffer)
 # ---
-# fa: source file backing span `sa`
-# sa: byte span in `fa`
-# fb: source file backing span `sb`
-# sb: byte span in `fb`
+# fa:  source file backing span `sa`
+# sa:  byte span in `fa`
+# fb:  source file backing span `sb`
+# sb:  byte span in `fb`
 # ret: true on an exact byte-for-byte match
 pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
     if (sa.len != sb.len) { ret false; }
-    val a: *u8 = fa.text::*u8;
-    val b: *u8 = fb.text::*u8;
+    val a: *u8   = fa.text::*u8;
+    val b: *u8   = fb.text::*u8;
     var i: usize = 0;
     for (i < sa.len) {
         if (a[sa.offset + i] != b[sb.offset + i]) { ret false; }
@@ -1233,15 +1260,15 @@ test "features: field_decl_span matches a field across two sources (dependency)"
     var pa: Allocator;
     page.make(?pa);
     # the declaring "module" file holds the record fields
-    var da: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32 = add_field(?da, 0, 4);   # "name"
-    add_field(?da, 5, 3);                     # "age"
+    var da:    ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32     = add_field(?da, 0, 4); # "name"
+    add_field(?da, 5, 3); # "age"
     var df: src.SourceFile = stub_file("name age");
     # the referencing buffer file holds a member access "p.age"
     var qf: src.SourceFile = stub_file("p.age");
 
-    var fail: bool = false;
-    val o: opt[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
+    var fail: bool            = false;
+    val o:    opt[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (sp.offset != 5 || sp.len != 3) { fail = true; }
@@ -1256,14 +1283,14 @@ test "features: field_decl_span matches a field across two sources (dependency)"
 test "features: field_decl_span returns none for an unknown field" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32 = add_field(?a, 0, 1);   # "x"
-    add_field(?a, 2, 1);                     # "y"
-    var f: src.SourceFile = stub_file("xy");
+    var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32     = add_field(?a, 0, 1); # "x"
+    add_field(?a, 2, 1); # "y"
+    var f:  src.SourceFile = stub_file("xy");
     var qf: src.SourceFile = stub_file("o.z");
 
     val sel_1: opt[token.Span] = field_decl_span(?a, ?f, start, 2, ?qf, span_at(2, 1));
-    val ok: bool = sel sel_1.none;
+    val ok:    bool            = sel sel_1.none;
     ast.dnit(?a);
     if (!ok) { ret 1; }
     ret 0;
@@ -1272,11 +1299,11 @@ test "features: field_decl_span returns none for an unknown field" {
 test "features: field_decl_span returns none for an empty field range" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
+    var a: ast.Ast        = ast.init(?pa, 0::src.FileId);
     var f: src.SourceFile = stub_file("x");
 
     val sel_2: opt[token.Span] = field_decl_span(?a, ?f, 0, 0, ?f, span_at(0, 1));
-    val ok: bool = sel sel_2.none;
+    val ok:    bool            = sel sel_2.none;
     ast.dnit(?a);
     if (!ok) { ret 1; }
     ret 0;
@@ -1285,34 +1312,34 @@ test "features: field_decl_span returns none for an empty field range" {
 test "features: field_decl_span returns none for a zero-length query" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32 = add_field(?a, 0, 1);   # "x"
-    var f: src.SourceFile = stub_file("x");
+    var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
+    val start: u32            = add_field(?a, 0, 1); # "x"
+    var f:     src.SourceFile = stub_file("x");
 
     val sel_3: opt[token.Span] = field_decl_span(?a, ?f, start, 1, ?f, span_at(0, 0));
-    val ok: bool = sel sel_3.none;
+    val ok:    bool            = sel sel_3.none;
     ast.dnit(?a);
     if (!ok) { ret 1; }
     ret 0;
 }
 
 test "features: span_bytes_equal matches identical bytes across files" {
-    var fa: src.SourceFile = stub_file("alpha");
-    var fb: src.SourceFile = stub_file("xalphay");
-    var fail: bool = false;
+    var fa:   src.SourceFile = stub_file("alpha");
+    var fb:   src.SourceFile = stub_file("xalphay");
+    var fail: bool           = false;
     if (!span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 5))) { fail = true; }
     if (span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 4)))  { fail = true; }
     if (span_bytes_equal(?fa, span_at(0, 3), ?fb, span_at(0, 3)))  { fail = true; }
-    if (fail) { ret 1; }
+    if (fail)                                                      { ret 1; }
     ret 0;
 }
 
 test "features: field_decl_self_at hits a field name and misses elsewhere" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32 = add_field(?a, 4, 1);   # "x" at offset 4
-    add_field(?a, 10, 3);                    # "foo" at offset 10
+    var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
+    val start: u32     = add_field(?a, 4, 1); # "x" at offset 4
+    add_field(?a, 10, 3); # "foo" at offset 10
 
     var fail: bool = false;
     # offset 11 sits inside "foo"
@@ -1336,14 +1363,14 @@ test "features: field_decl_self_at hits a field name and misses elsewhere" {
 # zeroed; only `kind` and `doc` matter for the doc-retrieval tests
 fun add_doc_fun(a: *ast.Ast, doc_off: usize, doc_len: usize) id.DeclId {
     var d: decl.Decl;
-    d.kind             = decl.DECL_KIND_FUN;
-    d.flags            = 0;
-    d.doc.offset       = doc_off;
-    d.doc.len          = doc_len;
-    d.decorators_start = 0;
-    d.decorators_len   = 0;
-    d.data.fun_.name.offset   = 0;
-    d.data.fun_.name.len      = 0;
+    d.kind                     = decl.DECL_KIND_FUN;
+    d.flags                    = 0;
+    d.doc.offset               = doc_off;
+    d.doc.len                  = doc_len;
+    d.decorators_start         = 0;
+    d.decorators_len           = 0;
+    d.data.fun_.name.offset    = 0;
+    d.data.fun_.name.len       = 0;
     d.data.fun_.generics_start = 0;
     d.data.fun_.generics_len   = 0;
     d.data.fun_.params_start   = 0;
@@ -1369,12 +1396,12 @@ fun fun_sym(did: id.DeclId) rslv.Symbol {
 test "features: doc_span_of returns the decl's first-class doc span" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId = add_doc_fun(?a, 4, 9);
+    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId   = add_doc_fun(?a, 4, 9);
     var sym: rslv.Symbol = fun_sym(did);
 
-    var fail: bool = false;
-    val o: opt[token.Span] = doc_span_of(?a, ?sym);
+    var fail: bool            = false;
+    val o:    opt[token.Span] = doc_span_of(?a, ?sym);
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (sp.offset != 4 || sp.len != 9) { fail = true; }
@@ -1389,12 +1416,12 @@ test "features: doc_span_of returns the decl's first-class doc span" {
 test "features: doc_span_of returns none for a decl with no docstring" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId = add_doc_fun(?a, 0, 0);   # empty doc span = no docstring
+    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId   = add_doc_fun(?a, 0, 0); # empty doc span = no docstring
     var sym: rslv.Symbol = fun_sym(did);
 
     val sel_5: opt[token.Span] = doc_span_of(?a, ?sym);
-    val ok: bool = sel sel_5.none;
+    val ok:    bool            = sel sel_5.none;
     ast.dnit(?a);
     if (!ok) { ret 1; }
     ret 0;
@@ -1403,13 +1430,13 @@ test "features: doc_span_of returns none for a decl with no docstring" {
 test "features: doc_span_of returns none for a param symbol" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId = add_doc_fun(?a, 4, 9);
+    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
+    val did: id.DeclId   = add_doc_fun(?a, 4, 9);
     var sym: rslv.Symbol = fun_sym(did);
     sym.kind = rslv.SYM_PARAM;
 
     val sel_6: opt[token.Span] = doc_span_of(?a, ?sym);
-    val ok: bool = sel sel_6.none;
+    val ok:    bool            = sel sel_6.none;
     ast.dnit(?a);
     if (!ok) { ret 1; }
     ret 0;
@@ -1424,7 +1451,7 @@ test "features: field_doc_desc finds the matching component's description" {
     val src: str = "# a point\n# ---\n# x: the horizontal coordinate\n# y: the vertical coordinate\nrec P { x: i32; y: i32; }";
     var doc: token.Span;
     doc.offset = 0;
-    doc.len    = 75;   # through the end of the `# y: ...` component, before the rec body
+    doc.len    = 75; # through the end of the `# y: ...` component, before the rec body
     # the rec-body field names: "x" at offset 84, "y" at offset 92.
 
     var fail: bool = false;
@@ -1454,7 +1481,7 @@ test "features: field_doc_desc returns none when no component matches" {
     doc.len    = 46;
     # "z" field name at offset 55 - no matching component
     val sel_7: opt[token.Span] = field_doc_desc(src, doc, name_span_in(55, 1));
-    val ok: bool = sel sel_7.none;
+    val ok:    bool            = sel sel_7.none;
     if (!ok) { ret 1; }
     ret 0;
 }
@@ -1466,7 +1493,7 @@ test "features: field_doc_desc returns none for a summary-only doc block" {
     doc.len    = 31;
     # "x" field name at offset 40 - the block has no component lines
     val sel_8: opt[token.Span] = field_doc_desc(src, doc, name_span_in(40, 1));
-    val ok: bool = sel sel_8.none;
+    val ok:    bool            = sel sel_8.none;
     if (!ok) { ret 1; }
     ret 0;
 }
@@ -1523,7 +1550,10 @@ fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
             sr.expr_type  = r.ok;
             sr.expr_count = n;
             var i: u32 = 0;
-            for (i < n) { sr.expr_type[i] = type.TYPE_NIL; i = i + 1; }
+            for (i < n) {
+                sr.expr_type[i] = type.TYPE_NIL;
+                i               = i + 1;
+            }
         }
     }
     ret sr;
@@ -1551,8 +1581,8 @@ fun add_ident(a: *ast.Ast, off: usize, len: usize) id.ExprId {
 # member expr id
 fun add_member(a: *ast.Ast, object: id.ExprId, name_off: usize, name_len: usize) id.ExprId {
     var e: expr.Expr;
-    e.span = span_at(name_off, name_len);
-    e.kind = expr.EXPR_KIND_MEMBER;
+    e.span               = span_at(name_off, name_len);
+    e.kind               = expr.EXPR_KIND_MEMBER;
     e.data.member.object = object;
     e.data.member.name   = span_at(name_off, name_len);
     val r: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
@@ -1571,8 +1601,8 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     val start: u32 = fr.ok;
 
     var e: expr.Expr;
-    e.span = span_at(name_off, name_len);
-    e.kind = expr.EXPR_KIND_STRUCT_LIT;
+    e.span                         = span_at(name_off, name_len);
+    e.kind                         = expr.EXPR_KIND_STRUCT_LIT;
     e.data.struct_lit.ty           = id.TYPE_NIL;
     e.data.struct_lit.fields_start = start;
     e.data.struct_lit.fields_len   = 1;
@@ -1584,27 +1614,27 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
 test "features: field_ref_span_at matches a member access of the keyed record" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:    type.TypeInterner;
     val sel_9: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_9.err) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
     # 8 of the declaring source. the buffer text "p.x" carries the member access
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(2), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" at offset 8
+    val recp:  type.TypeId    = recp_r.ok;
+    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
     var buf:   src.SourceFile = stub_file("p.x");
 
     # expr 0 = receiver "p" (typed P); expr 1 = member access "p.x" (name "x"@2)
-    val recv: id.ExprId = add_ident(?a, 0, 1);
-    val mem:  id.ExprId = add_member(?a, recv, 2, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
+    val recv: id.ExprId       = add_ident(?a, 0, 1);
+    val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
+    var sr:   sema.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[recv] = recp;
 
-    val key: FieldKey = fk(2, 4, ?declf, 8, 1);
-    var fail: bool = false;
-    val o: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
+    val key:  FieldKey        = fk(2, 4, ?declf, 8, 1);
+    var fail: bool            = false;
+    val o:    opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (sp.offset != 2 || sp.len != 1) { fail = true; }
@@ -1624,27 +1654,27 @@ test "features: field_ref_span_at matches a member access of the keyed record" {
 test "features: field_ref_span_at peels a pointer receiver to the record" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_11: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_11.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 0::intern.StrId, t_owner(1), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
+    val recp:  type.TypeId                 = recp_r.ok;
     val ptr_r: res[type.TypeId, fail.Fail] = type.intern_pointer(?ti, recp);
     if (sel ptr_r.err) { ret 1; }
-    val ptr: type.TypeId = ptr_r.ok;
-    var declf: src.SourceFile = stub_file("name");   # "name" at offset 0
+    val ptr:   type.TypeId    = ptr_r.ok;
+    var declf: src.SourceFile = stub_file("name"); # "name" at offset 0
     var buf:   src.SourceFile = stub_file("q.name");
 
-    val recv: id.ExprId = add_ident(?a, 0, 1);
-    val mem:  id.ExprId = add_member(?a, recv, 2, 4);   # ".name"
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[recv] = ptr;   # *P
+    val recv: id.ExprId       = add_ident(?a, 0, 1);
+    val mem:  id.ExprId       = add_member(?a, recv, 2, 4); # ".name"
+    var sr:   sema.SemaResult = mk_sema(?pa, 2);
+    sr.expr_type[recv] = ptr; # *P
 
-    val key: FieldKey = fk(1, 0, ?declf, 0, 4);
+    val key:    FieldKey        = fk(1, 0, ?declf, 0, 4);
     val sel_12: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
-    val ok: bool = sel sel_12.some;
+    val ok:     bool            = sel sel_12.some;
 
     free_sema(?pa, ?sr);
     type.dnit(?ti);
@@ -1656,24 +1686,24 @@ test "features: field_ref_span_at peels a pointer receiver to the record" {
 test "features: field_ref_span_at matches a struct-literal field init" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_13: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_13.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 1::intern.StrId, t_owner(3), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" at offset 8
-    var buf:   src.SourceFile = stub_file("P{ x: 1 }");           # init "x" at offset 3
+    val recp:  type.TypeId    = recp_r.ok;
+    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
+    var buf:   src.SourceFile = stub_file("P{ x: 1 }"); # init "x" at offset 3
 
     # expr 0 = the struct literal itself, typed P; its single init names "x"@3
-    val lit: id.ExprId = add_struct_lit(?a, 3, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 1);
+    val lit: id.ExprId       = add_struct_lit(?a, 3, 1);
+    var sr:  sema.SemaResult = mk_sema(?pa, 1);
     sr.expr_type[lit] = recp;
 
-    val key: FieldKey = fk(3, 1, ?declf, 8, 1);
-    var fail: bool = false;
-    val o: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
+    val key:  FieldKey        = fk(3, 1, ?declf, 8, 1);
+    var fail: bool            = false;
+    val o:    opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (sp.offset != 3 || sp.len != 1) { fail = true; }
@@ -1690,24 +1720,24 @@ test "features: field_ref_span_at matches a struct-literal field init" {
 test "features: field_ref_span_at rejects a different record and a different field" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_14: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_14.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(2), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" at offset 8
+    val recp:  type.TypeId    = recp_r.ok;
+    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
     var buf:   src.SourceFile = stub_file("p.x");
 
-    val recv: id.ExprId = add_ident(?a, 0, 1);
-    val mem:  id.ExprId = add_member(?a, recv, 2, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
+    val recv: id.ExprId       = add_ident(?a, 0, 1);
+    val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
+    var sr:   sema.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[recv] = recp;
 
     var fail: bool = false;
     # right record, wrong field name ("y" vs the access "x"): no match
-    var decly: src.SourceFile = stub_file("y");
+    var decly:  src.SourceFile  = stub_file("y");
     val sel_15: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
     if (sel sel_15.some) { fail = true; }
     # right field name, wrong record identity (decl 9): no match.
@@ -1736,8 +1766,8 @@ fun empty_doc() token.Span {
 test "features: collect_field_sites gathers every site, the decl, and the doc component (rename)" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_18: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_18.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
@@ -1746,22 +1776,22 @@ test "features: collect_field_sites gathers every site, the decl, and the doc co
 
     # the declaring module's source: the doc block then `rec P { x: i32; y: i32; }`.
     # the doc `# x:` component name is at offset 18 (after "# a point\n# ---\n# ")
-    val declsrc: str = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; y: i32; }";
-    var declf: src.SourceFile = stub_file(declsrc);
-    var doc: token.Span;
+    val declsrc: str            = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; y: i32; }";
+    var declf:   src.SourceFile = stub_file(declsrc);
+    var doc:     token.Span;
     doc.offset = 0;
-    doc.len    = 33;   # through the `# x: ...` component, before the rec body
+    doc.len    = 33; # through the `# x: ...` component, before the rec body
     # the field "x" name in the rec body sits at offset 42 (within `rec P { x`)
     val xoff: usize = 42;
 
     # the module under walk also contains two member accesses and a struct lit on x
-    var buf: src.SourceFile = stub_file("p.x q.x P{ x: 1 }");
-    val r1: id.ExprId = add_ident(?a, 0, 1);          # "p"
-    val m1: id.ExprId = add_member(?a, r1, 2, 1);     # "p.x" name @2
-    val r2: id.ExprId = add_ident(?a, 4, 1);          # "q"
-    val m2: id.ExprId = add_member(?a, r2, 6, 1);     # "q.x" name @6
-    val lit: id.ExprId = add_struct_lit(?a, 11, 1);   # "P{ x" name @11
-    var sr: sema.SemaResult = mk_sema(?pa, 5);
+    var buf: src.SourceFile  = stub_file("p.x q.x P{ x: 1 }");
+    val r1:  id.ExprId       = add_ident(?a, 0, 1); # "p"
+    val m1:  id.ExprId       = add_member(?a, r1, 2, 1); # "p.x" name @2
+    val r2:  id.ExprId       = add_ident(?a, 4, 1); # "q"
+    val m2:  id.ExprId       = add_member(?a, r2, 6, 1); # "q.x" name @6
+    val lit: id.ExprId       = add_struct_lit(?a, 11, 1); # "P{ x" name @11
+    var sr:  sema.SemaResult = mk_sema(?pa, 5);
     sr.expr_type[r1]  = recp;
     sr.expr_type[r2]  = recp;
     sr.expr_type[lit] = recp;
@@ -1775,13 +1805,13 @@ test "features: collect_field_sites gathers every site, the decl, and the doc co
     if (n != 5) { fail = true; }
     or {
         # the three body sites in walk order: m1@2, m2@6, lit@11.
-        if (out[0].offset != 2  || out[0].len != 1) { fail = true; }
-        if (out[1].offset != 6  || out[1].len != 1) { fail = true; }
+        if (out[0].offset != 2 || out[0].len != 1)  { fail = true; }
+        if (out[1].offset != 6 || out[1].len != 1)  { fail = true; }
         if (out[2].offset != 11 || out[2].len != 1) { fail = true; }
         # the field declaration name.
         if (out[3].offset != xoff || out[3].len != 1) { fail = true; }
         # the doc component name token "x" at offset 18.
-        if (!region_eq(declsrc, out[4], "x")) { fail = true; }
+        if (!region_eq(declsrc, out[4], "x"))  { fail = true; }
         if (declsrc[out[4].offset - 2] != '#') { fail = true; }
     }
 
@@ -1795,22 +1825,22 @@ test "features: collect_field_sites gathers every site, the decl, and the doc co
 test "features: collect_field_sites omits the doc component for references (want_doc false)" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_19: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_19.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    val declsrc: str = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; }";
-    var declf: src.SourceFile = stub_file(declsrc);
-    var doc: token.Span;
+    val recp:    type.TypeId    = recp_r.ok;
+    val declsrc: str            = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; }";
+    var declf:   src.SourceFile = stub_file(declsrc);
+    var doc:     token.Span;
     doc.offset = 0;
     doc.len    = 33;
-    var buf: src.SourceFile = stub_file("p.x");
-    val r1: id.ExprId = add_ident(?a, 0, 1);
-    val m1: id.ExprId = add_member(?a, r1, 2, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
+    var buf: src.SourceFile  = stub_file("p.x");
+    val r1:  id.ExprId       = add_ident(?a, 0, 1);
+    val m1:  id.ExprId       = add_member(?a, r1, 2, 1);
+    var sr:  sema.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[r1] = recp;
 
     val key: FieldKey = fk(0, 4, ?declf, 42, 1);
@@ -1821,7 +1851,7 @@ test "features: collect_field_sites omits the doc component for references (want
     free_sema(?pa, ?sr);
     type.dnit(?ti);
     ast.dnit(?a);
-    if (n != 2) { ret 1; }
+    if (n != 2)             { ret 1; }
     if (out[0].offset != 2) { ret 1; }
     ret 0;
 }
@@ -1829,20 +1859,20 @@ test "features: collect_field_sites omits the doc component for references (want
 test "features: collect_field_sites in a non-declaring module yields only body sites" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_20: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_20.err) { ret 1; }
     # the record is declared in module 0; this is a different (importing) module
     # whose only contribution is a member access on the imported record's value
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" @8
-    var buf:   src.SourceFile = stub_file("p.x");
-    val r1: id.ExprId = add_ident(?a, 0, 1);
-    val m1: id.ExprId = add_member(?a, r1, 2, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
+    val recp:  type.TypeId     = recp_r.ok;
+    var declf: src.SourceFile  = stub_file("rec P { x: i32; }"); # "x" @8
+    var buf:   src.SourceFile  = stub_file("p.x");
+    val r1:    id.ExprId       = add_ident(?a, 0, 1);
+    val m1:    id.ExprId       = add_member(?a, r1, 2, 1);
+    var sr:    sema.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[r1] = recp;
 
     val key: FieldKey = fk(0, 4, ?declf, 8, 1);
@@ -1853,7 +1883,7 @@ test "features: collect_field_sites in a non-declaring module yields only body s
     free_sema(?pa, ?sr);
     type.dnit(?ti);
     ast.dnit(?a);
-    if (n != 1) { ret 1; }
+    if (n != 1)                                { ret 1; }
     if (out[0].offset != 2 || out[0].len != 1) { ret 1; }
     ret 0;
 }
@@ -1861,18 +1891,18 @@ test "features: collect_field_sites in a non-declaring module yields only body s
 test "features: collect_field_sites adds the decl but no doc edit when the record has no docstring" {
     var pa: Allocator;
     page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    var ti: type.TypeInterner;
+    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var ti:     type.TypeInterner;
     val sel_21: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_21.err) { ret 1; }
     val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }");   # "x" @8
-    var buf:   src.SourceFile = stub_file("p.x");
-    val r1: id.ExprId = add_ident(?a, 0, 1);
-    val m1: id.ExprId = add_member(?a, r1, 2, 1);
-    var sr: sema.SemaResult = mk_sema(?pa, 2);
+    val recp:  type.TypeId     = recp_r.ok;
+    var declf: src.SourceFile  = stub_file("rec P { x: i32; }"); # "x" @8
+    var buf:   src.SourceFile  = stub_file("p.x");
+    val r1:    id.ExprId       = add_ident(?a, 0, 1);
+    val m1:    id.ExprId       = add_member(?a, r1, 2, 1);
+    var sr:    sema.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[r1] = recp;
 
     val key: FieldKey = fk(0, 4, ?declf, 8, 1);
@@ -1883,9 +1913,9 @@ test "features: collect_field_sites adds the decl but no doc edit when the recor
     free_sema(?pa, ?sr);
     type.dnit(?ti);
     ast.dnit(?a);
-    if (n != 2) { ret 1; }
-    if (out[0].offset != 2) { ret 1; }   # the member access
-    if (out[1].offset != 8) { ret 1; }   # the field decl
+    if (n != 2)             { ret 1; }
+    if (out[0].offset != 2) { ret 1; } # the member access
+    if (out[1].offset != 8) { ret 1; } # the field decl
     ret 0;
 }
 
@@ -1896,12 +1926,12 @@ test "features: doc_component_name_span rewrites a plain field / param component
     doc.len    = str_len(txt);
     var qf: src.SourceFile = stub_file("b");
 
-    var fail: bool = false;
-    val o: opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
+    var fail: bool            = false;
+    val o:    opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (!region_eq(txt, sp, "b")) { fail = true; }
-        if (sp.len != 1) { fail = true; }
+        if (sp.len != 1)              { fail = true; }
         # it must be the component head "b", not the "b" inside "the augend".
         if (txt[sp.offset - 2] != '#') { fail = true; }
     }
@@ -1924,7 +1954,7 @@ test "features: doc_component_name_span rewrites the inner identifier of a gener
     if (sel o.some) {
         val sp: token.Span = o.some;
         if (!region_eq(txt, sp, "T")) { fail = true; }
-        if (sp.len != 1) { fail = true; }
+        if (sp.len != 1)              { fail = true; }
         # the byte before the matched span is the '[' and after is the ']'.
         if (txt[sp.offset - 1] != '[' || txt[sp.offset + sp.len] != ']') { fail = true; }
     }
@@ -1938,8 +1968,8 @@ test "features: doc_component_name_span rewrites the inner identifier of a gener
 }
 
 test "features: doc_component_name_span returns none with no doc, no match, summary-only" {
-    var qf: src.SourceFile = stub_file("x");
-    var fail: bool = false;
+    var qf:   src.SourceFile = stub_file("x");
+    var fail: bool           = false;
 
     # empty doc span -> none
     var empty: token.Span;

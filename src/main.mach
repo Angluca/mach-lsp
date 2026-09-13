@@ -8,19 +8,19 @@
 use std.runtime;
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
-use std.types.string.str;
+use std.types.bool.true;
 use std.types.option.opt;
+use std.types.string.str;
 
+use std.allocator;
 use std.allocator.Allocator;
-use allocator: std.allocator;
+use std.allocator.page;
+use std.system.os;
 use std.types.error.err;
-use page: std.allocator.page;
-use os:   std.system.os;
 
-use server:     mls.server;
-use supervisor: mls.supervisor;
+use mls.server;
+use mls.supervisor;
 use std.types.string.str_equals;
 
 #[symbol("main")]
@@ -28,7 +28,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (os.ignore_sigpipe() != 0) { ret 1; }
 
     var alloc: Allocator;
-    val pe: err[allocator.Error] = page.make(?alloc);
+    val pe:    err[allocator.Error] = page.make(?alloc);
     if (sel pe.err) { ret 1; }
 
     # two roles, one executable. Without `--worker` this process is the
