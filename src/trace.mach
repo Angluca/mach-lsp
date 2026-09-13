@@ -28,8 +28,8 @@ use std.types.size.usize;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
-use std.types.result.Result;
-use std.types.result.ok;
+use std.types.result.res;
+use std.types.option.opt;
 
 use os:     std.system.os;
 use env:    std.process.env;
@@ -104,9 +104,11 @@ var LOG_FD: i64 = -1;
 # ---
 # ret: true when MLS_TRACE is present in the environment
 fun trace_enabled() bool {
-    val n: i64 = env.get(TRACE_VAR, ?GATE_BUF[0], 31);
-    if (n < 0) { ret false; }
-    var len: usize = n::usize;
+    val r: res[opt[usize], env.EnvError] = env.get(TRACE_VAR, ?GATE_BUF[0], 31);
+    if (sel r.err) { ret false; }
+    val n: opt[usize] = r.ok;
+    if (sel n.none) { ret false; }
+    var len: usize = n.some;
     if (len > 31) { len = 31; }
     GATE_BUF[len] = 0;
     BODIES_ENABLED = str_equals((?GATE_BUF[0])::str, BODIES_WORD);
@@ -118,10 +120,15 @@ fun trace_enabled() bool {
 # ret: a live descriptor, or a negative value on failure
 fun trace_open() i64 {
     val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
-    val n: i64 = env.get(PATH_VAR, ?PATH_BUF[0], 511);
-    if (n > 0) {
-        PATH_BUF[n::usize] = 0;
-        ret os.open(os.AT_FDCWD, ?PATH_BUF[0], flags, 420);
+    val r: res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
+    if (sel r.ok) {
+        val n: opt[usize] = r.ok;
+        if (sel n.some) {
+            if (n.some > 0) {
+                PATH_BUF[n.some] = 0;
+                ret os.open(os.AT_FDCWD, ?PATH_BUF[0], flags, 420);
+            }
+        }
     }
     ret os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
 }
@@ -209,13 +216,15 @@ fun write_prefix(s: str, n: usize) {
 # ---
 # ret: the monotonic clock reading in nanoseconds
 pub fun now_ns() i64 {
-    ret chrono.time_unix_nsec(chrono.monotonic());
+    val c: chrono.Clock = chrono.monotonic();
+    if (sel c.err) { ret 0; }
+    ret chrono.time_unix_nsec(c.ok);
 }
 
 # writer sink appending straight to the open trace descriptor
-fun trace_sink(ctx: ptr, p: *u8, len: usize) Result[usize, str] {
+fun trace_sink(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
     os.write(LOG_FD::i32, p, len);
-    ret ok[usize, str](len);
+    ret res[usize, writer.WriteError].ok{len};
 }
 
 # append one formatted line to the trace log; a no-op when tracing is off

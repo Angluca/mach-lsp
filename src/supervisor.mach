@@ -45,9 +45,8 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
+use std.types.option.opt;
 
 use std.allocator.Allocator;
 
@@ -206,9 +205,9 @@ pub fun run(alloc: *Allocator, self: str) i64 {
 
         var child: exec.Child;
         child.pid = pid;
-        val wr: Result[exec.ExitStatus, str] = exec.wait(child);
-        if (is_err[exec.ExitStatus, str](wr)) { code = 1; brk; }
-        var status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](wr);
+        val wr: res[exec.ExitStatus, exec.Error] = exec.wait(child);
+        if (sel wr.err) { code = 1; brk; }
+        var status: exec.ExitStatus = wr.ok;
 
         if (!exec.signaled(status)) {
             # a clean or self-reported exit is the worker's own decision - a
@@ -378,11 +377,15 @@ fun now_ns() i64 {
 # the request deadline, from the environment when it names one
 fun configured_deadline() i64 {
     var buf: [24]u8;
-    val n: i64 = env.get(DEADLINE_VAR, ?buf[0], 24);
-    if (n <= 0) { ret DEFAULT_DEADLINE_NS; }
+    val r: res[opt[usize], env.EnvError] = env.get(DEADLINE_VAR, ?buf[0], 24);
+    if (sel r.err) { ret DEFAULT_DEADLINE_NS; }
+    val n_o: opt[usize] = r.ok;
+    if (sel n_o.none) { ret DEFAULT_DEADLINE_NS; }
+    val n: usize = n_o.some;
+    if (n == 0) { ret DEFAULT_DEADLINE_NS; }
     var ms: i64 = 0;
     var i: usize = 0;
-    for (i < n::usize) {
+    for (i < n) {
         if (buf[i] < '0' || buf[i] > '9') { ret DEFAULT_DEADLINE_NS; }
         ms = ms * 10 + (buf[i]::i64 - '0'::i64);
         i = i + 1;

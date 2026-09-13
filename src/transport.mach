@@ -11,9 +11,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -24,6 +22,7 @@ use mem: std.memory;
 
 use trace: mls.trace;
 
+use allocator: std.allocator;
 # one received message. `body` is owned and nil-terminated
 pub rec Message {
     body:     str;
@@ -91,9 +90,9 @@ pub fun read_message_from(fd: i32, msg: *Message, alloc: *Allocator) ReadStatus 
     msg.body = nil;
     msg.body_len = 0;
 
-    val hr: Result[*u8, str] = allocate[u8](alloc, HEADER_MAX);
-    if (is_err[*u8, str](hr)) { ret READ_ERROR; }
-    val header: *u8 = unwrap_ok[*u8, str](hr);
+    val hr: res[*u8, allocator.Error] = allocate[u8](alloc, HEADER_MAX);
+    if (sel hr.err) { ret READ_ERROR; }
+    val header: *u8 = hr.ok;
 
     var header_len: usize = 0;
     for (true) {
@@ -129,9 +128,9 @@ pub fun read_message_from(fd: i32, msg: *Message, alloc: *Allocator) ReadStatus 
     val body_len: usize = body_len_r::usize;
 
     # body_len is capped below usize max, so the terminator addition cannot wrap
-    val br: Result[*u8, str] = allocate[u8](alloc, body_len + 1);
-    if (is_err[*u8, str](br)) { ret READ_ERROR; }
-    val body: *u8 = unwrap_ok[*u8, str](br);
+    val br: res[*u8, allocator.Error] = allocate[u8](alloc, body_len + 1);
+    if (sel br.err) { ret READ_ERROR; }
+    val body: *u8 = br.ok;
 
     var got: usize = 0;
     for (got < body_len) {
@@ -174,9 +173,9 @@ pub fun send_message(body: str, alloc: *Allocator) bool {
     if (body_len > usize_max - fixed) { WRITE_FAILED = true; ret false; }
     val total: usize = fixed + body_len;
 
-    val r: Result[*u8, str] = allocate[u8](alloc, total);
-    if (is_err[*u8, str](r)) { WRITE_FAILED = true; ret false; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, total);
+    if (sel r.err) { WRITE_FAILED = true; ret false; }
+    val buf: *u8 = r.ok;
     var off: usize = 0;
     mem.raw_copy((buf::usize + off)::ptr, HEADER_PREFIX::ptr, prefix_len); off = off + prefix_len;
     mem.raw_copy((buf::usize + off)::ptr, (?digits[digit_start])::ptr, digit_len); off = off + digit_len;

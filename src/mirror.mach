@@ -31,9 +31,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -46,6 +44,7 @@ use json:      mls.json;
 use textedit:  mls.textedit;
 use transport: mls.transport;
 
+use allocator: std.allocator;
 # one open document as the client last described it
 # ---
 # uri:      owned document URI
@@ -297,14 +296,14 @@ fun slot_for(m: *Mirror, uri: str) *Doc {
 fun grow(m: *Mirror) *Doc {
     val new_len: usize = m.len + 1;
     if (m.docs == nil) {
-        val r: Result[*Doc, str] = allocate[Doc](m.alloc, new_len);
-        if (is_err[*Doc, str](r)) { ret nil; }
-        m.docs = unwrap_ok[*Doc, str](r);
+        val r: res[*Doc, allocator.Error] = allocate[Doc](m.alloc, new_len);
+        if (sel r.err) { ret nil; }
+        m.docs = r.ok;
     }
     or {
-        val r: Result[*Doc, str] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
-        if (is_err[*Doc, str](r)) { ret nil; }
-        m.docs = unwrap_ok[*Doc, str](r);
+        val r: res[*Doc, allocator.Error] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
+        if (sel r.err) { ret nil; }
+        m.docs = r.ok;
     }
     val d: *Doc = ?m.docs[m.len];
     d.uri      = nil;

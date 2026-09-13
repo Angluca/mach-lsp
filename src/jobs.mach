@@ -22,9 +22,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -123,9 +121,9 @@ pub fun init(q: *Queue, alloc: *Allocator) bool {
     q.closed = false;
     q.live   = false;
 
-    val r: Result[*Job, str] = allocate[Job](alloc, CAPACITY);
-    if (is_err[*Job, str](r)) { ret false; }
-    q.jobs = unwrap_ok[*Job, str](r);
+    val r: res[*Job, allocator.Error] = allocate[Job](alloc, CAPACITY);
+    if (sel r.err) { ret false; }
+    q.jobs = r.ok;
     q.cap  = CAPACITY;
     var i: usize = 0;
     for (i < q.cap) {
@@ -167,9 +165,9 @@ pub fun start(q: *Queue, f: JobFn, fx: ptr) bool {
 pub fun push(q: *Queue, body: str, len: usize) bool {
     if (body == nil) { ret false; }
 
-    val r: Result[*u8, str] = allocate[u8](q.alloc, len + 1);
-    if (is_err[*u8, str](r)) { ret false; }
-    val copy: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](q.alloc, len + 1);
+    if (sel r.err) { ret false; }
+    val copy: *u8 = r.ok;
     if (len > 0) { mem.raw_copy(copy::ptr, body::ptr, len); }
     copy[len] = 0;
 
@@ -293,6 +291,7 @@ fun worker_main(arg: *u8) {
 use page: std.allocator.page;
 use std.types.string.str_equals;
 
+use allocator: std.allocator;
 # the queue's contract is that every accepted body reaches the callback exactly
 # once and in push order, so the tests assert the sequence rather than a count
 
@@ -445,9 +444,9 @@ pub fun cancels_init(c: *Cancels, alloc: *Allocator) bool {
     c.count = 0;
     c.cap   = 0;
     c.ids   = nil;
-    val r: Result[*Job, str] = allocate[Job](alloc, CANCEL_CAP);
-    if (is_err[*Job, str](r)) { ret false; }
-    c.ids = unwrap_ok[*Job, str](r);
+    val r: res[*Job, allocator.Error] = allocate[Job](alloc, CANCEL_CAP);
+    if (sel r.err) { ret false; }
+    c.ids = r.ok;
     c.cap = CANCEL_CAP;
     var i: usize = 0;
     for (i < c.cap) { c.ids[i].body = nil; c.ids[i].len = 0; i = i + 1; }
@@ -475,9 +474,9 @@ pub fun cancels_dnit(c: *Cancels) {
 pub fun cancel_add(c: *Cancels, id_token: str) bool {
     if (id_token == nil || c.ids == nil) { ret false; }
     val len: usize = str_len(id_token);
-    val r: Result[*u8, str] = allocate[u8](c.alloc, len + 1);
-    if (is_err[*u8, str](r)) { ret false; }
-    val copy: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](c.alloc, len + 1);
+    if (sel r.err) { ret false; }
+    val copy: *u8 = r.ok;
     if (len > 0) { mem.raw_copy(copy::ptr, id_token::ptr, len); }
     copy[len] = 0;
 

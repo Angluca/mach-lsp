@@ -16,14 +16,8 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
 use std.types.string.str_contains;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.none;
-use std.types.option.unwrap;
+use std.types.result.res;
+use std.types.option.opt;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -57,6 +51,7 @@ use render:      mls.render;
 use progress:    mls.progress;
 use positions:   mls.positions;
 
+use fail:   mach.lang.fail;
 # lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;
@@ -136,9 +131,9 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.watch_dynamic = false;
     srv.watch_state = WATCH_FALLBACK;
 
-    val sr: Result[sess.Session, str] = sess.init(alloc);
-    if (is_err[sess.Session, str](sr)) { ret false; }
-    srv.s = unwrap_ok[sess.Session, str](sr);
+    val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
+    if (sel sr.err) { ret false; }
+    srv.s = sr.ok;
 
     srv.es = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
@@ -668,20 +663,20 @@ fun republish_all(srv: *Server) {
 fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) {
     val path: str = project.path_of_uri(srv.alloc, uri);
     if (path == nil) { ret; }
-    var dr: Result[*documents.Document, str];
+    var dr: res[*documents.Document, str];
     if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }
     or { dr = documents.change(?srv.docs, uri, text, version); }
     json.free_str(path, srv.alloc);
 
-    if (is_err[*documents.Document, str](dr)) {
+    if (sel dr.err) {
         trace.log("documents: ");
-        trace.log(unwrap_err[*documents.Document, str](dr));
+        trace.log(dr.err);
         trace.log("\n");
         ret;
     }
-    val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    val cr: Result[bool, str] = project.document_changed(?srv.ws, doc);
-    if (is_err[bool, str](cr)) {
+    val doc: *documents.Document = dr.ok;
+    val cr: res[bool, str] = project.document_changed(?srv.ws, doc);
+    if (sel cr.err) {
         trace.log("project: failed to mirror document overlay\n");
         ret;
     }

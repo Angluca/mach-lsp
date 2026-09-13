@@ -25,12 +25,8 @@ use std.types.size.isize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.ok;
-use std.types.option.Option;
-use std.types.option.is_some;
+use std.types.result.res;
+use std.types.option.opt;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -43,6 +39,8 @@ use arena: std.allocator.arena;
 use sj:    std.data.json;
 use writer: std.io.writer;
 
+use allocator: std.allocator;
+use std.types.error.err;
 # a growable byte buffer for assembling one JSON payload
 #
 # the fixed-shape responses in this server are assembled by summing their
@@ -105,14 +103,14 @@ fun buf_reserve(b: *Buf, want: usize) bool {
     for (next < need) { next = next * 2; }
 
     if (b.data == nil) {
-        val r: Result[*u8, str] = allocate[u8](b.a, next);
-        if (is_err[*u8, str](r)) { b.failed = true; ret false; }
-        b.data = unwrap_ok[*u8, str](r);
+        val r: res[*u8, allocator.Error] = allocate[u8](b.a, next);
+        if (sel r.err) { b.failed = true; ret false; }
+        b.data = r.ok;
     }
     or {
-        val r: Result[*u8, str] = reallocate[u8](b.a, b.data, b.cap, next);
-        if (is_err[*u8, str](r)) { b.failed = true; ret false; }
-        b.data = unwrap_ok[*u8, str](r);
+        val r: res[*u8, allocator.Error] = reallocate[u8](b.a, b.data, b.cap, next);
+        if (sel r.err) { b.failed = true; ret false; }
+        b.data = r.ok;
     }
     b.cap = next;
     ret true;
@@ -136,12 +134,12 @@ pub fun buf_push_byte(b: *Buf, ch: u8) {
 }
 
 # writer callback appending into the Buf behind `ctx`
-fun buf_write(ctx: ptr, p: *u8, len: usize) Result[usize, str] {
+fun buf_write(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
     val b: *Buf = ctx::*Buf;
-    if (!buf_reserve(b, len)) { ret ok[usize, str](len); }
+    if (!buf_reserve(b, len)) { ret res[usize, writer.WriteError].ok{len}; }
     mem.raw_copy((b.data::usize + b.len)::ptr, p::ptr, len);
     b.len = b.len + len;
-    ret ok[usize, str](len);
+    ret res[usize, writer.WriteError].ok{len};
 }
 
 # a `std.io.writer` view over `b`, so the std JSON escaper can emit into it
@@ -260,8 +258,8 @@ val READER_ARENA_CAP: usize = 64 * 1024;
 # ret:     true when the arena was created
 pub fun reader_init(rd: *Reader, backing: *Allocator) bool {
     rd.ready = false;
-    var opt: Option[*u8] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
-    if (is_some[*u8](opt)) { ret false; }
+    val r: err[allocator.Error] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
+    if (sel r.err) { ret false; }
     rd.ready = true;
     ret true;
 }
@@ -298,9 +296,9 @@ pub fun read(rd: *Reader, body: str, len: usize) Message {
     if (!rd.ready || body == nil) { ret m; }
     var a: Allocator;
     arena.make(?a, ?rd.ar);
-    val r: Result[sj.Value, str] = sj.parse(body::*u8, len, ?a);
-    if (is_err[sj.Value, str](r)) { ret m; }
-    m.root  = unwrap_ok[sj.Value, str](r);
+    val r: res[sj.Value, sj.JsonError] = sj.parse(body::*u8, len, ?a);
+    if (sel r.err) { ret m; }
+    m.root  = r.ok;
     m.valid = true;
     ret m;
 }
@@ -318,7 +316,9 @@ pub fun release(rd: *Reader) {
 # ret: borrowed member value, or nil
 pub fun member(v: *sj.Value, key: str) *sj.Value {
     if (v == nil) { ret nil; }
-    ret sj.value_find(v, key);
+    val m: opt[*sj.Value] = sj.value_find(v, key);
+    if (sel m.none) { ret nil; }
+    ret m.some;
 }
 
 # the member `key` of the member `outer` of `v`, or nil at any miss
@@ -334,7 +334,9 @@ pub fun member2(v: *sj.Value, outer: str, key: str) *sj.Value {
 # the `index`-th element of array `v`, or nil when out of range
 pub fun element(v: *sj.Value, index: usize) *sj.Value {
     if (v == nil || !sj.value_is_array(v)) { ret nil; }
-    ret sj.value_get(v, index);
+    val e: opt[*sj.Value] = sj.value_get(v, index);
+    if (sel e.none) { ret nil; }
+    ret e.some;
 }
 
 # the number of elements in array or object `v`, 0 for anything else
@@ -359,14 +361,14 @@ pub fun is_null(v: *sj.Value) bool {
 # ret:   owned nul-terminated text, or nil
 pub fun text(v: *sj.Value, alloc: *Allocator) str {
     if (v == nil || !sj.value_is_string(v)) { ret nil; }
-    val sr: Result[usize, str] = sj.value_string_decode(v, nil, 0);
-    if (is_err[usize, str](sr)) { ret nil; }
-    val n: usize = unwrap_ok[usize, str](sr);
-    val br: Result[*u8, str] = allocate[u8](alloc, n + 1);
-    if (is_err[*u8, str](br)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-    val dr: Result[usize, str] = sj.value_string_decode(v, buf, n);
-    if (is_err[usize, str](dr)) { deallocate[u8](alloc, buf, n + 1); ret nil; }
+    val sr: res[usize, sj.JsonError] = sj.value_string_decode(v, nil, 0);
+    if (sel sr.err) { ret nil; }
+    val n: usize = sr.ok;
+    val br: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel br.err) { ret nil; }
+    val buf: *u8 = br.ok;
+    val dr: res[usize, sj.JsonError] = sj.value_string_decode(v, buf, n);
+    if (sel dr.err) { deallocate[u8](alloc, buf, n + 1); ret nil; }
     buf[n] = 0;
     ret buf::str;
 }
@@ -450,9 +452,9 @@ pub fun quote(s: str, alloc: *Allocator) str {
     val view: str = buf_str(?b);
     if (view == nil) { buf_dnit(?b); ret nil; }
     val n: usize = str_len(view);
-    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
-    if (is_err[*u8, str](r)) { buf_dnit(?b); ret nil; }
-    val out: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel r.err) { buf_dnit(?b); ret nil; }
+    val out: *u8 = r.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(?b);
@@ -478,9 +480,9 @@ fun buf_take(b: *Buf, alloc: *Allocator) str {
     val view: str = buf_str(b);
     if (view == nil) { buf_dnit(b); ret nil; }
     val n: usize = str_len(view);
-    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
-    if (is_err[*u8, str](r)) { buf_dnit(b); ret nil; }
-    val out: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel r.err) { buf_dnit(b); ret nil; }
+    val out: *u8 = r.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(b);
@@ -773,9 +775,9 @@ pub fun buf_push_range(b: *Buf, s: str, from: usize, to: usize) {
 pub fun dup(s: str, alloc: *Allocator) str {
     if (s == nil) { ret nil; }
     val n: usize = str_len(s);
-    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val out: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel r.err) { ret nil; }
+    val out: *u8 = r.ok;
     if (n > 0) { mem.raw_copy(out::ptr, s::ptr, n); }
     out[n] = 0;
     ret out::str;

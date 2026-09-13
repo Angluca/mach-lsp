@@ -24,14 +24,8 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.option.opt;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 
@@ -42,7 +36,7 @@ use ast:      mach.lang.fe.ast;
 use id:       mach.lang.fe.ast.id;
 use decl:     mach.lang.fe.ast.decl;
 use aexpr:    mach.lang.fe.ast.expr;
-use res:      mach.lang.fe.resolve;
+use rslv:      mach.lang.fe.resolve;
 use stmt:     mach.lang.fe.ast.stmt;
 use type:     mach.lang.type;
 use typename: mach.lang.fe.sema.typename;
@@ -106,18 +100,18 @@ fun session_of(an: analysis.Analyzed) *sess.Session {
 # append a parameter-name hint for each argument of the call at `eid`
 fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed, uri: str,
                     eid: id.ExprId, lo: usize, hi: usize, count: usize, alloc: *Allocator) usize {
-    val eo: Option[*aexpr.Expr] = ast.get_expr(an.a, eid);
-    if (!is_some[*aexpr.Expr](eo)) { ret count; }
-    val e: *aexpr.Expr = unwrap[*aexpr.Expr](eo);
+    val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, eid);
+    if (sel eo.none) { ret count; }
+    val e: *aexpr.Expr = eo.some;
     if (e.kind != aexpr.EXPR_KIND_CALL) { ret count; }
     val nargs: u32 = e.data.call.args_len;
     if (nargs == 0 || an.a.expr_ids == nil) { ret count; }
 
     # the callee's parameter names live in its declaration, which is reached
     # through the same pivot definition uses
-    val d_opt: Option[*decl.Decl] = callee_decl(ws, an, uri, e.data.call.callee);
-    if (!is_some[*decl.Decl](d_opt)) { ret count; }
-    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    val d_opt: opt[*decl.Decl] = callee_decl(ws, an, uri, e.data.call.callee);
+    if (sel d_opt.none) { ret count; }
+    val d: *decl.Decl = d_opt.some;
     val site_a: *ast.Ast = callee_ast(ws, an, uri, e.data.call.callee);
     val site_f: positions.Text = callee_file(ws, an, uri, e.data.call.callee);
     if (site_a == nil || site_f.file == nil) { ret count; }
@@ -130,13 +124,13 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     var i: u32 = 0;
     for (i < nargs && i < d.data.fun_.params_len && emitted < MAX_HINTS) {
         val arg: id.ExprId = an.a.expr_ids[(e.data.call.args_start + i)::usize];
-        val ao: Option[*aexpr.Expr] = ast.get_expr(an.a, arg);
-        if (is_some[*aexpr.Expr](ao)) {
-            val at: usize = unwrap[*aexpr.Expr](ao).span.offset;
-            if (at >= lo && at <= hi && wants_hint(unwrap[*aexpr.Expr](ao))) {
+        val ao: opt[*aexpr.Expr] = ast.get_expr(an.a, arg);
+        if (sel ao.some) {
+            val at: usize = ao.some.span.offset;
+            if (at >= lo && at <= hi && wants_hint(ao.some)) {
                 val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
                 if (pname != nil) {
-                    if (!names_itself(an.text.file, unwrap[*aexpr.Expr](ao).span, pname)) {
+                    if (!names_itself(an.text.file, ao.some.span, pname)) {
                         push_hint(b, an.text.file, at, pname, emitted > 0);
                         emitted = emitted + 1;
                     }
@@ -150,28 +144,28 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
 }
 
 # the function declaration the callee expression resolves to, or none
-fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) Option[*decl.Decl] {
-    val so: Option[*res.Symbol] = callee_symbol(an, callee);
-    if (!is_some[*res.Symbol](so)) { ret none[*decl.Decl](); }
-    val sym: *res.Symbol = unwrap[*res.Symbol](so);
-    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
-    if (!is_some[project.Site](site_o)) { ret none[*decl.Decl](); }
-    var site: project.Site = unwrap[project.Site](site_o);
-    val d: Option[*decl.Decl] = ast.get_decl(site.a, sym.decl);
+fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) opt[*decl.Decl] {
+    val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
+    if (sel so.none) { ret opt[*decl.Decl].none{}; }
+    val sym: *rslv.Symbol = so.some;
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    if (sel site_o.none) { ret opt[*decl.Decl].none{}; }
+    var site: project.Site = site_o.some;
+    val d: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
     project.free_site(ws, ?site);
-    if (!is_some[*decl.Decl](d)) { ret none[*decl.Decl](); }
-    if (unwrap[*decl.Decl](d).kind != decl.DECL_KIND_FUN) { ret none[*decl.Decl](); }
+    if (sel d.none) { ret opt[*decl.Decl].none{}; }
+    if (d.some.kind != decl.DECL_KIND_FUN) { ret opt[*decl.Decl].none{}; }
     ret d;
 }
 
 # the Ast the callee's declaration lives in
 fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) *ast.Ast {
-    val so: Option[*res.Symbol] = callee_symbol(an, callee);
-    if (!is_some[*res.Symbol](so)) { ret nil; }
-    val site_o: Option[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, unwrap[*res.Symbol](so));
-    if (!is_some[project.Site](site_o)) { ret nil; }
-    var site: project.Site = unwrap[project.Site](site_o);
+    val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
+    if (sel so.none) { ret nil; }
+    val site_o: opt[project.Site] =
+        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+    if (sel site_o.none) { ret nil; }
+    var site: project.Site = site_o.some;
     val a: *ast.Ast = site.a;
     project.free_site(ws, ?site);
     ret a;
@@ -180,24 +174,24 @@ fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: 
 # the source file backing the callee's declaration
 fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) positions.Text {
     var empty: positions.Text = positions.text_of(nil);
-    val so: Option[*res.Symbol] = callee_symbol(an, callee);
-    if (!is_some[*res.Symbol](so)) { ret empty; }
-    val site_o: Option[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, unwrap[*res.Symbol](so));
-    if (!is_some[project.Site](site_o)) { ret empty; }
-    var site: project.Site = unwrap[project.Site](site_o);
+    val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
+    if (sel so.none) { ret empty; }
+    val site_o: opt[project.Site] =
+        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+    if (sel site_o.none) { ret empty; }
+    var site: project.Site = site_o.some;
     val f: positions.Text = site.text;
     project.free_site(ws, ?site);
     ret f;
 }
 
 # the symbol the callee expression binds
-fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) Option[*res.Symbol] {
-    if (an.rr == nil || an.rr.expr_resolved == nil) { ret none[*res.Symbol](); }
-    if (callee == id.EXPR_NIL || callee::u32 >= an.rr.expr_count) { ret none[*res.Symbol](); }
-    val sid: res.SymbolId = an.rr.expr_resolved[callee];
-    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none[*res.Symbol](); }
-    ret some[*res.Symbol](?an.rr.symbols[sid]);
+fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) opt[*rslv.Symbol] {
+    if (an.rr == nil || an.rr.expr_resolved == nil) { ret opt[*rslv.Symbol].none{}; }
+    if (callee == id.EXPR_NIL || callee::u32 >= an.rr.expr_count) { ret opt[*rslv.Symbol].none{}; }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[callee];
+    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
+    ret opt[*rslv.Symbol].some{?an.rr.symbols[sid]};
 }
 
 # the declared name of the parameter in `typed_names` slot `slot`
@@ -281,13 +275,13 @@ fun push_position(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
 fun range_bounds(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret; }
-    val so: Option[usize] = offset_of_member(rng, "start", file);
-    val eo: Option[usize] = offset_of_member(rng, "end", file);
-    if (is_some[usize](so)) { @lo = unwrap[usize](so); }
-    if (is_some[usize](eo)) { @hi = unwrap[usize](eo); }
+    val so: opt[usize] = offset_of_member(rng, "start", file);
+    val eo: opt[usize] = offset_of_member(rng, "end", file);
+    if (sel so.some) { @lo = so.some; }
+    if (sel eo.some) { @hi = eo.some; }
 }
 
-fun offset_of_member(rng: *sj.Value, key: str, file: positions.Text) Option[usize] {
+fun offset_of_member(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
     val p: *sj.Value = json.member(rng, key);
     val line: i64 = json.number(json.member(p, "line"), -1);
     val ch:   i64 = json.number(json.member(p, "character"), -1);

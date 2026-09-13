@@ -23,12 +23,8 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.option.opt;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 
@@ -63,9 +59,9 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
     val d: *documents.Document = documents.find(docs, uri);
     if (d == nil) { render.reply_empty_array(alloc, id_raw); ret; }
 
-    val vr: Result[project.DocumentView, str] = project.document_view(ws, d);
-    if (is_err[project.DocumentView, str](vr)) { render.reply_empty_array(alloc, id_raw); ret; }
-    val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+    val vr: res[project.DocumentView, str] = project.document_view(ws, d);
+    if (sel vr.err) { render.reply_empty_array(alloc, id_raw); ret; }
+    val v: project.DocumentView = vr.ok;
     val s: *sess.Session = project.root_session(v.root);
     if (s == nil) { render.reply_empty_array(alloc, id_raw); ret; }
 
@@ -83,12 +79,12 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 
     var emitted: usize = 0;
     var i: usize = 0;
-    for (i < s.diags.len) {
-        val dg: *diag.Diagnostic = ?s.diags.items[i];
+    for (i < s.diags.items.len) {
+        val dg: *diag.Diagnostic = ?s.diags.items.data[i];
         if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
             var f: usize = 0;
-            for (f < dg.fix_len) {
-                push_action(?b, ws, alloc, ?s.sources, v.text.file, uri, dg, ?dg.fixes[f], emitted > 0);
+            for (f < dg.fixes.len) {
+                push_action(?b, ws, alloc, ?s.sources, v.text.file, uri, dg, ?dg.fixes.data[f], emitted > 0);
                 emitted = emitted + 1;
                 f = f + 1;
             }
@@ -136,8 +132,8 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
                file: *src.SourceFile, uri: str, fix: *diag.Fix) {
     var wrote_group: bool = false;
     var e: usize = 0;
-    for (e < fix.edit_len) {
-        val ed: *diag.Edit = ?fix.edits[e];
+    for (e < fix.edits.len) {
+        val ed: *diag.Edit = ?fix.edits.data[e];
         val same: bool = edit_file(sources, ed) == file;
         if (same) {
             if (!wrote_group) {
@@ -156,9 +152,9 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
 
 # the source file an edit addresses, or nil
 fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
-    val fo: Option[*src.SourceFile] = src.get(sources, ed.loc.file_id);
-    if (!is_some[*src.SourceFile](fo)) { ret nil; }
-    ret unwrap[*src.SourceFile](fo);
+    val fo: opt[*src.SourceFile] = src.get(sources, ed.loc.file_id);
+    if (sel fo.none) { ret nil; }
+    ret fo.some;
 }
 
 # whether a diagnostic's span touches the requested range
@@ -179,16 +175,17 @@ fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
 fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) bool {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret false; }
-    val so: Option[usize] = offset_of(rng, "start", file);
-    val eo: Option[usize] = offset_of(rng, "end", file);
-    if (!is_some[usize](so) || !is_some[usize](eo)) { ret false; }
-    @lo = unwrap[usize](so);
-    @hi = unwrap[usize](eo);
+    val so: opt[usize] = offset_of(rng, "start", file);
+    val eo: opt[usize] = offset_of(rng, "end", file);
+    if (sel so.none) { ret false; }
+    if (sel eo.none) { ret false; }
+    @lo = so.some;
+    @hi = eo.some;
     if (@hi < @lo) { @hi = @lo; }
     ret true;
 }
 
-fun offset_of(rng: *sj.Value, key: str, file: positions.Text) Option[usize] {
+fun offset_of(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
     val p: *sj.Value = json.member(rng, key);
     val line: i64 = json.number(json.member(p, "line"), -1);
     val ch:   i64 = json.number(json.member(p, "character"), -1);

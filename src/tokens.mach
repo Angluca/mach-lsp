@@ -19,14 +19,8 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
+use std.types.option.opt;
+use std.types.result.res;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -38,7 +32,7 @@ use token: mach.lang.fe.token;
 use ast:   mach.lang.fe.ast;
 use id:    mach.lang.fe.ast.id;
 use decl:  mach.lang.fe.ast.decl;
-use res:   mach.lang.fe.resolve;
+use rslv:   mach.lang.fe.resolve;
 use editor: mach.lang.editor;
 use sj:    std.data.json;
 
@@ -50,6 +44,7 @@ use positions: mls.positions;
 use documents: mls.documents;
 use analysis:  mls.analysis;
 
+use allocator: std.allocator;
 # the legend, in the order the client is told about it at initialize. an index
 # into this list is what a token's `tokenType` field carries
 pub val TOKEN_TYPES: str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\"";
@@ -87,9 +82,9 @@ pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc
     var an: analysis.Analyzed;
     if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty(alloc, id_raw); ret; }
 
-    val ta: Result[*Tok, str] = allocate[Tok](alloc, MAX_TOKENS);
-    if (is_err[*Tok, str](ta)) { reply_empty(alloc, id_raw); ret; }
-    val toks: *Tok = unwrap_ok[*Tok, str](ta);
+    val ta: res[*Tok, allocator.Error] = allocate[Tok](alloc, MAX_TOKENS);
+    if (sel ta.err) { reply_empty(alloc, id_raw); ret; }
+    val toks: *Tok = ta.ok;
 
     var n: usize = collect(an, toks, MAX_TOKENS);
     if (n > 1) {
@@ -118,12 +113,12 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 
     var di: usize = 0;
     for (di < an.a.decl_len && n < cap) {
-        val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, di::id.DeclId);
-        if (is_some[*decl.Decl](d_opt)) {
-            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
-            val nso: Option[token.Span] = features.decl_name_span(d);
-            if (is_some[token.Span](nso)) {
-                n = push(out, n, cap, unwrap[token.Span](nso),
+        val d_opt: opt[*decl.Decl] = ast.get_decl(an.a, di::id.DeclId);
+        if (sel d_opt.some) {
+            val d: *decl.Decl = d_opt.some;
+            val nso: opt[token.Span] = features.decl_name_span(d);
+            if (sel nso.some) {
+                n = push(out, n, cap, nso.some,
                          decl_token_type(d.kind), M_DECLARATION);
             }
             n = collect_members(an, d, out, n, cap);
@@ -133,12 +128,12 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 
     var ei: usize = 0;
     for (ei < an.a.expr_len && n < cap) {
-        val so: Option[res.SymbolId] = expr_symbol(an, ei::id.ExprId);
-        if (is_some[res.SymbolId](so)) {
-            val sid: res.SymbolId = unwrap[res.SymbolId](so);
-            val spo: Option[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
-            if (is_some[token.Span](spo)) {
-                n = push(out, n, cap, unwrap[token.Span](spo), symbol_token_type(an, sid), M_NONE);
+        val so: opt[rslv.SymbolId] = expr_symbol(an, ei::id.ExprId);
+        if (sel so.some) {
+            val sid: rslv.SymbolId = so.some;
+            val spo: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
+            if (sel spo.some) {
+                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ei = ei + 1;
@@ -146,12 +141,12 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 
     var ti: usize = 0;
     for (ti < an.a.type_len && n < cap) {
-        val so: Option[res.SymbolId] = type_symbol(an, ti::id.TypeId);
-        if (is_some[res.SymbolId](so)) {
-            val sid: res.SymbolId = unwrap[res.SymbolId](so);
-            val spo: Option[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
-            if (is_some[token.Span](spo)) {
-                n = push(out, n, cap, unwrap[token.Span](spo), symbol_token_type(an, sid), M_NONE);
+        val so: opt[rslv.SymbolId] = type_symbol(an, ti::id.TypeId);
+        if (sel so.some) {
+            val sid: rslv.SymbolId = so.some;
+            val spo: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
+            if (sel spo.some) {
+                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ti = ti + 1;
@@ -204,35 +199,35 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     ret n;
 }
 
-fun expr_symbol(an: analysis.Analyzed, eid: id.ExprId) Option[res.SymbolId] {
+fun expr_symbol(an: analysis.Analyzed, eid: id.ExprId) opt[rslv.SymbolId] {
     if (an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret none_sym(); }
-    val sid: res.SymbolId = an.rr.expr_resolved[eid];
-    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[eid];
+    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
     ret some_sym(sid);
 }
 
-fun type_symbol(an: analysis.Analyzed, tid: id.TypeId) Option[res.SymbolId] {
+fun type_symbol(an: analysis.Analyzed, tid: id.TypeId) opt[rslv.SymbolId] {
     if (an.rr.type_resolved == nil || tid::u32 >= an.rr.type_count) { ret none_sym(); }
-    val sid: res.SymbolId = an.rr.type_resolved[tid];
-    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    val sid: rslv.SymbolId = an.rr.type_resolved[tid];
+    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
     ret some_sym(sid);
 }
 
-fun some_sym(s: res.SymbolId) Option[res.SymbolId] { ret some[res.SymbolId](s); }
-fun none_sym() Option[res.SymbolId] { ret none[res.SymbolId](); }
+fun some_sym(s: rslv.SymbolId) opt[rslv.SymbolId] { ret opt[rslv.SymbolId].some{s}; }
+fun none_sym() opt[rslv.SymbolId] { ret opt[rslv.SymbolId].none{}; }
 
 # the legend index for a resolved symbol
-fun symbol_token_type(an: analysis.Analyzed, sid: res.SymbolId) i64 {
-    val sym: *res.Symbol = ?an.rr.symbols[sid];
-    if (sym.kind == res.SYM_FUN)     { ret T_FUNCTION; }
-    if (sym.kind == res.SYM_REC)     { ret T_TYPE; }
-    if (sym.kind == res.SYM_UNI)     { ret T_TYPE; }
-    if (sym.kind == res.SYM_DEF)     { ret T_TYPE; }
-    if (sym.kind == res.SYM_PRIM)    { ret T_TYPE; }
-    if (sym.kind == res.SYM_VECTOR)  { ret T_TYPE; }
-    if (sym.kind == res.SYM_PARAM)   { ret T_PARAMETER; }
-    if (sym.kind == res.SYM_GENERIC) { ret T_TYPE_PARAMETER; }
-    if (sym.kind == res.SYM_USE)     { ret T_NAMESPACE; }
+fun symbol_token_type(an: analysis.Analyzed, sid: rslv.SymbolId) i64 {
+    val sym: *rslv.Symbol = ?an.rr.symbols[sid];
+    if (sym.kind == rslv.SYM_FUN)     { ret T_FUNCTION; }
+    if (sym.kind == rslv.SYM_REC)     { ret T_TYPE; }
+    if (sym.kind == rslv.SYM_UNI)     { ret T_TYPE; }
+    if (sym.kind == rslv.SYM_DEF)     { ret T_TYPE; }
+    if (sym.kind == rslv.SYM_PRIM)    { ret T_TYPE; }
+    if (sym.kind == rslv.SYM_VECTOR)  { ret T_TYPE; }
+    if (sym.kind == rslv.SYM_PARAM)   { ret T_PARAMETER; }
+    if (sym.kind == rslv.SYM_GENERIC) { ret T_TYPE_PARAMETER; }
+    if (sym.kind == rslv.SYM_USE)     { ret T_NAMESPACE; }
     ret T_VARIABLE;
 }
 
