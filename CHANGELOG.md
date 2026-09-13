@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-13
+
 Mach 5.0 migration. The server now builds against the mach v5.0.0 compiler and
 std 2.0.0, follows the 5.0 driver and type-table contracts, and drops the
 lockfile in favour of the committed dependency gitlinks.
