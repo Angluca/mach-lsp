@@ -38,7 +38,7 @@ abi = "aapcs64"
 [profile.debug]
 default = true
 opt = 0
-debug = true
+debug = false
 simd = "scalarize"
 vectorize = true
 float_reassoc = false

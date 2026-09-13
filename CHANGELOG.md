@@ -14,7 +14,9 @@ lockfile in favour of the committed dependency gitlinks.
 ### Changed
 - build: `mach.toml` follows the 5.0 manifest rules (complete profiles, one
   default target and profile, `[dep.std]` realized at `dep/std`, pins on
-  `tag/v5.0.0` and `tag/v2.0.0`); `mach.lock` is gone.
+  `tag/v5.0.0` and `tag/v2.0.0`); `mach.lock` is gone. The debug profile
+  builds without debug info, as the compiler's own does, because the windows
+  target registers no debug model in 5.0 and a profile is not per target.
 - source: every `Result` / `Option` use is a `res` / `opt` tag read through
   `sel` guards; std 2.0 signatures (allocation, paths, strings, env, clock,
   writer sinks, toml/json optionals) are followed at each call site. The
