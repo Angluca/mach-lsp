@@ -20,19 +20,19 @@
 # answers nil, so a response is either complete or absent - never truncated.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use src:   mach.lang.source;
-use token: mach.lang.fe.token;
+use mach.lang.fe.token;
+use src: mach.lang.source;
 
-use json:      mls.json;
-use positions: mls.positions;
-use transport: mls.transport;
+use mls.json;
+use mls.positions;
+use mls.transport;
 
 # append an LSP Range
 # ---
@@ -168,7 +168,7 @@ pub fun reply_empty_edit(alloc: *Allocator, id_raw: str) {
     reply_literal(alloc, id_raw, "{\"changes\":{}}");
 }
 
-use page: std.allocator.page;
+use std.allocator.page;
 use std.types.string.str_equals;
 
 # a SourceFile over `text` with a real line index
@@ -197,7 +197,10 @@ test "render: a range spells both endpoints" {
     page.make(?pa);
     var b: json.Buf = json.buf_init(?pa);
     var r: positions.LspRange;
-    r.start_line = 2; r.start_char = 4; r.end_line = 2; r.end_char = 9;
+    r.start_line = 2;
+    r.start_char = 4;
+    r.end_line   = 2;
+    r.end_char   = 9;
     range(?b, r);
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b),
@@ -211,12 +214,14 @@ test "render: a location carries an escaped uri" {
     var pa: Allocator;
     page.make(?pa);
     var starts: [3]usize;
-    starts[0] = 0; starts[1] = 3; starts[2] = 6;
+    starts[0] = 0;
+    starts[1] = 3;
+    starts[2] = 6;
     var f: src.SourceFile = stub_file("ab\ncd\n", ?starts[0], 3);
-    var b: json.Buf = json.buf_init(?pa);
+    var b: json.Buf       = json.buf_init(?pa);
     location(?b, ?f, "file:///a b.mach", span_at(3, 2));
     var fail: bool = false;
-    val got: str = json.buf_str(?b);
+    val got:  str  = json.buf_str(?b);
     if (got == nil) { fail = true; }
     or {
         if (!str_equals(got,
@@ -235,10 +240,10 @@ test "render: a text edit escapes its replacement" {
     var starts: [1]usize;
     starts[0] = 0;
     var f: src.SourceFile = stub_file("abcd", ?starts[0], 1);
-    var b: json.Buf = json.buf_init(?pa);
+    var b: json.Buf       = json.buf_init(?pa);
     text_edit(?b, ?f, span_at(0, 2), "x\"y\nz");
     var fail: bool = false;
-    val got: str = json.buf_str(?b);
+    val got:  str  = json.buf_str(?b);
     if (got == nil) { fail = true; }
     or {
         if (!str_equals(got,

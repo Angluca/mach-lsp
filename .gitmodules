@@ -1,5 +1,5 @@
-[submodule "dep/mach-std"]
-	path = dep/mach-std
+[submodule "dep/std"]
+	path = dep/std
 	url = https://github.com/briar-systems/mach-std
 [submodule "dep/mach"]
 	path = dep/mach

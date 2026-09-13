@@ -25,26 +25,26 @@
 # that produced it.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
-use std.allocator.reallocate;
 use std.allocator.deallocate;
+use std.allocator.reallocate;
 
 use sj: std.data.json;
 
-use json:      mls.json;
-use textedit:  mls.textedit;
-use transport: mls.transport;
+use mls.json;
+use mls.textedit;
+use mls.transport;
+
+use std.allocator;
 
 # one open document as the client last described it
 # ---
@@ -171,11 +171,14 @@ fun record_initialize(m: *Mirror, root: *sj.Value, body: str, len: usize) {
 }
 
 fun record_open(m: *Mirror, params: *sj.Value) {
-    val td: *sj.Value = json.member(params, "textDocument");
-    val uri: str = json.text(json.member(td, "uri"), m.alloc);
+    val td:  *sj.Value = json.member(params, "textDocument");
+    val uri: str       = json.text(json.member(td, "uri"), m.alloc);
     if (uri == nil) { ret; }
     val text: str = json.text(json.member(td, "text"), m.alloc);
-    if (text == nil) { json.free_str(uri, m.alloc); ret; }
+    if (text == nil) {
+        json.free_str(uri, m.alloc);
+        ret;
+    }
 
     val d: *Doc = slot_for(m, uri);
     if (d == nil) {
@@ -192,15 +195,15 @@ fun record_open(m: *Mirror, params: *sj.Value) {
 }
 
 fun record_change(m: *Mirror, params: *sj.Value) {
-    val td: *sj.Value = json.member(params, "textDocument");
-    val uri: str = json.text(json.member(td, "uri"), m.alloc);
+    val td:  *sj.Value = json.member(params, "textDocument");
+    val uri: str       = json.text(json.member(td, "uri"), m.alloc);
     if (uri == nil) { ret; }
     val d: *Doc = find(m, uri);
     json.free_str(uri, m.alloc);
     if (d == nil || !d.live) { ret; }
 
     val changes: *sj.Value = json.member(params, "contentChanges");
-    val n: usize = json.count(changes);
+    val n:       usize     = json.count(changes);
     if (n == 0) { ret; }
 
     val next: str = textedit.apply_changes(m.alloc, d.text, changes, n);
@@ -229,11 +232,11 @@ fun record_close(m: *Mirror, params: *sj.Value) {
 # already gone, and pushing the rest of the session into a broken pipe would
 # only turn one failure into several.
 # ---
-# m:  the mirror
-# fd: the worker's input
+# m:   the mirror
+# fd:  the worker's input
 # ret: true when the whole session was written
 pub fun replay(m: *Mirror, fd: i32) bool {
-    if (m.init_body == nil) { ret true; }
+    if (m.init_body == nil)                                               { ret true; }
     if (!transport.write_frame_to(fd, m.init_body, str_len(m.init_body))) { ret false; }
     if (m.ready_body != nil) {
         if (!transport.write_frame_to(fd, m.ready_body, str_len(m.ready_body))) { ret false; }
@@ -256,15 +259,15 @@ fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
     json.buf_push_quoted(?b, d.uri);
     json.buf_push(?b, ",\"languageId\":");
     if (d.language != nil) { json.buf_push_quoted(?b, d.language); }
-    or { json.buf_push(?b, "\"mach\""); }
+    or                     { json.buf_push(?b, "\"mach\""); }
     json.buf_push(?b, ",\"version\":");
     json.buf_push_i64(?b, d.version);
     json.buf_push(?b, ",\"text\":");
     json.buf_push_quoted(?b, d.text);
     json.buf_push(?b, "}}}");
 
-    val msg: str = json.buf_str(?b);
-    var ok: bool = false;
+    val msg: str  = json.buf_str(?b);
+    var ok:  bool = false;
     if (msg != nil) { ok = transport.write_frame_to(fd, msg, json.buf_len(?b)); }
     json.buf_dnit(?b);
     ret ok;
@@ -297,14 +300,14 @@ fun slot_for(m: *Mirror, uri: str) *Doc {
 fun grow(m: *Mirror) *Doc {
     val new_len: usize = m.len + 1;
     if (m.docs == nil) {
-        val r: Result[*Doc, str] = allocate[Doc](m.alloc, new_len);
-        if (is_err[*Doc, str](r)) { ret nil; }
-        m.docs = unwrap_ok[*Doc, str](r);
+        val r: res[*Doc, allocator.Error] = allocate[Doc](m.alloc, new_len);
+        if (sel r.err) { ret nil; }
+        m.docs = r.ok;
     }
     or {
-        val r: Result[*Doc, str] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
-        if (is_err[*Doc, str](r)) { ret nil; }
-        m.docs = unwrap_ok[*Doc, str](r);
+        val r: res[*Doc, allocator.Error] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
+        if (sel r.err) { ret nil; }
+        m.docs = r.ok;
     }
     val d: *Doc = ?m.docs[m.len];
     d.uri      = nil;
@@ -312,7 +315,7 @@ fun grow(m: *Mirror) *Doc {
     d.text     = nil;
     d.version  = 0;
     d.live     = false;
-    m.len = new_len;
+    m.len      = new_len;
     ret d;
 }
 

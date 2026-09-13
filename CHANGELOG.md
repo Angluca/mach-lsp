@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-13
+
+Mach 5.0 migration. The server now builds against the mach v5.0.0 compiler and
+std 2.0.0, follows the 5.0 driver and type-table contracts, and drops the
+lockfile in favour of the committed dependency gitlinks.
+
+### Changed
+- build: `mach.toml` follows the 5.0 manifest rules (complete profiles, one
+  default target and profile, `[dep.std]` realized at `dep/std`, pins on
+  `tag/v5.0.0` and `tag/v2.0.0`); `mach.lock` is gone. The debug profile
+  builds without debug info, as the compiler's own does, because the windows
+  target registers no debug model in 5.0 and a profile is not per target.
+- source: every `Result` / `Option` use is a `res` / `opt` tag read through
+  `sel` guards; std 2.0 signatures (allocation, paths, strings, env, clock,
+  writer sinks, toml/json optionals) are followed at each call site. The
+  server's own error payload stays `str`, since its errors are client-facing
+  messages.
+- analysis: the standalone buffer path runs `editor.analyze` per phase and
+  borrows the buffer's products for the request; diagnostics read the owned
+  `DiagnosticStore` (children, related, fixes are vectors).
+- types: the record back-link keys on the declaring file and interned name the
+  5.0 type table carries (`TypeOwner`), with `nominal_decl` recovering the
+  declaration from the file's Ast; `FieldKey` and `RecordSite` carry the same
+  identity.
+- project: `site_of` canonicalizes a `use` / `fwd` binding, which no longer
+  carries a DeclId, to the defining module's own symbol; every consumer of a
+  site reads `site.sym`.
+- test: protocol fixtures are 5.0 manifests; the on-disk edit in the watcher
+  case keeps the project compiling.
+
+### Requires
+- mach v5.0.2: the project load uses `driver.analyze_project_tolerant`, which
+  keeps a project's trees, resolve results and sema results through a rejected
+  frontend phase (briar-systems/mach#3337). The document view accepts a
+  module without a sema product, so a buffer mid-edit keeps project-scoped
+  diagnostics and navigation. Types in independent modules later in
+  dependency order still go dark while another module is rejected
+  (briar-systems/mach#3340). Buffers are registered with the editor under
+  their filesystem path, as 5.0 requires; a project whose manifest cannot
+  load is analyzed standalone by the editor (briar-systems/mach#3343), which
+  keeps syntax features alive while a manifest is being edited.
+
 ## [0.17.0] - 2026-08-31
 
 Completion now stays responsive while project analysis catches up to edits,

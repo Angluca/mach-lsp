@@ -19,15 +19,15 @@
 # waiting is nothing, while the cost of waiting would be the deadlock.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use json:      mls.json;
-use transport: mls.transport;
+use mls.json;
+use mls.transport;
 
 # whether the client said it can render work-done progress
 #
@@ -67,7 +67,10 @@ pub fun start(alloc: *Allocator, title: str) str {
     json.buf_push(?tb, "mls/progress/");
     json.buf_push_i64(?tb, SEQ);
     val view: str = json.buf_str(?tb);
-    if (view == nil) { json.buf_dnit(?tb); ret nil; }
+    if (view == nil) {
+        json.buf_dnit(?tb);
+        ret nil;
+    }
     val token: str = json.dup(view, alloc);
     json.buf_dnit(?tb);
     if (token == nil) { ret nil; }

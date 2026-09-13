@@ -66,7 +66,7 @@ and declared as git dependencies in `mach.toml`. Pull them, then build with the
 Mach toolchain:
 
 ```sh
-mach dep pull   # vendor dep/mach and dep/mach-std
+mach dep pull . # vendor dep/mach and dep/std
 mach build .    # compile the server
 ```
 
@@ -109,10 +109,10 @@ aware that the log will then contain fragments of whatever you have open.
 ## How the compiler dependency is wired
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
-surfaces this server binds to; `dep/mach-std` (id
-`std`) provides `std.*`. Both are declared as git dependencies in `mach.toml`
-and fetched by `mach dep pull`; Mach tracks `branch/dev` while mach-std tracks
-`branch/main` to match Mach's dependency identity.
+surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.0.2`
+and `v2.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
+`dep/` are the pins; there is no lockfile.
 
 ## Architecture
 
