@@ -33,12 +33,14 @@ lockfile in favour of the committed dependency gitlinks.
 - test: protocol fixtures are 5.0 manifests; the on-disk edit in the watcher
   case keeps the project compiling.
 
-### Known
-- A project whose frontend rejects a phase (any buffer with a parse or type
-  error mid-edit) loses its products under mach 5.0.0, so cross-module
-  features degrade to single-buffer analysis until briar-systems/mach#3337
-  ships a tolerant analysis entry point. The protocol suite fails from the
-  field-completion case onward for this reason.
+### Requires
+- mach v5.0.1: the project load uses `driver.analyze_project_tolerant`, which
+  keeps a project's trees, resolve results and sema results through a rejected
+  frontend phase (briar-systems/mach#3337). The document view accepts a
+  module without a sema product, so a buffer mid-edit keeps project-scoped
+  diagnostics and navigation. Types in independent modules later in
+  dependency order still go dark while another module is rejected
+  (briar-systems/mach#3340).
 
 ## [0.17.0] - 2026-08-31
 

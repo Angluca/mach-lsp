@@ -680,9 +680,9 @@ fun try_load(w: *Workspace, r: *Root) bool {
         ret false;
     }
     val extra_count: u32 = ecr.ok;
-    # a rejected frontend answers `reported` and releases the project; the
-    # products behind those diagnostics are unreachable until mach #3337
-    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project(r.s, ?m, ?req, extra, extra_count);
+    # the tolerant entry point keeps the project through a rejected phase, so
+    # the products behind the diagnostics stay readable while the user types
+    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(r.s, ?m, ?req, extra, extra_count, driver.FRONTEND_SEMA);
     if (extra != nil) { deallocate[intern.StrId](w.alloc, extra, documents.slot_count(w.docs)); }
     vector.dnit[request.LinkToken](?req.link_tokens);
     vector.dnit[str](?req.lib_dirs);
@@ -1374,7 +1374,10 @@ fun view_from_root(root: *Root, d: *documents.Document) res[DocumentView, str] {
     if (sel mo.none) { ret res[DocumentView, str].err{"project: document module was not loaded"}; }
     val mid: sess.ModuleId       = mo.some;
     val m:   *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil || !m.resolved || m.sema_result == nil) {
+    # a module whose own parse was rejected carries its tree and resolve result
+    # but no sema product; the view says so through a nil `sr` rather than
+    # falling back to single-buffer analysis
+    if (m == nil || m.a == nil || m.resolve_result == nil) {
         ret res[DocumentView, str].err{"project: document analysis unavailable"};
     }
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
