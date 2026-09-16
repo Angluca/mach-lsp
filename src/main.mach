@@ -21,11 +21,17 @@ use std.types.error.err;
 
 use mls.server;
 use mls.supervisor;
+use mls.version;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     if (os.ignore_sigpipe() != 0) { ret 1; }
+
+    # answered before anything else starts: a user asking which binary they have
+    # should not need a client, and must not start a server
+    if (has_flag(argc, argv, "--version")) { ret print_version(); }
 
     var alloc: Allocator;
     val pe:    err[allocator.Error] = page.make(?alloc);
@@ -50,12 +56,26 @@ fun main(argc: i64, argv: **u8) i64 {
 
 # whether this process was started as the analysis worker
 fun is_worker(argc: i64, argv: **u8) bool {
+    ret has_flag(argc, argv, supervisor.WORKER_FLAG);
+}
+
+# whether `flag` is one of the arguments
+fun has_flag(argc: i64, argv: **u8, flag: str) bool {
     var i: i64 = 1;
     for (i < argc) {
-        if (argv[i] != nil && str_equals(argv[i]::str, supervisor.WORKER_FLAG)) { ret true; }
+        if (argv[i] != nil && str_equals(argv[i]::str, flag)) { ret true; }
         i = i + 1;
     }
     ret false;
+}
+
+# write `mls <version>` to stdout
+fun print_version() i64 {
+    val name: str = "mls ";
+    if (os.write(os.STDOUT_FD, name::*u8, str_len(name)) < 0)                       { ret 1; }
+    if (os.write(os.STDOUT_FD, version.VERSION::*u8, str_len(version.VERSION)) < 0) { ret 1; }
+    if (os.write(os.STDOUT_FD, "\n"::*u8, 1) < 0)                                   { ret 1; }
+    ret 0;
 }
 
 # this executable's path, for re-spawning the worker

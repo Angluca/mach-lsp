@@ -1425,6 +1425,37 @@ def run_stale_diagnostics(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_version(server: Path, timeout: float) -> None:
+    """The binary reports the version it was built from, and starts nothing to do so.
+
+    A release asset is checked against its tag by this flag, and a client learns
+    the same value from `initialize`; both come from `[project].version`.
+    """
+    manifest = Path(__file__).resolve().parents[1] / "mach.toml"
+    match = re.search(r'^version = "([^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
+    require(match is not None, "mach.toml has no project version")
+    expected = match.group(1)
+
+    done = subprocess.run([str(server), "--version"], stdin=subprocess.DEVNULL,
+                          capture_output=True, timeout=timeout)
+    require(done.returncode == 0, f"--version exited {done.returncode}: {done.stderr!r}")
+    require(done.stdout.decode().strip() == f"mls {expected}",
+            f"--version printed {done.stdout!r}, expected mls {expected}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-version-") as directory:
+        session = LspSession(server, Path(directory), timeout)
+        finished = False
+        try:
+            info = session.request("initialize", {"capabilities": {}})["result"].get("serverInfo", {})
+            require(info == {"name": "mach-lsp", "version": expected},
+                    f"initialize reported {info!r}, expected version {expected}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
     """Prove a request is ANSWERED while a project rebuild is still running.
 
@@ -4384,6 +4415,7 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        run_version(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)

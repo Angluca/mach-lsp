@@ -89,11 +89,39 @@ The server binary is produced at `out/linux-x86_64/debug/bin/mls`.
 
 ## Installing
 
-Copy the built binary onto your `PATH`:
+Each release carries a prebuilt server for every supported platform. Download
+the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
+your `PATH`:
+
+```sh
+v=0.19.0 t=x86_64-linux
+curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
+curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf mls-$v-$t.tar.gz mls && install -Dm755 mls ~/.local/bin/mls
+mls --version
+```
+
+Or build it yourself and copy that binary instead:
 
 ```sh
 install -Dm755 out/linux-x86_64/debug/bin/mls ~/.local/bin/mls
 ```
+
+### Release assets
+
+The names are a contract: editor extensions download by them.
+
+| asset | contents |
+| --- | --- |
+| `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
+| `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
+| `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
+
+`<version>` has no leading `v`. `mls --version` prints `mls <version>`, and
+`initialize` reports the same value as `serverInfo.version`. Every shipped
+platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
+target without a native runner and is not shipped.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
