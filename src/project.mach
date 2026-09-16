@@ -66,6 +66,7 @@ use mls.documents;
 use mls.json;
 use mls.positions;
 use mls.progress;
+use mls.textdiff;
 use mls.trace;
 use mls.transport;
 use mtypes: mls.types;
@@ -128,6 +129,12 @@ rec SourceFingerprint {
 # attempted_revision:last input revision analyzed, including a failed attempt
 # dirty:             explicit watcher/save invalidation requiring one attempt
 # last_disk_scan_ns: last fallback fingerprint scan time
+# wins:              per module, where the snapshot's text differs from the open
+#                    buffer holding that module; valid for `wins_rev`, released
+#                    whenever the snapshot is replaced
+# wins_rev:          per module, the document revision `wins` was computed for,
+#                    0 when none
+# wins_len:          length of `wins` and `wins_rev`
 pub rec Root {
     path:               str;
     loaded:             bool;
@@ -148,6 +155,9 @@ pub rec Root {
     attempted_revision: u64;
     dirty:              bool;
     last_disk_scan_ns:  i64;
+    wins:               *textdiff.Windows;
+    wins_rev:           *u64;
+    wins_len:           u32;
 }
 
 # project roots and the standalone-editor fallback
@@ -633,6 +643,9 @@ fun reset_slot(r: *Root) {
     r.attempted_revision = 0;
     r.dirty              = false;
     r.last_disk_scan_ns  = 0;
+    r.wins               = nil;
+    r.wins_rev           = nil;
+    r.wins_len           = 0;
 }
 
 # a reusable dead slot, growing the array when every slot is
@@ -1015,6 +1028,7 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     # this repo, a rebuild goes from ~7s to ~34s without it. Its Project rides
     # along to be released by the next build, on the worker.
     free_mod_paths(w, r);
+    free_windows(w, r);
     if (r.loaded) {
         r.spare_p     = r.p;
         r.spare_has_p = true;
@@ -1563,6 +1577,7 @@ pub fun root_covers_document(w: *Workspace, r: *Root, d: *documents.Document) bo
 
 # release a root's retained Project, source index, Session, and owned path
 fun free_root(w: *Workspace, r: *Root) {
+    free_windows(w, r);
     free_root_graph(w, r);
     free_mod_paths(w, r);
     if (r.spare_has_p) {
@@ -1933,7 +1948,7 @@ fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[Docum
     v.sr     = m.sema_result;
     v.stale  = d.revision > root.snapshot_revision;
     v.text   = positions.text_of(fo.some);
-    if (v.stale) { v.text = positions.text_against(fo.some, documents.live_file(w.docs, d)); }
+    if (v.stale) { v.text = positions.text_against(fo.some, documents.live_file(w.docs, d), module_windows(w, root, mid, fo.some, d)); }
     v.interner = ?root.s.interner;
     v.revision = root.snapshot_revision;
     v.file_id  = m.file_id;
@@ -1974,6 +1989,66 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
     ret opt[ModuleView].some{v};
 }
 
+# where loaded module `mid`'s snapshot text differs from `d`'s current buffer,
+# computed once per document revision for this snapshot, or nil when it cannot
+# be computed
+#
+# The list is owned by the root and lives until the snapshot is replaced, which
+# only happens between messages, so every Text that borrows it during a request
+# stays valid for the whole request.
+# ---
+# w:    the workspace
+# root: the loaded root
+# mid:  the module
+# file: the module's snapshot source
+# d:    the open document holding the module
+# ret:  the windows, or nil
+fun module_windows(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile, d: *documents.Document) *textdiff.Windows {
+    val live: *src.SourceFile = documents.live_file(w.docs, d);
+    if (live == nil) { ret nil; }
+    if (root.wins == nil) {
+        val n:  u32                                     = root.p.module_len;
+        val wr: res[*textdiff.Windows, allocator.Error] = allocate[textdiff.Windows](w.alloc, n::usize);
+        if (sel wr.err) { ret nil; }
+        val rr: res[*u64, allocator.Error] = allocate[u64](w.alloc, n::usize);
+        if (sel rr.err) {
+            deallocate[textdiff.Windows](w.alloc, wr.ok, n::usize);
+            ret nil;
+        }
+        root.wins     = wr.ok;
+        root.wins_rev = rr.ok;
+        root.wins_len = n;
+        var i: u32 = 0;
+        for (i < n) {
+            root.wins[i]     = textdiff.empty();
+            root.wins_rev[i] = 0;
+            i                = i + 1;
+        }
+    }
+    if (mid::u32 >= root.wins_len) { ret nil; }
+    val slot: *textdiff.Windows = ?root.wins[mid::u32];
+    if (root.wins_rev[mid::u32] == d.revision) { ret slot; }
+    root.wins_rev[mid::u32] = 0;
+    if (!textdiff.compute(w.alloc, file, str_len(file.text), live, str_len(live.text), slot)) { ret nil; }
+    root.wins_rev[mid::u32] = d.revision;
+    ret slot;
+}
+
+# release a root's window cache, which describes the snapshot being replaced
+fun free_windows(w: *Workspace, r: *Root) {
+    if (r.wins == nil) { ret; }
+    var i: u32 = 0;
+    for (i < r.wins_len) {
+        textdiff.dnit(w.alloc, ?r.wins[i]);
+        i = i + 1;
+    }
+    deallocate[textdiff.Windows](w.alloc, r.wins, r.wins_len::usize);
+    deallocate[u64](w.alloc, r.wins_rev, r.wins_len::usize);
+    r.wins     = nil;
+    r.wins_rev = nil;
+    r.wins_len = 0;
+}
+
 # loaded module `mid`'s source read against the client's buffer, when an open
 # document holds that module and has moved past the snapshot
 #
@@ -1997,7 +2072,7 @@ fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.Sourc
         val d: *documents.Document = documents.at(w.docs, i);
         if (d != nil && d.in_use && d.path != nil && str_equals(d.path, path)) {
             if (d.revision <= root.snapshot_revision) { ret plain; }
-            ret positions.text_against(file, documents.live_file(w.docs, d));
+            ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mid, file, d));
         }
         i = i + 1;
     }

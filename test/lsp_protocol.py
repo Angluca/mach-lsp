@@ -1184,6 +1184,21 @@ def run_stale_hover(server: Path, timeout: float) -> None:
             require("base9" in json.dumps(fresh.get("result")),
                     f"the rebuilt snapshot did not answer for the new name: {fresh!r}")
 
+            # two edits far apart - a line at the top, a statement above `ret` -
+            # leave the imports between them answerable, each moved by the first
+            lines = renamed.splitlines(keepends=True)
+            use_line = next(i for i, value in enumerate(lines) if value.startswith("use stale.m5.base5;"))
+            spread = ("# top\n" + "".join(lines[:ret_line + 1])
+                      + "    val late: i32 = base7;\n" + "".join(lines[ret_line + 1:]))
+            between = stale_request(session, builds, change(uri, 5, spread),
+                                    "textDocument/hover", at(uri, use_line + 1, len("use stale.m5.ba")))
+            result = between.get("result")
+            require(isinstance(result, dict) and "base5" in json.dumps(result.get("contents")),
+                    f"a name between two edits answered nothing: {between!r}")
+            require(result.get("range", {}).get("start", {}).get("line") == use_line + 1,
+                    f"a name between two edits is not where the client has it: {result!r}")
+            builds.settle(4, "the fourth edit's rebuild")
+
             session.finish()
             finished = True
         finally:

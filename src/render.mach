@@ -34,6 +34,7 @@ use src: mach.lang.source;
 
 use mls.json;
 use mls.positions;
+use mls.textdiff;
 use mls.transport;
 
 # the LSP SymbolKind a declaration kind is reported as
@@ -333,9 +334,11 @@ test "render: an unmapped span writes nothing" {
     page.make(?pa);
     var starts: [1]usize;
     starts[0] = 0;
-    var old:  src.SourceFile = stub_file("abXYcd", ?starts[0], 1);
-    var new:  src.SourceFile = stub_file("abQcd", ?starts[0], 1);
-    val t:    positions.Text = positions.text_against(?old, ?new);
+    var old:  src.SourceFile   = stub_file("abXYcd", ?starts[0], 1);
+    var new:  src.SourceFile   = stub_file("abQcd", ?starts[0], 1);
+    var wins: textdiff.Windows = textdiff.empty();
+    textdiff.compute(?pa, ?old, 6, ?new, 5, ?wins);
+    val t:    positions.Text = positions.text_against(?old, ?new, ?wins);
     var b:    json.Buf       = json.buf_init(?pa);
     var fail: bool           = false;
     if (location(?b, t, "file:///x.mach", span_at(2, 1))) { fail = true; }
@@ -347,6 +350,7 @@ test "render: an unmapped span writes nothing" {
     val got: str = json.buf_str(?b);
     if (got == nil || !str_equals(got, "{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":5}}")) { fail = true; }
     json.buf_dnit(?b);
+    textdiff.dnit(?pa, ?wins);
     if (fail) { ret 1; }
     ret 0;
 }
