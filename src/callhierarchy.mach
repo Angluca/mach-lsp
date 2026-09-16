@@ -660,7 +660,7 @@ fun callee_shown(callees: *Callee, i: usize, n: usize) bool {
 
 # whether an item's two ranges can both be reported
 fun item_maps(text: positions.Text, name_span: token.Span, decl_span: token.Span) bool {
-    ret positions.maps(text, name_span) && positions.maps(text, decl_span);
+    ret positions.maps(text, name_span) && positions.maps_around(text, decl_span);
 }
 
 # whether the item `push_decl_item` would write for `did` can be reported
@@ -748,7 +748,7 @@ fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     json.buf_push(b, ",\"uri\":");
     json.buf_push_quoted(b, uri);
     json.buf_push(b, ",\"range\":");
-    render.span_range(b, text, decl_span);
+    render.span_range_around(b, text, decl_span);
     json.buf_push(b, ",\"selectionRange\":");
     render.span_range(b, text, name_span);
     json.buf_push_byte(b, '}');

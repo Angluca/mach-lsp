@@ -178,8 +178,19 @@ pub fun live_span(t: Text, span: token.Span, enclosing: bool) opt[token.Span] {
     ret opt[token.Span].none{};
 }
 
-# whether `span` can be reported to the client, enclosing spans included
+# whether `span` can be reported to the client
+#
+# A span that encloses the window is refused: a name, a reference, a highlight
+# is a claim about exactly those bytes, and a change inside them changed what it
+# names. A declaration's full range is not such a claim; see `maps_around`.
 pub fun maps(t: Text, span: token.Span) bool {
+    val o: opt[token.Span] = live_span(t, span, false);
+    ret sel o.some;
+}
+
+# as `maps`, for a range that merely surrounds what it describes - a
+# declaration around an edit to its body is still that declaration
+pub fun maps_around(t: Text, span: token.Span) bool {
     val o: opt[token.Span] = live_span(t, span, true);
     ret sel o.some;
 }
@@ -255,23 +266,22 @@ fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
 }
 
 # the client's LSP range for a span of the analyzed text, or none when the span
-# cannot be carried into the client's buffer
+# cannot be carried into the client's buffer (see `maps`)
 # ---
 # t:    the pairing the span indexes
 # span: a span of `t.file`
 # ret:  the 0-based range in the client's buffer, or none
 pub fun span_range(t: Text, span: token.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[token.Span] = live_span(t, span, true);
+    val lo: opt[token.Span] = live_span(t, span, false);
     if (sel lo.none) { ret opt[LspRange].none{}; }
     ret opt[LspRange].some{range_of(client_file(t), lo.some)};
 }
 
-# as `span_range`, refusing a span that encloses the window: for a claim about
-# the span's own content, which the edit may have changed
-pub fun span_range_disjoint(t: Text, span: token.Span) opt[LspRange] {
+# as `span_range`, carrying a range that surrounds the window; see `maps_around`
+pub fun span_range_around(t: Text, span: token.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[token.Span] = live_span(t, span, false);
+    val lo: opt[token.Span] = live_span(t, span, true);
     if (sel lo.none) { ret opt[LspRange].none{}; }
     ret opt[LspRange].some{range_of(client_file(t), lo.some)};
 }

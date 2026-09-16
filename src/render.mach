@@ -92,6 +92,15 @@ pub fun span_range(b: *json.Buf, t: positions.Text, span: token.Span) bool {
     ret true;
 }
 
+# as `span_range`, for a range that surrounds what it describes; see
+# `positions.maps_around`
+pub fun span_range_around(b: *json.Buf, t: positions.Text, span: token.Span) bool {
+    val ro: opt[positions.LspRange] = positions.span_range_around(t, span);
+    if (sel ro.none) { ret false; }
+    range(b, ro.some);
+    ret true;
+}
+
 # append an LSP Location: a document URI and a range within it
 # ---
 # b:    output buffer

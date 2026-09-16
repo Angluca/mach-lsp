@@ -246,7 +246,7 @@ fun range_for(t: positions.Text, span: token.Span, out: *positions.LspRange) boo
     out.end_line   = 0;
     out.end_char   = 0;
     if (t.file == nil) { ret true; }
-    val ro: opt[positions.LspRange] = positions.span_range_disjoint(t, span);
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
     if (sel ro.none) { ret false; }
     @out = ro.some;
     ret true;
