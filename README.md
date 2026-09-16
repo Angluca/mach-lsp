@@ -125,7 +125,7 @@ aware that the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.2.0`
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.2.1`
 and `v3.2.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 `dep/` are the pins; there is no lockfile.
 
