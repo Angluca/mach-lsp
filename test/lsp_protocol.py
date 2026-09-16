@@ -1157,9 +1157,16 @@ def run_stale_hover(server: Path, timeout: float) -> None:
 
             # a line inserted above: the answer moves down with the text
             above = "# a line the snapshot never saw\n" + text
+            before = rebuilt(builds)
             hover_lands(stale_request(session, builds, change(uri, 2, above),
                                       "textDocument/hover", at(uri, ret_line + 1, column + 2)),
                         ret_line + 1, "after the window")
+            # the inserted line has no analysis, even where the same column of the
+            # snapshot's first line holds a name
+            inserted = session.request("textDocument/hover", at(uri, 0, len("use stale.m0.ba")))
+            require(rebuilt(builds) == before, "the rebuild landed before the inserted line was asked about")
+            require(inserted.get("result") is None,
+                    f"a cursor on text the snapshot never saw answered: {inserted!r}")
             builds.settle(1, "the first edit's rebuild")
 
             # text appended below: the answer keeps its place
