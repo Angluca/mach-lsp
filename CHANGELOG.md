@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `project.TypeSite`. The cursor tries four candidates and takes the first that
   resolves to a declaration rather than the first that types, because a callee's
   own type is a function type and committing to it answers null on `make` in
-  `ret make();`.
+  `ret make();`. A cursor on a function parameter's name reads the parameter's
+  written type, since a parameter binds no declaration of its own.
 - feat(navigation): call hierarchy - `textDocument/prepareCallHierarchy`,
   `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. An item is
   addressed by `uri` plus `selectionRange.start` and re-derived on every
