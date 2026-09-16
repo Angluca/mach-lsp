@@ -124,10 +124,10 @@ class LspSession:
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        started = time.monotonic()
+        started = time.perf_counter()
         self._send(message)
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.monotonic() - started))
+        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
@@ -154,7 +154,7 @@ class LspSession:
         for message in messages:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
             frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
-        started = time.monotonic()
+        started = time.perf_counter()
         try:
             self.proc.stdin.write(b"".join(frames))
             self.proc.stdin.flush()
@@ -162,7 +162,7 @@ class LspSession:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.monotonic() - started))
+        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
@@ -611,12 +611,12 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             alpha_manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(alpha_manifest_text + "\n[broken\n", encoding="utf-8")
-            started = time.monotonic()
+            started = time.perf_counter()
             symbols = session.request(
                 "textDocument/documentSymbol",
                 {"textDocument": {"uri": alpha[0].as_uri()}},
             )
-            require(time.monotonic() - started < 1.0,
+            require(time.perf_counter() - started < 1.0,
                     "syntax-only documentSymbol blocked on project analysis")
             require(isinstance(symbols.get("result"), list) and symbols["result"],
                     f"documentSymbol depended on project loading: {symbols!r}")
@@ -1045,10 +1045,10 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
             manifest_text = manifest.read_text(encoding="utf-8")
             manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
             time.sleep(0.4)
-            started = time.monotonic()
+            started = time.perf_counter()
             broken = session.request(
                 "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
-            require(time.monotonic() - started < 1.0,
+            require(time.perf_counter() - started < 1.0,
                     "documentSymbol blocked on project analysis")
             require(isinstance(broken.get("result"), list) and broken["result"],
                     f"documentSymbol needed a loaded project: {broken!r}")
@@ -1175,15 +1175,26 @@ path = "dep/std"
     return main, text
 
 
+def ratio_text(healthy: float, standalone: float) -> str:
+    """Format a latency ratio, or say so when the baseline is too small to divide."""
+    if standalone <= 0.0:
+        return "unmeasurable baseline"
+    return f"{healthy / standalone:.2f}x"
+
+
 def syntax_only_median(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
                        text: str, label: str, samples: int) -> tuple[float, Any]:
-    """Median latency over `samples` identical requests, with the last reply."""
+    """Median latency over `samples` identical requests, with the last reply.
+
+    perf_counter, not monotonic: monotonic ticks about every 15.6ms on Windows,
+    which reads a millisecond-scale request as zero elapsed.
+    """
     durations: list[float] = []
     result: Any = None
     for _ in range(samples):
-        started = time.monotonic()
+        started = time.perf_counter()
         response = session.request(feature.method, feature.params(uri, text))
-        durations.append(time.monotonic() - started)
+        durations.append(time.perf_counter() - started)
         result = response.get("result")
         require(feature.valid(result),
                 f"{feature.name} answered nothing usable {label}: {response!r}")
@@ -1255,10 +1266,12 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
                         f"{feature.name} answered differently once the project was lost")
 
                 allowed = max(standalone * SYNTAX_ONLY_RATIO, SYNTAX_ONLY_FLOOR)
+                # require's message is built whether or not it fails, so the
+                # ratio cannot be divided here unguarded
                 require(healthy <= allowed,
                         f"{feature.name} reloads the project on a healthy root: "
                         f"{healthy * 1000:.1f}ms healthy vs {standalone * 1000:.1f}ms "
-                        f"standalone ({healthy / standalone:.2f}x, allowed "
+                        f"standalone ({ratio_text(healthy, standalone)}, allowed "
                         f"{allowed * 1000:.1f}ms)")
                 measured.append((feature.name, healthy, standalone))
 
@@ -1530,9 +1543,9 @@ def run_workspace_symbol(server: Path, timeout: float) -> None:
                 return items
 
             # nothing is loaded yet: a query must answer, not block on a build
-            started = time.monotonic()
+            started = time.perf_counter()
             require(query("answer") == [], "an unloaded workspace returned symbols")
-            require(time.monotonic() - started < 2.0,
+            require(time.perf_counter() - started < 2.0,
                     "workspace/symbol forced a cold project load")
 
             session.notify(
