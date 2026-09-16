@@ -217,6 +217,24 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId
     ret opt[SymbolRef].none{};
 }
 
+# the written type of the function parameter whose binding name holds `offset`
+# in decl `did`, or TYPE_NIL. a parameter carries no Decl node, so neither the
+# decl nor the expr side tables can answer for a cursor on its name
+pub fun param_type_at(a: *ast.Ast, did: id.DeclId, offset: usize) id.TypeId {
+    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel d_opt.none) { ret id.TYPE_NIL; }
+    val d: *decl.Decl = d_opt.some;
+    if (d.kind != decl.DECL_KIND_FUN) { ret id.TYPE_NIL; }
+
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+        if (ast.span_contains(tn.name, offset)) { ret tn.ty; }
+        pi = pi + 1;
+    }
+    ret id.TYPE_NIL;
+}
+
 # generics_start_of / generics_len_of: the generic-name pool slice of a decl
 # that may declare generics (fun / rec / uni), or 0 otherwise
 fun generics_start_of(d: *decl.Decl) u32 {

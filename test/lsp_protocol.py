@@ -1211,6 +1211,10 @@ pub fun indirect(f: Handler, t: Table) i32 {
     ret f(1) + t.fn(2);
 }
 
+pub fun measure(p: *Box) i32 {
+    ret p.v;
+}
+
 pub fun main() i32 {
     var b: Box;
     val c: Color = make();
@@ -1530,11 +1534,15 @@ def run_type_definition(server: Path, timeout: float) -> None:
             lands_on("val c: Color = make();", "make", "Color")
             # and a tag is a type like any other
             lands_on("val c: Color = make();", "Color", "Color")
+            # a parameter is no decl of its own, and its pointer is peeled
+            lands_on("measure(p: *Box)", "(p", "Box")
+            lands_on("ret p.v;", "p", "Box")
 
             # a type with no nominal site has nowhere to go
             for within, needle in (("val n: i32   = b.v", "b.v"),
                                    ("val n: i32   = b.v", "v"),
-                                   ("ret local(n)", "n")):
+                                   ("ret local(n)", "n"),
+                                   ("local(n: i32)", "(n")):
                 result = type_definition(within, needle)
                 require(result is None,
                         f"typeDefinition on the primitive {needle!r} answered {result!r}")

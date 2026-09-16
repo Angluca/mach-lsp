@@ -895,8 +895,8 @@ pub fun type_definition(ws: *project.Workspace, es: *editor.EditorSession, alloc
 #      `make()` reaches the return type rather than the function type;
 #   3. a written type, which is neither expression nor declaration: `Box` in
 #      `var b: Box[i32];`, a field's declared type, a return type;
-#   4. the enclosing declaration's own type, which answers a cursor on a binding's
-#      name.
+#   4. the binding under the cursor: a function parameter's written type, which
+#      is not a decl of its own, else the enclosing declaration's type.
 # ---
 # ws:     the workspace
 # an:     the analyzed request document
@@ -924,8 +924,11 @@ fun type_site_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) 
     }
 
     val did: id.DeclId = ast.offset_to_decl(an.a, offset);
-    if (did != id.DECL_NIL) { ret site_of_type(ws, an, project.decl_type_of(an.sr, did)); }
-    ret opt[project.TypeSite].none{};
+    if (did == id.DECL_NIL) { ret opt[project.TypeSite].none{}; }
+
+    val ptid: id.TypeId = features.param_type_at(an.a, did, offset);
+    if (ptid != id.TYPE_NIL) { ret site_of_type(ws, an, project.type_ref_of(an.sr, ptid)); }
+    ret site_of_type(ws, an, project.decl_type_of(an.sr, did));
 }
 
 # the declaring site of `tid` against the request's buffer and project
