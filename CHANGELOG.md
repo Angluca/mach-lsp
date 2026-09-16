@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     version.
   - The release is drafted with every asset, checked, and only then made public.
   - A dispatch rehearses the whole path and stops at a draft.
+- build: the windows server is `mls.exe` (`out = "bin/mls{artifact.suffix}"`);
+  it was written as `mls`, which a client launching `mls` cannot run.
 - feat(server): `mls --version` prints `mls <version>`, and `initialize`
   reports it as `serverInfo.version`, both from `[project].version`.
 - feat(navigation): `textDocument/typeDefinition` goes to the declaring site of
