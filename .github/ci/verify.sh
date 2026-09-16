@@ -17,8 +17,10 @@ if [ -z "$target" ]; then
     esac
 fi
 
+# the .exe name first: git bash on windows also answers `-f mls` for mls.exe,
+# and the suite needs the real file name
 bin=""
-for candidate in "out/$target/debug/bin/mls" "out/$target/debug/bin/mls.exe"; do
+for candidate in "out/$target/debug/bin/mls.exe" "out/$target/debug/bin/mls"; do
     if [ -f "$candidate" ]; then
         bin="$candidate"
         break
