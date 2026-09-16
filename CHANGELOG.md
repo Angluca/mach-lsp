@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for them - see #249.
 
 ### Fixed
+- fix(supervisor): the server starts on aarch64-linux (#259). The worker was
+  spawned with stderr passed as descriptor 2, which std redirects with `dup3`
+  on aarch64 and riscv64, and `dup3(2, 2)` fails, so the worker died before
+  exec. It now passes -1, std's spelling of inherit. Found by the new heavy
+  aarch64 CI leg.
 - fix(project): a buffer whose snapshot is rebuilding is answered instead of
   ignored (#251). `document_view` refused a snapshot older than the buffer, and
   nothing fell back, so every semantic request on an edited buffer answered null

@@ -314,8 +314,12 @@ fun start_worker(self: str, to: *i32, from: *i32) i64 {
     # child an EMPTY environment, which silently drops everything a tool reads
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
+    #
+    # the worker's stderr is inherited, and -1 is how std spells that. passing 2
+    # asks for dup3(2, 2), which aarch64 and riscv64 reject, and the child then
+    # dies before exec
     val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
-        to[0], from[1], 2);
+        to[0], from[1], -1);
     os.close(to[0]);
     os.close(from[1]);
     if (pid < 0) {
