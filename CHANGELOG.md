@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- perf(analysis): a syntax-only request no longer reloads the project through
+  the editor session. `editor.analyze` tore the project down on every call, so
+  `documentSymbol` against a healthy project paid a full reload: against this
+  repo, a 1586.9ms median versus 34.8ms under a manifest that cannot load. The
+  cause was mach#3431, and the pin advances to v5.1.0 to carry the fix, which
+  puts the same measurement at 1.00x. std advances to v2.2.0 alongside it.
+
 ### Changed
+- test: the protocol suite asserts the healthy-project latency of every
+  syntax-only feature, not just the standalone path. The previous assertion
+  broke the manifest before timing `documentSymbol`, so it measured the one
+  path that was never slow and a 40x regression shipped in 0.18.0 unnoticed.
+  The new bound is a ratio between the two paths measured in the same run, so
+  machine load cancels, and the fixture carries a real dependency because a
+  reload costs what its dependencies cost and a dependency-free project cannot
+  show one.
 - build: the mach pin advances to v5.0.4. v5.0.3 is codegen and register
   allocation work the server only consumes; v5.0.4 removes the filesystem
   transaction layer, so no `.mach-txn-lock`, `.machtxn.claims/` or
