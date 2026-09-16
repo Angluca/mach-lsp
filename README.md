@@ -50,6 +50,21 @@ under canonical and manifest-raw POSIX spellings (including `src = "./src"`).
 Portable Windows/UNC canonicalization is tracked by #157, mach#2998, and
 mach-std#472.
 
+While a root rebuilds, the edited buffer is still answered from the snapshot
+it has, read through the edits since that snapshot (#251). `textdiff` compares
+the snapshot's text with the buffer line by line and narrows each difference to
+its bytes. Every position going out is carried across those windows, and a
+position touching one answers nothing rather than a place the client no longer
+has. Hover, definition, typeDefinition, highlight, signature help, inlay hints,
+semantic tokens and the call hierarchy answer this way, and clients that
+support it are asked to refresh tokens and hints once the rebuild lands.
+References, rename, prepareRename and code actions must not answer from earlier
+text, so they are held until a snapshot covers every buffer of their root, and
+answered then. A cancel answers a held request at once, and closing its document
+answers it with ContentModified. Diagnostics show the buffer's own syntax errors
+when it has any, and otherwise the snapshot's semantic diagnostics that avoid
+the edits.
+
 Cross-module references and rename walk the retained graph. Rename is restricted
 to project-owned declarations, so vendored dependency sources remain read-only.
 Completion is currently a flat list of module names, import aliases, and primitive
@@ -125,7 +140,9 @@ and `v2.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 | `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
 | `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback |
-| `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point |
+| `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point, including across a stale snapshot's edits |
+| `textdiff` | the windows where a snapshot's text and the client's buffer differ |
+| `parked` | requests held until their root's snapshot catches up |
 | `features` | offset → id → symbol query core over the resolve side tables |
 | `project` | stable per-root compiler Sessions and retained Project snapshots, overlays, routing, fingerprints, module views, and invalidation |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
