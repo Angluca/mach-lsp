@@ -30,6 +30,7 @@ use src:  mach.lang.source;
 
 use mls.features;
 use mls.json;
+use mls.positions;
 use mls.project;
 use mls.render;
 use strutil: std.text.string;
@@ -118,9 +119,10 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
                 if (match_tier(query, name) == tier) {
                     val spo: opt[token.Span] = features.decl_name_span_of(mv.a, sym);
                     if (sel spo.some) {
-                        push_symbol(b, mv.text.file, uri, spo.some, name,
-                            features.lsp_symbol_kind(sym.kind), fqn, emitted > 0);
-                        emitted = emitted + 1;
+                        if (push_symbol(b, mv.text, uri, spo.some, name,
+                            features.lsp_symbol_kind(sym.kind), fqn, emitted > 0)) {
+                            emitted = emitted + 1;
+                        }
                     }
                 }
             }
@@ -134,10 +136,12 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
 #
 # `containerName` carries the declaring module's FQN, which is what makes two
 # identically-named symbols distinguishable - and roots with colliding FQNs are
-# explicitly supported, so this is not cosmetic.
-fun push_symbol(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span,
-    name: str, kind: i64, container: str, comma: bool) {
-    if (comma) { json.buf_push_byte(b, ','); }
+# explicitly supported, so this is not cosmetic. a declaration whose name
+# span cannot be reported in the client's buffer is left out
+fun push_symbol(b: *json.Buf, text: positions.Text, uri: str, span: token.Span,
+    name: str, kind: i64, container: str, comma: bool) bool {
+    if (!positions.maps(text, span)) { ret false; }
+    if (comma)                       { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"name\":");
     json.buf_push_quoted(b, name);
     json.buf_push(b, ",\"kind\":");
@@ -147,8 +151,9 @@ fun push_symbol(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span,
         json.buf_push_quoted(b, container);
     }
     json.buf_push(b, ",\"location\":");
-    render.location(b, file, uri, span);
+    render.location(b, text, uri, span);
     json.buf_push_byte(b, '}');
+    ret true;
 }
 
 # how well `name` matches `query`, case-insensitively

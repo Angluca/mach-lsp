@@ -42,6 +42,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for them - see #249.
 
 ### Fixed
+- fix(project): a buffer whose snapshot is rebuilding is answered instead of
+  ignored (#251). `document_view` refused a snapshot older than the buffer, and
+  nothing fell back, so every semantic request on an edited buffer answered null
+  until the rebuild landed: ~33s after the first edit on this repo, ~6.5s after
+  any later one. The stale snapshot now answers through `textdiff`, a Myers line
+  diff narrowed to bytes. A position touching an edit answers nothing, and names
+  and references refuse a span whose own bytes changed. One window from the
+  common prefix to the common suffix was measured first and rejected: an import
+  added at the top and used below blinds a median 53% of a file's identifiers
+  with one window, and 0.47% with the list. References, rename, prepareRename
+  and code actions are held until the root is current, then re-dispatched in
+  arrival order. A cancel answers a held request at once, and didClose and
+  shutdown answer theirs with ContentModified. A rename that would leave an
+  occurrence unmapped answers ContentModified instead of half an edit. They
+  also now require every buffer of the root to be current, not just their own,
+  since a sibling's stale picture made a rename miss or misplace its edits.
+  Diagnostics keep the buffer's parse errors when it has any, and otherwise
+  carry the snapshot's semantic diagnostics that avoid the edits. Clients that
+  advertise `refreshSupport` are asked to refresh semantic tokens and inlay
+  hints after a swap that replaced stale answers.
+- fix(tokens): a semantic token dropped for spanning lines no longer leaves a
+  leading comma when it is the first one.
 - fix(project): a source file written while a build ran is rebuilt rather than
   recorded as already seen (#254). A build fingerprinted its modules after
   analyzing them, so a write landing in between left a snapshot of the old

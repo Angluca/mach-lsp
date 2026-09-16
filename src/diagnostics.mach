@@ -25,12 +25,14 @@ use std.allocator.page;
 use mach.lang.build.outcome;
 use diag: mach.lang.diagnostic;
 use mach.lang.editor;
+use mach.lang.fe.token;
 use src: mach.lang.source;
 
 use mls.documents;
 use mls.json;
 use mls.positions;
 use mls.project;
+use mls.render;
 use mls.trace;
 use mls.transport;
 
@@ -55,6 +57,16 @@ val MAX_DIAGNOSTICS: usize = 200;
 # or refreshes the root, and the result is parse, resolve, and sema at the same
 # fidelity `mach build` reports.
 #
+# While the root rebuilds, the snapshot describes earlier text (#251). What the
+# buffer can say about itself - its parse - is current and always wins: a buffer
+# with syntax errors shows exactly those. A buffer that parses cleanly keeps the
+# snapshot's semantic diagnostics, carried into its current text, when the
+# snapshot parsed this module cleanly too, so everything it reports for the file
+# came from resolve and sema; one that touches the edited window is dropped,
+# since the edit may be what fixed it. When the snapshot could not parse the
+# module, its diagnostics describe text that is gone, and nothing is shown until
+# the rebuild lands.
+#
 # `project.refresh_inputs` makes this a revision check once the snapshot is
 # current, so republishing every open document after a change costs one
 # comparison per document rather than one analysis.
@@ -67,14 +79,31 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var list:   *diag.DiagnosticStore = nil;
     var result: editor.AnalysisResult = editor.AnalysisResult{};
     result.alloc = nil;
-    var sources: *src.SourceMap                 = nil;
-    var own:     src.FileId                     = d.file_id;
-    val vr:      res[project.DocumentView, str] = project.document_view(w, d);
+    var at:  Locator                        = Locator{w: w, root: nil, sources: nil};
+    var own: src.FileId                     = d.file_id;
+    val vr:  res[project.DocumentView, str] = project.document_view(w, d);
     if (sel vr.ok) {
         val v: project.DocumentView = vr.ok;
-        list    = ?v.root.s.diags;
-        sources = ?v.root.s.sources;
-        own     = v.file_id;
+        if (v.stale) {
+            if (!standalone(es, d, editor.PHASE_PARSE, alloc, ?result)) { ret; }
+            list       = result.diagnostics;
+            at.sources = ?es.s.sources;
+            if (count_for(list, own) == 0) {
+                list = nil;
+                if (v.parse_ok) {
+                    list       = ?v.root.s.diags;
+                    at.sources = ?v.root.s.sources;
+                    at.root    = v.root;
+                    own        = v.file_id;
+                }
+            }
+        }
+        or {
+            list       = ?v.root.s.diags;
+            at.sources = ?v.root.s.sources;
+            at.root    = v.root;
+            own        = v.file_id;
+        }
     }
     or {
         # Fidelity is chosen by who the AUTHORITY is, not by what is available.
@@ -85,21 +114,10 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         # off it was meant to remove. Parse is what the buffer can say about
         # itself instantly; the post-swap republish carries the rest.
         var phase: editor.AnalysisPhase = editor.PHASE_SEMA;
-        if (project.root_for_loaded(w, d.uri) != nil) { phase = editor.PHASE_PARSE; }
-        var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, phase);
-        val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
-        if (sel ar.err) {
-            var f: outcome.Fail = ar.err;
-            trace.log("diagnostics: standalone analysis failed: ");
-            trace.log(outcome.describe(f));
-            trace.log("\n");
-            editor.fail_dnit(es, ?f);
-            clear(alloc, d.uri);
-            ret;
-        }
-        result  = ar.ok;
-        list    = result.diagnostics;
-        sources = ?es.s.sources;
+        if (project.root_for_loaded(w, d.uri) != nil)  { phase = editor.PHASE_PARSE; }
+        if (!standalone(es, d, phase, alloc, ?result)) { ret; }
+        list       = result.diagnostics;
+        at.sources = ?es.s.sources;
     }
 
     var b: json.Buf = json.buf_init(alloc);
@@ -112,11 +130,9 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     json.buf_push(?b, ",\"diagnostics\":[");
     var i:       usize = 0;
     var written: usize = 0;
-    for (i < list.items.len && written < MAX_DIAGNOSTICS) {
+    for (list != nil && i < list.items.len && written < MAX_DIAGNOSTICS) {
         if (list.items.data[i].loc.file_id == own) {
-            if (written > 0) { json.buf_push_byte(?b, ','); }
-            push_entry(?b, sources, ?list.items.data[i], alloc);
-            written = written + 1;
+            if (push_entry(?b, ?at, ?list.items.data[i], alloc, written > 0)) { written = written + 1; }
         }
         i = i + 1;
     }
@@ -126,6 +142,56 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     if (msg != nil) { transport.send_message(msg, alloc); }
     json.buf_dnit(?b);
     editor.analysis_dnit(?result);
+}
+
+# where a diagnostic's file ids resolve, and how their spans reach the client
+# ---
+# w:       the workspace
+# root:    the root whose session the ids belong to, or nil for the editor's
+# sources: the source map the ids index
+rec Locator {
+    w:       *project.Workspace;
+    root:    *project.Root;
+    sources: *src.SourceMap;
+}
+
+# the text a file id's spans are reported through
+fun text_for(at: *Locator, fid: src.FileId) positions.Text {
+    if (at.root != nil) { ret project.file_text(at.w, at.root, fid); }
+    val so: opt[*src.SourceFile] = src.get(at.sources, fid);
+    if (sel so.some) { ret positions.text_of(so.some); }
+    ret positions.text_of(nil);
+}
+
+# run the editor frontend on the open buffer; on failure the client's list is
+# cleared and false returned
+fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: editor.AnalysisPhase,
+    alloc: *Allocator, out: *editor.AnalysisResult) bool {
+    var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, phase);
+    val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
+    if (sel ar.err) {
+        var f: outcome.Fail = ar.err;
+        trace.log("diagnostics: standalone analysis failed: ");
+        trace.log(outcome.describe(f));
+        trace.log("\n");
+        editor.fail_dnit(es, ?f);
+        clear(alloc, d.uri);
+        ret false;
+    }
+    @out = ar.ok;
+    ret true;
+}
+
+# how many diagnostics `list` holds for `fid`
+fun count_for(list: *diag.DiagnosticStore, fid: src.FileId) usize {
+    if (list == nil) { ret 0; }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < list.items.len) {
+        if (list.items.data[i].loc.file_id == fid) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
 }
 
 # publish an unversioned empty diagnostics array for `uri` on close; omitting a
@@ -144,7 +210,8 @@ pub fun clear(alloc: *Allocator, uri: str) {
     json.buf_dnit(?b);
 }
 
-# append one diagnostic as an LSP Diagnostic object.
+# append one diagnostic as an LSP Diagnostic object, or nothing when its
+# primary span cannot be reported in the client's buffer
 #
 # a mach diagnostic is more than its primary message: the resolve and type stages
 # attach a `= note:` line, a `= help:` suggestion, and secondary `related`
@@ -153,45 +220,36 @@ pub fun clear(alloc: *Allocator, uri: str) {
 # of the diagnostic that says what to DO about it. note and help ride the message
 # as trailing lines - the shape a terminal reader already knows - and the
 # secondary locations become `relatedInformation`, so the client can jump to them
-fun push_entry(b: *json.Buf, sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) {
+fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocator, comma: bool) bool {
+    var r: positions.LspRange;
+    if (!range_for(text_for(at, d.loc.file_id), d.loc.span, ?r)) { ret false; }
+    if (comma)                                                   { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"range\":");
-    push_range(b, sources, ?d.loc);
+    render.range(b, r);
     json.buf_push(b, ",\"severity\":");
     json.buf_push_i64(b, map_severity(d.severity));
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     push_message(b, d);
-    push_related(b, sources, d, alloc);
+    push_related(b, at, d, alloc);
     json.buf_push_byte(b, '}');
+    ret true;
 }
 
-# append `{"start":{...},"end":{...}}` for `loc`, resolving its byte span
-# against the source map. an unresolvable file id degrades to the start of the
-# document rather than dropping the diagnostic
-fun push_range(b: *json.Buf, sources: *src.SourceMap, loc: *diag.Location) {
-    var start_line: usize = 0;
-    var start_char: usize = 0;
-    var end_line:   usize = 0;
-    var end_char:   usize = 0;
-
-    val so: opt[*src.SourceFile] = src.get(sources, loc.file_id);
-    if (sel so.some) {
-        val sf: *src.SourceFile    = so.some;
-        val r:  positions.LspRange = positions.range_of(sf, loc.span);
-        start_line = r.start_line;
-        start_char = r.start_char;
-        end_line   = r.end_line;
-        end_char   = r.end_char;
-    }
-
-    json.buf_push(b, "{\"start\":{\"line\":");
-    json.buf_push_usize(b, start_line);
-    json.buf_push(b, ",\"character\":");
-    json.buf_push_usize(b, start_char);
-    json.buf_push(b, "},\"end\":{\"line\":");
-    json.buf_push_usize(b, end_line);
-    json.buf_push(b, ",\"character\":");
-    json.buf_push_usize(b, end_char);
-    json.buf_push(b, "}}");
+# the client's range for a diagnostic span
+#
+# A diagnostic's claim is about the bytes it covers, so a span touching the
+# edited window is not carried, even one that encloses it. An unresolvable file
+# degrades to the start of the document rather than dropping the diagnostic.
+fun range_for(t: positions.Text, span: token.Span, out: *positions.LspRange) bool {
+    out.start_line = 0;
+    out.start_char = 0;
+    out.end_line   = 0;
+    out.end_char   = 0;
+    if (t.file == nil) { ret true; }
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel ro.none) { ret false; }
+    @out = ro.some;
+    ret true;
 }
 
 # append the quoted message, with the note and help lines appended when
@@ -226,24 +284,24 @@ fun push_message(b: *json.Buf, d: *diag.Diagnostic) {
 # whose file id or URI cannot be resolved is skipped rather than emitted with a
 # wrong location; a nil label renders as an empty caption, which the protocol
 # requires as a string
-fun push_related(b: *json.Buf, sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) {
+fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocator) {
     if (d.related.len == 0) { ret; }
 
     var written: usize = 0;
     var r:       usize = 0;
     for (r < d.related.len) {
-        val rel: *diag.Related        = ?d.related.data[r];
-        val so:  opt[*src.SourceFile] = src.get(sources, rel.loc.file_id);
-        if (sel so.some) {
-            val sf: *src.SourceFile = so.some;
-            val u:  str             = project.uri_of_path(alloc, sf.path);
+        val rel: *diag.Related  = ?d.related.data[r];
+        val t:   positions.Text = text_for(at, rel.loc.file_id);
+        var rng: positions.LspRange;
+        if (t.file != nil && range_for(t, rel.loc.span, ?rng)) {
+            val u: str = project.uri_of_path(alloc, t.file.path);
             if (u != nil) {
                 if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
                 or                { json.buf_push_byte(b, ','); }
                 json.buf_push(b, "{\"location\":{\"uri\":");
                 json.buf_push_quoted(b, u);
                 json.buf_push(b, ",\"range\":");
-                push_range(b, sources, ?rel.loc);
+                render.range(b, rng);
                 json.buf_push(b, "},\"message\":");
                 json.buf_push_quoted(b, rel.label);
                 json.buf_push_byte(b, '}');
@@ -356,10 +414,11 @@ test "diagnostics: help alone still renders, without an empty note line" {
 test "diagnostics: no secondary locations emits no relatedInformation key" {
     var pa: Allocator;
     page.make(?pa);
-    var b: json.Buf        = json.buf_init(?pa);
-    var d: diag.Diagnostic = stub_diag("duplicate definition");
-    var m: src.SourceMap   = stub_map(nil, 0);
-    push_related(?b, ?m, ?d, ?pa);
+    var b:  json.Buf        = json.buf_init(?pa);
+    var d:  diag.Diagnostic = stub_diag("duplicate definition");
+    var m:  src.SourceMap   = stub_map(nil, 0);
+    var at: Locator         = Locator{w: nil, root: nil, sources: ?m};
+    push_related(?b, ?at, ?d, ?pa);
 
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b), "")) { fail = true; }
@@ -397,8 +456,9 @@ test "diagnostics: a secondary location renders as a located relatedInformation 
     var d: diag.Diagnostic = stub_diag("duplicate definition");
     d.related = stub_related(?rels[0], 1);
 
-    var b: json.Buf = json.buf_init(?pa);
-    push_related(?b, ?m, ?d, ?pa);
+    var b:  json.Buf = json.buf_init(?pa);
+    var at: Locator  = Locator{w: nil, root: nil, sources: ?m};
+    push_related(?b, ?at, ?d, ?pa);
 
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b),
@@ -424,8 +484,9 @@ test "diagnostics: a secondary location with an unresolvable file is skipped" {
     var d: diag.Diagnostic = stub_diag("duplicate definition");
     d.related = stub_related(?rels[0], 1);
 
-    var b: json.Buf = json.buf_init(?pa);
-    push_related(?b, ?m, ?d, ?pa);
+    var b:  json.Buf = json.buf_init(?pa);
+    var at: Locator  = Locator{w: nil, root: nil, sources: ?m};
+    push_related(?b, ?at, ?d, ?pa);
 
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b), "")) { fail = true; }

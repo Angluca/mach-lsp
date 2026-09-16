@@ -647,6 +647,20 @@ pub fun cancel_add(c: *Cancels, id_token: str) bool {
     ret true;
 }
 
+# whether `id_token` was cancelled, leaving the record for `cancel_take`
+pub fun cancel_has(c: *Cancels, id_token: str) bool {
+    if (id_token == nil || c.ids == nil) { ret false; }
+    var found: bool = false;
+    mutex.lock(?c.lock);
+    var i: usize = 0;
+    for (i < c.count && !found) {
+        if (c.ids[i].body != nil && str_equals(c.ids[i].body, id_token)) { found = true; }
+        i = i + 1;
+    }
+    mutex.unlock(?c.lock);
+    ret found;
+}
+
 # whether `id_token` was cancelled, removing it if so
 #
 # Consuming the entry keeps the set bounded and means a later request that

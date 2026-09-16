@@ -1,0 +1,423 @@
+# where two versions of a buffer differ, as an ordered list of windows
+#
+# A snapshot built before the client's latest edits is still worth answering
+# from (#251), through a map of where its text and the client's disagree. One
+# window from the common prefix to the common suffix is the cheap version of that
+# map, and it fails exactly where editing is ordinary: add an import at the top
+# and use it forty lines down, and the window spans everything between, so half
+# the file answers nothing. Measured over this repository, that one pattern
+# blinds a median of 54% of a file's identifiers to a single window.
+#
+# So the map is a list. The texts are compared line by line with Myers'
+# difference algorithm, whose cost grows with the number of differing lines
+# rather than the size of the file - a handful, while a rebuild is running - and
+# each differing run of lines is narrowed to the bytes that actually changed.
+# Past `MAX_EDITS` differing lines the comparison stops and the whole differing
+# middle becomes one window: coarser, never wrong.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use src: mach.lang.source;
+
+# the most differing lines compared exactly before falling back to one window
+val MAX_EDITS: usize = 128;
+
+# one region where the old and new texts differ: `[old_start, old_end)` in the
+# old text became `[new_start, new_end)` in the new one. windows are ordered and
+# never touch, so the bytes between two windows are equal in both texts
+pub rec Window {
+    old_start: usize;
+    old_end:   usize;
+    new_start: usize;
+    new_end:   usize;
+}
+
+# an owned, ordered list of windows
+pub rec Windows {
+    items: *Window;
+    len:   usize;
+    cap:   usize;
+}
+
+pub fun empty() Windows {
+    ret Windows{items: nil, len: 0, cap: 0};
+}
+
+pub fun dnit(alloc: *Allocator, w: *Windows) {
+    if (w.items != nil) { deallocate[Window](alloc, w.items, w.cap); }
+    w.items = nil;
+    w.len   = 0;
+    w.cap   = 0;
+}
+
+# a text and its line index, as the comparison reads it
+rec Lines {
+    text:   str;
+    len:    usize;
+    starts: *usize;
+    count:  usize;
+}
+
+# replace `out` with the windows where `old` became `new`
+# ---
+# alloc:   allocator for `out` and for scratch
+# old:     the earlier text, with its line index
+# old_len: its byte length
+# new:     the later text, with its line index
+# new_len: its byte length
+# out:     receives the windows; its previous items are released
+# ret:     false when memory ran out; `out` is then empty
+pub fun compute(alloc: *Allocator, old: *src.SourceFile, old_len: usize, new: *src.SourceFile, new_len: usize, out: *Windows) bool {
+    out.len = 0;
+    val a: Lines = Lines{text: old.text, len: old_len, starts: old.line_starts, count: old.line_len};
+    val b: Lines = Lines{text: new.text, len: new_len, starts: new.line_starts, count: new.line_len};
+
+    # equal leading and trailing lines never take part in the comparison
+    var lo: usize = 0;
+    for (lo < a.count && lo < b.count && line_eq(a, lo, b, lo)) { lo = lo + 1; }
+    var hi: usize = 0;
+    for (hi < a.count - lo && hi < b.count - lo && line_eq(a, a.count - 1 - hi, b, b.count - 1 - hi)) { hi = hi + 1; }
+    val n: usize = a.count - lo - hi;
+    val m: usize = b.count - lo - hi;
+    if (n == 0 && m == 0) { ret true; }
+
+    if (!myers(alloc, a, b, lo, n, m, out)) {
+        out.len = 0;
+        ret add_hunk(alloc, out, a, b, lo, lo + n, lo, lo + m);
+    }
+    ret true;
+}
+
+# the diff of the middle lines `[lo, lo + n)` of `a` against `[lo, lo + m)` of
+# `b`, appended to `out` as trimmed windows. false when it would take more than
+# MAX_EDITS differing lines or memory ran out. the cost is bounded by the edits,
+# not by how far apart they are: two insertions a thousand lines apart are two
+# steps, with the equal lines between them walked once
+
+fun myers(alloc: *Allocator, a: Lines, b: Lines, lo: usize, n: usize, m: usize, out: *Windows) bool {
+    val max:  usize = MAX_EDITS;
+    val size: usize = 2 * max + 3;
+    val off:  i64   = (max + 1)::i64;
+
+    val tr: res[*i64, allocator.Error] = allocate[i64](alloc, (max + 1) * size);
+    if (sel tr.err) { ret false; }
+    val trace: *i64                       = tr.ok;
+    val vr:    res[*i64, allocator.Error] = allocate[i64](alloc, size);
+    if (sel vr.err) {
+        deallocate[i64](alloc, trace, (max + 1) * size);
+        ret false;
+    }
+    val v: *i64  = vr.ok;
+    var z: usize = 0;
+    for (z < size) {
+        v[z] = 0;
+        z    = z + 1;
+    }
+
+    val ni:    i64  = n::i64;
+    val mi:    i64  = m::i64;
+    var found: bool = false;
+    var dfin:  i64  = 0;
+    var d:     i64  = 0;
+    for (!found && d <= max::i64) {
+        var c: usize = 0;
+        for (c < size) {
+            trace[d::usize * size + c] = v[c];
+            c                          = c + 1;
+        }
+        var k: i64 = -d;
+        for (!found && k <= d) {
+            var x: i64 = 0;
+            if (k == -d || (k != d && v[(k - 1 + off)::usize] < v[(k + 1 + off)::usize])) { x = v[(k + 1 + off)::usize]; }
+            or                                                                            { x = v[(k - 1 + off)::usize] + 1; }
+            var y: i64 = x - k;
+            for (x < ni && y < mi && line_eq(a, lo + x::usize, b, lo + y::usize)) {
+                x = x + 1;
+                y = y + 1;
+            }
+            v[(k + off)::usize] = x;
+            if (x >= ni && y >= mi) {
+                found = true;
+                dfin  = d;
+            }
+            k = k + 2;
+        }
+        d = d + 1;
+    }
+    deallocate[i64](alloc, v, size);
+    if (!found) {
+        deallocate[i64](alloc, trace, (max + 1) * size);
+        ret false;
+    }
+
+    # walk the path back, marking every deleted old line and inserted new line
+    val dr: res[*bool, allocator.Error] = allocate[bool](alloc, n + m + 2);
+    if (sel dr.err) {
+        deallocate[i64](alloc, trace, (max + 1) * size);
+        ret false;
+    }
+    val mark: *bool = dr.ok;
+    var q:    usize = 0;
+    for (q < n + m + 2) {
+        mark[q] = false;
+        q       = q + 1;
+    }
+    var x: i64 = ni;
+    var y: i64 = mi;
+    var e: i64 = dfin;
+    for (e > 0) {
+        val row:    usize = e::usize * size;
+        val k:      i64   = x - y;
+        var prev_k: i64   = k - 1;
+        if (k == -e || (k != e && trace[row + (k - 1 + off)::usize] < trace[row + (k + 1 + off)::usize])) { prev_k = k + 1; }
+        val prev_x: i64 = trace[row + (prev_k + off)::usize];
+        val prev_y: i64 = prev_x - prev_k;
+        for (x > prev_x && y > prev_y) {
+            x = x - 1;
+            y = y - 1;
+        }
+        # the one non-diagonal move of this step: a deleted old line (marked at
+        # its index) or an inserted new line (marked after the old ones)
+        if (x == prev_x) { mark[n + 1 + prev_y::usize] = true; }
+        or               { mark[prev_x::usize] = true; }
+        x = prev_x;
+        y = prev_y;
+        e = e - 1;
+    }
+    deallocate[i64](alloc, trace, (max + 1) * size);
+
+    # sweep the marks into runs: a run ends where an old and a new line pair up
+    var ok: bool  = true;
+    var i:  usize = 0;
+    var j:  usize = 0;
+    for (ok && (i < n || j < m)) {
+        val del: bool = i < n && mark[i];
+        val ins: bool = j < m && mark[n + 1 + j];
+        if (!del && !ins) {
+            i = i + 1;
+            j = j + 1;
+        }
+        or {
+            val i0: usize = i;
+            val j0: usize = j;
+            for ((i < n && mark[i]) || (j < m && mark[n + 1 + j])) {
+                if (i < n && mark[i])         { i = i + 1; }
+                if (j < m && mark[n + 1 + j]) { j = j + 1; }
+            }
+            ok = add_hunk(alloc, out, a, b, lo + i0, lo + i, lo + j0, lo + j);
+        }
+    }
+    deallocate[bool](alloc, mark, n + m + 2);
+    ret ok;
+}
+
+# append the window for old lines `[i0, i1)` becoming new lines `[j0, j1)`,
+# narrowed to the bytes that differ. a run whose bytes turn out equal adds
+# nothing
+fun add_hunk(alloc: *Allocator, out: *Windows, a: Lines, b: Lines, i0: usize, i1: usize, j0: usize, j1: usize) bool {
+    var os: usize = line_start(a, i0);
+    var oe: usize = line_start(a, i1);
+    var ns: usize = line_start(b, j0);
+    var ne: usize = line_start(b, j1);
+    for (os < oe && ns < ne && a.text[os] == b.text[ns]) {
+        os = os + 1;
+        ns = ns + 1;
+    }
+    for (oe > os && ne > ns && a.text[oe - 1] == b.text[ne - 1]) {
+        oe = oe - 1;
+        ne = ne - 1;
+    }
+    if (os == oe && ns == ne) { ret true; }
+
+    if (out.len == out.cap) {
+        var cap: usize = out.cap * 2;
+        if (cap == 0) { cap = 4; }
+        if (out.items == nil) {
+            val r: res[*Window, allocator.Error] = allocate[Window](alloc, cap);
+            if (sel r.err) { ret false; }
+            out.items = r.ok;
+        }
+        or {
+            val r: res[*Window, allocator.Error] = reallocate[Window](alloc, out.items, out.cap, cap);
+            if (sel r.err) { ret false; }
+            out.items = r.ok;
+        }
+        out.cap = cap;
+    }
+    out.items[out.len] = Window{old_start: os, old_end: oe, new_start: ns, new_end: ne};
+    out.len            = out.len + 1;
+    ret true;
+}
+
+# the byte offset line `i` starts at, or the text's end past its last line
+fun line_start(t: Lines, i: usize) usize {
+    if (i >= t.count) { ret t.len; }
+    ret t.starts[i];
+}
+
+# whether line `i` of `a` and line `j` of `b` hold the same bytes
+fun line_eq(a: Lines, i: usize, b: Lines, j: usize) bool {
+    val a0: usize = line_start(a, i);
+    val a1: usize = line_start(a, i + 1);
+    val b0: usize = line_start(b, j);
+    val b1: usize = line_start(b, j + 1);
+    if (a1 - a0 != b1 - b0) { ret false; }
+    var k: usize = 0;
+    for (k < a1 - a0) {
+        if (a.text[a0 + k] != b.text[b0 + k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+use std.allocator;
+use std.allocator.page;
+use std.types.string.str_len;
+
+# a SourceFile with a line index over `text`, as the compiler builds one: a line
+# starts after every newline, the last one included
+fun t_file(pa: *Allocator, text: str) src.SourceFile {
+    val n:     usize = str_len(text);
+    var lines: usize = 1;
+    var i:     usize = 0;
+    for (i < n) {
+        if (text[i] == '\n') { lines = lines + 1; }
+        i = i + 1;
+    }
+    val r:      res[*usize, allocator.Error] = allocate[usize](pa, lines);
+    var starts: *usize                       = nil;
+    if (sel r.ok) { starts = r.ok; }
+    starts[0] = 0;
+    var li: usize = 1;
+    i = 0;
+    for (i < n) {
+        if (text[i] == '\n') {
+            starts[li] = i + 1;
+            li         = li + 1;
+        }
+        i = i + 1;
+    }
+    var f: src.SourceFile;
+    f.present     = true;
+    f.revision    = 0;
+    f.path        = "t.mach";
+    f.text        = text;
+    f.line_starts = starts;
+    f.line_len    = lines;
+    ret f;
+}
+
+fun t_diff(pa: *Allocator, old: str, new: str, out: *Windows) bool {
+    var a: src.SourceFile = t_file(pa, old);
+    var b: src.SourceFile = t_file(pa, new);
+    ret compute(pa, ?a, str_len(old), ?b, str_len(new), out);
+}
+
+fun win_is(w: Window, os: usize, oe: usize, ns: usize, ne: usize) bool {
+    ret w.old_start == os && w.old_end == oe && w.new_start == ns && w.new_end == ne;
+}
+
+# the case one window cannot serve: an import at the top and its use far below
+# become two windows with everything between them left mapped
+test "textdiff: two distant edits are two windows" {
+    var pa: Allocator;
+    page.make(?pa);
+    var w:    Windows = empty();
+    var fail: bool    = false;
+    val old:  str     = "use a;\nfun f() {\n    one();\n    two();\n}\n";
+    val new:  str     = "use a;\nuse b;\nfun f() {\n    one();\n    b();\n    two();\n}\n";
+    if (!t_diff(?pa, old, new, ?w)) { fail = true; }
+    if (w.len != 2)                 { fail = true; }
+    or {
+        # "use b;\n" inserted at 7; "    b();\n" inserted before "    two();"
+        if (!win_is(w.items[0], 7, 7, 7, 14))    { fail = true; }
+        if (!win_is(w.items[1], 28, 28, 35, 44)) { fail = true; }
+    }
+    dnit(?pa, ?w);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the edits bound the work, not the distance between them: two insertions three
+# hundred lines apart are still two windows
+test "textdiff: distant edits in a long text stay separate" {
+    var pa: Allocator;
+    page.make(?pa);
+    val old:  str     = t_lines(?pa, 300, false);
+    val new:  str     = t_lines(?pa, 300, true);
+    var w:    Windows = empty();
+    var fail: bool    = false;
+    if (old == nil || new == nil) { fail = true; }
+    or {
+        if (!t_diff(?pa, old, new, ?w)) { fail = true; }
+        if (w.len != 2)                 { fail = true; }
+        or {
+            if (!win_is(w.items[0], 0, 0, 0, 3))         { fail = true; }
+            if (!win_is(w.items[1], 870, 870, 873, 876)) { fail = true; }
+        }
+    }
+    dnit(?pa, ?w);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# `n` lines of "x;\n", and with `edited`, "t;\n" before the first and "u;\n"
+# before line 290
+fun t_lines(pa: *Allocator, n: usize, edited: bool) str {
+    var total: usize = n * 3;
+    if (edited) { total = total + 6; }
+    val r: res[*u8, allocator.Error] = allocate[u8](pa, total + 1);
+    if (sel r.err) { ret nil; }
+    val out: *u8   = r.ok;
+    var o:   usize = 0;
+    var i:   usize = 0;
+    for (i < n) {
+        if (edited && (i == 0 || i == 290)) {
+            if (i == 0) { out[o] = 't'; }
+            or          { out[o] = 'u'; }
+            out[o + 1] = ';';
+            out[o + 2] = '\n';
+            o          = o + 3;
+        }
+        out[o]     = 'x';
+        out[o + 1] = ';';
+        out[o + 2] = '\n';
+        o          = o + 3;
+        i          = i + 1;
+    }
+    out[o] = 0;
+    ret out::str;
+}
+
+# a change inside a line is narrowed to its bytes, and identical texts have no
+# windows at all
+test "textdiff: a replaced word is narrowed to its bytes" {
+    var pa: Allocator;
+    page.make(?pa);
+    var w:    Windows = empty();
+    var fail: bool    = false;
+    if (!t_diff(?pa, "val x = 1;\nval y = 2;\n", "val x = 1;\nval zz = 2;\n", ?w)) { fail = true; }
+    if (w.len != 1 || !win_is(w.items[0], 15, 16, 15, 17))                         { fail = true; }
+    if (!t_diff(?pa, "same\ntext\n", "same\ntext\n", ?w))                          { fail = true; }
+    if (w.len != 0)                                                                { fail = true; }
+    # a deleted line and a changed line far apart
+    if (!t_diff(?pa, "a\nb\nc\nd\ne\n", "a\nc\nd\nE\n", ?w)) { fail = true; }
+    if (w.len != 2)                                          { fail = true; }
+    or {
+        if (!win_is(w.items[0], 2, 4, 2, 2)) { fail = true; }
+        if (!win_is(w.items[1], 8, 9, 6, 7)) { fail = true; }
+    }
+    dnit(?pa, ?w);
+    if (fail) { ret 1; }
+    ret 0;
+}

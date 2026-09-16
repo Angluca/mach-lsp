@@ -167,6 +167,18 @@ class LspSession:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
 
+    def send_all(self, messages: list[dict[str, Any]]) -> None:
+        """Write several complete messages in one write, so they queue together."""
+        frames = []
+        for message in messages:
+            payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
+            frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
+        try:
+            self.proc.stdin.write(b"".join(frames))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
+
     def respond_error(self, request: dict[str, Any], code: int, message: str) -> None:
         """Reject one server-initiated request."""
         self._send({"jsonrpc": "2.0", "id": request.get("id"),
@@ -1053,6 +1065,313 @@ def run_disk_change_during_build(server: Path, timeout: float) -> None:
             if not finished:
                 session.abort()
 
+
+
+STALE_MODULES = 192
+
+
+def stale_fixture(root: Path, name: str, extra: str = "") -> tuple[Path, str, int]:
+    """A project whose rebuild outlasts a request round-trip by a wide margin.
+
+    `extra` is spliced into `main` just before its `ret`, and the returned line
+    is the `ret` line's index in the opened text.
+    """
+    main, text = write_wide_project(root, name, STALE_MODULES)
+    if extra:
+        text = text.replace("    ret ", extra + "    ret ", 1)
+        main.write_text(text, encoding="utf-8")
+    ret_line = next(i for i, value in enumerate(text.splitlines()) if value.startswith("    ret "))
+    return main, text, ret_line
+
+
+def open_stale_session(server: Path, root: Path, timeout: float, main: Path, text: str,
+                       capabilities: dict[str, Any] | None = None) -> tuple[LspSession, BuildLog]:
+    builds = BuildLog(root / "trace.log")
+    session = LspSession(server, root, timeout, builds.env())
+    session.request("initialize", {"rootUri": root.as_uri(), "capabilities": capabilities or {}})
+    session.notify("initialized", {})
+    session.notify(
+        "textDocument/didOpen",
+        {"textDocument": {"uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}},
+    )
+    session.diagnostics(main.as_uri(), 1)
+    return session, builds
+
+
+def rebuilt(builds: BuildLog) -> int:
+    return builds.text().count("project: rebuilt")
+
+
+def change(uri: str, version: int, text: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+            "params": {"textDocument": {"uri": uri, "version": version},
+                       "contentChanges": [{"text": text}]}}
+
+
+def at(uri: str, line: int, character: int) -> dict[str, Any]:
+    return {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}
+
+
+def stale_request(session: LspSession, builds: BuildLog, edit: dict[str, Any],
+                  method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Send an edit and a request in one write, and prove the answer was stale.
+
+    Written together, the request is handled before the rebuild the edit
+    started can finish, and the build log confirms it: no build completed
+    between the edit and the answer.
+    """
+    before = rebuilt(builds)
+    request_id = session.next_id
+    session.next_id += 1
+    session.send_all([edit, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}])
+    response = session.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
+    require(rebuilt(builds) == before,
+            f"{method} was answered after the rebuild landed, so it proves nothing about staleness")
+    return response
+
+
+def run_stale_hover(server: Path, timeout: float) -> None:
+    """A snapshot behind the buffer answers through the edit window (#251).
+
+    Before the window an answer keeps its place, after it an answer moves with
+    the text, and a cursor or a result touching the window answers nothing
+    rather than a position the client no longer has.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-hover-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "stale")
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            column = text.splitlines()[ret_line].index("base3 ")
+
+            def hover_lands(response: dict[str, Any], line: int, what: str) -> None:
+                result = response.get("result")
+                require(isinstance(result, dict), f"stale hover {what} answered nothing: {response!r}")
+                require("base3" in json.dumps(result.get("contents")),
+                        f"stale hover {what} described something else: {result!r}")
+                start = result.get("range", {}).get("start")
+                require(start == {"line": line, "character": column},
+                        f"stale hover {what} is not where the client's text has it: {start!r}")
+
+            # a line inserted above: the answer moves down with the text
+            above = "# a line the snapshot never saw\n" + text
+            before = rebuilt(builds)
+            hover_lands(stale_request(session, builds, change(uri, 2, above),
+                                      "textDocument/hover", at(uri, ret_line + 1, column + 2)),
+                        ret_line + 1, "after the window")
+            # the inserted line has no analysis, even where the same column of the
+            # snapshot's first line holds a name
+            inserted = session.request("textDocument/hover", at(uri, 0, len("use stale.m0.ba")))
+            require(rebuilt(builds) == before, "the rebuild landed before the inserted line was asked about")
+            require(inserted.get("result") is None,
+                    f"a cursor on text the snapshot never saw answered: {inserted!r}")
+            builds.settle(1, "the first edit's rebuild")
+
+            # text appended below: the answer keeps its place
+            below = above + "# and one after everything\n"
+            hover_lands(stale_request(session, builds, change(uri, 3, below),
+                                      "textDocument/hover", at(uri, ret_line + 1, column + 2)),
+                        ret_line + 1, "before the window")
+            builds.settle(2, "the second edit's rebuild")
+
+            # the name itself replaced: the cursor still sits on bytes that exist
+            # in both texts, but the name it resolves to overlaps the window
+            renamed = below.replace("ret base0 + base1 + base2 + base3 ", "ret base0 + base1 + base2 + base9 ", 1)
+            require(renamed != below, "the fixture's ret line changed shape")
+            inside = stale_request(session, builds, change(uri, 4, renamed),
+                                   "textDocument/hover", at(uri, ret_line + 1, column + 1))
+            require(inside.get("result") is None,
+                    f"a hover on a name the client has since edited answered: {inside!r}")
+            builds.settle(3, "the third edit's rebuild")
+
+            # and once the rebuild lands, the same position is answered afresh
+            fresh = session.request("textDocument/hover", at(uri, ret_line + 1, column + 1))
+            require("base9" in json.dumps(fresh.get("result")),
+                    f"the rebuilt snapshot did not answer for the new name: {fresh!r}")
+
+            # two edits far apart - a line at the top, a statement above `ret` -
+            # leave the imports between them answerable, each moved by the first
+            lines = renamed.splitlines(keepends=True)
+            use_line = next(i for i, value in enumerate(lines) if value.startswith("use stale.m5.base5;"))
+            spread = ("# top\n" + "".join(lines[:ret_line + 1])
+                      + "    val late: i32 = base7;\n" + "".join(lines[ret_line + 1:]))
+            between = stale_request(session, builds, change(uri, 5, spread),
+                                    "textDocument/hover", at(uri, use_line + 1, len("use stale.m5.ba")))
+            result = between.get("result")
+            require(isinstance(result, dict) and "base5" in json.dumps(result.get("contents")),
+                    f"a name between two edits answered nothing: {between!r}")
+            require(result.get("range", {}).get("start", {}).get("line") == use_line + 1,
+                    f"a name between two edits is not where the client has it: {result!r}")
+            builds.settle(4, "the fourth edit's rebuild")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_stale_strict_requests(server: Path, timeout: float) -> None:
+    """A rename or reference list waits for the snapshot that covers its edit.
+
+    Answered from the stale snapshot, a rename would miss an occurrence the
+    client just typed. Held, it is answered once the rebuild lands, can be
+    withdrawn while it waits, and is abandoned when its document closes.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-strict-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "strict")
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            column = text.splitlines()[ret_line].index("base1 ")
+            holds = lambda: builds.text().count("holding a request")
+
+            # a new use of base1 is typed together with the rename request
+            edited = text.replace("    ret base0 ", "    val again: i32 = base1;\n    ret base0 ", 1)
+            request_id = session.next_id
+            session.next_id += 1
+            session.send_all([
+                change(uri, 2, edited),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/rename",
+                 "params": {**at(uri, ret_line + 1, column + 2), "newName": "renamed"}},
+            ])
+            response = session.wait_for(lambda item: item.get("id") == request_id, "held rename")
+            require(holds() == 1, f"the rename was not held: {holds()} holds")
+            edits = response.get("result", {}).get("changes", {}).get(uri, [])
+            lines = sorted(e["range"]["start"]["line"] for e in edits)
+            require(ret_line in lines and ret_line + 1 in lines,
+                    f"the rename missed the occurrence typed with it: {lines!r}")
+            builds.settle(1, "the rename's rebuild")
+
+            # withdrawn while held: answered at once, not when the rebuild lands
+            request_id = session.next_id
+            session.next_id += 1
+            before = rebuilt(builds)
+            session.send_all([
+                change(uri, 3, edited + "# edit three\n"),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/references",
+                 "params": {**at(uri, ret_line + 1, column + 2), "context": {"includeDeclaration": True}}},
+            ])
+            eventually(holds, lambda n: n == 2, "the references request to be held")
+            session.notify("$/cancelRequest", {"id": request_id})
+            cancelled = session.wait_for(lambda item: item.get("id") == request_id, "cancelled request")
+            require(cancelled.get("error", {}).get("code") == -32800,
+                    f"a withdrawn held request was not cancelled: {cancelled!r}")
+            require(rebuilt(builds) == before,
+                    "the cancellation was only answered after the rebuild landed")
+            builds.settle(2, "the cancelled request's rebuild")
+
+            # abandoned when its document closes
+            request_id = session.next_id
+            session.next_id += 1
+            session.send_all([
+                change(uri, 4, edited + "# edit four\n"),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/prepareRename",
+                 "params": at(uri, ret_line + 1, column + 2)},
+            ])
+            eventually(holds, lambda n: n == 3, "the prepareRename request to be held")
+            session.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            closed = session.wait_for(lambda item: item.get("id") == request_id, "abandoned request")
+            require(closed.get("error", {}).get("code") == -32801,
+                    f"a held request outlived its document: {closed!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_stale_refresh(server: Path, timeout: float) -> None:
+    """Answers given from a stale snapshot are replaced once the rebuild lands.
+
+    Semantic tokens and inlay hints are re-requested by a client only when told
+    to, so the server asks - and only a client that said it can take the request.
+    """
+    for supported in (True, False):
+        with tempfile.TemporaryDirectory(prefix="mls-stale-refresh-") as directory:
+            root = Path(directory).resolve()
+            main, text, _ = stale_fixture(root, "refresh")
+            uri = main.as_uri()
+            capabilities = {"workspace": {"semanticTokens": {"refreshSupport": supported},
+                                          "inlayHint": {"refreshSupport": supported}}}
+            session, builds = open_stale_session(server, root, timeout, main, text, capabilities)
+            finished = False
+            try:
+                tokens = stale_request(session, builds, change(uri, 2, "# moved\n" + text),
+                                       "textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+                require(tokens.get("result", {}).get("data"),
+                        f"stale semantic tokens answered nothing: {tokens!r}")
+                builds.settle(1, "the rebuild behind the stale tokens")
+                refreshes = lambda item: item.get("method") in (
+                    "workspace/semanticTokens/refresh", "workspace/inlayHint/refresh")
+                if supported:
+                    for _ in range(2):
+                        request = session.wait_for(refreshes, "a refresh request")
+                        session.respond_result(request)
+                else:
+                    session.assert_no_message(refreshes, "refresh request to a client that cannot take one")
+                session.finish()
+                finished = True
+            finally:
+                if not finished:
+                    session.abort()
+
+
+def run_stale_diagnostics(server: Path, timeout: float) -> None:
+    """While the root rebuilds, a buffer shows what can still be said about it.
+
+    A semantic error away from the edit is carried to its new line; a buffer
+    that no longer parses shows its syntax errors and nothing older.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-diags-") as directory:
+        root = Path(directory).resolve()
+        main, text, _ = stale_fixture(root, "diags", "    val bad: i32 = nowhere;\n")
+        uri = main.as_uri()
+        bad_line = next(i for i, value in enumerate(text.splitlines()) if "nowhere" in value)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": uri, "languageId": "mach", "version": 1, "text": text}},
+            )
+            opened = session.diagnostics(uri, 1)["params"]["diagnostics"]
+            require(bad_line in [d["range"]["start"]["line"] for d in opened],
+                    f"the fixture's unresolved name was not reported: {opened!r}")
+
+            def publish(version: int, new_text: str) -> list[int]:
+                before = rebuilt(builds)
+                session.send_all([change(uri, version, new_text)])
+                published = session.diagnostics(uri, version)
+                require(rebuilt(builds) == before, "the publish came after the rebuild")
+                return [d["range"]["start"]["line"] for d in published["params"]["diagnostics"]]
+
+            moved = "# pushes everything down\n" + text
+            lines = publish(2, moved)
+            require(bad_line + 1 in lines,
+                    f"the unresolved name was not carried to its new line: {lines!r}")
+            builds.settle(1, "the first edit's rebuild")
+            session.diagnostics(uri, 2)
+
+            broken = moved + "pub fun half( {\n"
+            lines = publish(3, broken)
+            require(lines, "a buffer that no longer parses showed no errors")
+            require(bad_line + 1 not in lines,
+                    f"a stale semantic error was shown beside the syntax errors: {lines!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
@@ -4015,6 +4334,10 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
+        run_stale_hover(server, args.timeout)
+        run_stale_strict_requests(server, args.timeout)
+        run_stale_refresh(server, args.timeout)
+        run_stale_diagnostics(server, args.timeout)
         run_disk_change_during_build(server, args.timeout)
         run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
