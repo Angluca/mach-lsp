@@ -136,8 +136,8 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
             if (at >= lo && at <= hi && wants_hint(ao.some)) {
                 val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
                 if (pname != nil) {
-                    if (!names_itself(an.text.file, ao.some.span, pname)) {
-                        push_hint(b, an.text.file, at, pname, emitted > 0);
+                    if (!names_itself(an.text.file, ao.some.span, pname)
+                        && push_hint(b, an.text, ao.some.span, pname, emitted > 0)) {
                         emitted = emitted + 1;
                     }
                     json.free_str(pname, alloc);
@@ -154,7 +154,7 @@ fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee:
     val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
     if (sel so.none) { ret opt[*decl.Decl].none{}; }
     val sym:    *rslv.Symbol      = so.some;
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
     if (sel site_o.none) { ret opt[*decl.Decl].none{}; }
     var site: project.Site    = site_o.some;
     val d:    opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
@@ -169,7 +169,7 @@ fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: 
     val so: opt[*rslv.Symbol] = callee_symbol(an, callee);
     if (sel so.none) { ret nil; }
     val site_o: opt[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+        project.site_of(ws, an.root, an.own, an.a, an.text, uri, so.some);
     if (sel site_o.none) { ret nil; }
     var site: project.Site = site_o.some;
     val a:    *ast.Ast     = site.a;
@@ -183,7 +183,7 @@ fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee:
     val so:    opt[*rslv.Symbol] = callee_symbol(an, callee);
     if (sel so.none) { ret empty; }
     val site_o: opt[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+        project.site_of(ws, an.root, an.own, an.a, an.text, uri, so.some);
     if (sel site_o.none) { ret empty; }
     var site: project.Site   = site_o.some;
     val f:    positions.Text = site.text;
@@ -240,13 +240,19 @@ fun names_itself(file: *src.SourceFile, span: token.Span, name: str) bool {
 #
 # `paddingLeft` rather than a leading space in the label, so a client that
 # renders hints inline and one that renders them in a gutter both look right.
-fun push_hint(b: *json.Buf, file: *src.SourceFile, offset: usize, text: str, comma: bool) {
-    if (comma) { json.buf_push_byte(b, ','); }
+#
+# The hint describes the argument, so an argument the client has since edited is
+# not labelled: nothing is written, and false returned, unless the whole
+# argument is carried into the client's buffer.
+fun push_hint(b: *json.Buf, t: positions.Text, arg: token.Span, text: str, comma: bool) bool {
+    val lo: opt[token.Span] = positions.live_span(t, arg, false);
+    if (sel lo.none) { ret false; }
+    if (comma)       { json.buf_push_byte(b, ','); }
     var at: token.Span;
-    at.offset = offset;
+    at.offset = arg.offset;
     at.len    = 0;
     json.buf_push(b, "{\"position\":");
-    push_position(b, file, at);
+    push_position(b, t, at);
     # `name:` reads as the argument label it stands in for
     json.buf_push(b, ",\"label\":");
     var label: json.Buf = json.buf_init(b.a);
@@ -257,6 +263,7 @@ fun push_hint(b: *json.Buf, file: *src.SourceFile, offset: usize, text: str, com
     json.buf_push(b, ",\"kind\":");
     json.buf_push_i64(b, HINT_PARAMETER);
     json.buf_push(b, ",\"paddingLeft\":false,\"paddingRight\":true}");
+    ret true;
 }
 
 # whether the renderer produced a placeholder rather than a spelling
@@ -266,9 +273,12 @@ fun is_placeholder(text: str) bool {
     ret text[0] == '<';
 }
 
-# the `start` of a zero-length span, which is the hint's anchor
-fun push_position(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
-    val r: positions.LspRange = positions.range_of(file, span);
+# the `start` of a zero-length span, which is the hint's anchor. the caller has
+# checked that the span maps
+fun push_position(b: *json.Buf, t: positions.Text, span: token.Span) {
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel ro.none) { ret; }
+    val r: positions.LspRange = ro.some;
     json.buf_push(b, "{\"line\":");
     json.buf_push_usize(b, r.start_line);
     json.buf_push(b, ",\"character\":");
@@ -281,16 +291,16 @@ fun push_position(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
 fun range_bounds(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret; }
-    val so: opt[usize] = offset_of_member(rng, "start", file);
-    val eo: opt[usize] = offset_of_member(rng, "end", file);
+    val so: opt[usize] = bound_of_member(rng, "start", file, false);
+    val eo: opt[usize] = bound_of_member(rng, "end", file, true);
     if (sel so.some) { @lo = so.some; }
     if (sel eo.some) { @hi = eo.some; }
 }
 
-fun offset_of_member(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
+fun bound_of_member(rng: *sj.Value, key: str, file: positions.Text, is_end: bool) opt[usize] {
     val p:    *sj.Value = json.member(rng, key);
     val line: i64       = json.number(json.member(p, "line"), -1);
     val ch:   i64       = json.number(json.member(p, "character"), -1);
-    if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
-    ret positions.offset_at(file, line::usize, ch::usize);
+    if (line < 0 || ch < 0) { ret positions.bound_at(file, 0, 0, is_end); }
+    ret positions.bound_at(file, line::usize, ch::usize, is_end);
 }

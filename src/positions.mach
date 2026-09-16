@@ -32,6 +32,8 @@ use mem: std.memory;
 use mach.lang.fe.token;
 use src: mach.lang.source;
 
+use mls.textdiff;
+
 # a 0-based LSP range, the form a `Location` / hover range needs
 # ---
 # start_line: 0-based start line
@@ -58,12 +60,32 @@ pub rec LspRange {
 # separately is a bound a caller can take from the wrong file, and a span copied
 # against another file's length reads off the end of this one. `text_of` is the
 # only way to build one, so the pair is correct by construction.
+#
+# A Text may also be READ AGAINST a newer buffer. A project snapshot built before
+# the client's latest edits indexes text the client no longer has, and answering
+# from it is still better than not answering (#251), provided no position crosses
+# the boundary unmapped. So the analyzed file can carry the client's `live` file
+# and the windows where the two differ (`textdiff`): every offset the analysis
+# reports is carried into `live` on the way out, and every position the client
+# sends is carried back on the way in. This is the single conversion point, so a
+# feature answering from a stale snapshot needs no knowledge that it is doing so.
 # ---
-# file: the source file
-# len:  byte length of `file.text`, excluding the terminator
+# file:      the source file every analysis offset indexes
+# len:       byte length of `file.text`, excluding the terminator
+# live:      the client's buffer when it differs from `file`, else nil
+# live_len:  byte length of `live.text`
+# wins:      where `file` and `live` differ, ordered, borrowed; meaningful only
+#            when `live` is set
+# win_count: how many windows `wins` holds
+# blind:     the differences could not be computed, so nothing maps
 pub rec Text {
-    file: *src.SourceFile;
-    len:  usize;
+    file:      *src.SourceFile;
+    len:       usize;
+    live:      *src.SourceFile;
+    live_len:  usize;
+    wins:      *textdiff.Window;
+    win_count: usize;
+    blind:     bool;
 }
 
 # pair `file` with its text length, scanning once
@@ -72,30 +94,218 @@ pub rec Text {
 # ret:  the file paired with its length
 pub fun text_of(file: *src.SourceFile) Text {
     var t: Text;
-    t.file = file;
-    t.len  = 0;
+    t.file      = file;
+    t.len       = 0;
+    t.live      = nil;
+    t.live_len  = 0;
+    t.wins      = nil;
+    t.win_count = 0;
+    t.blind     = false;
     if (file != nil) { t.len = str_len(file.text); }
     ret t;
 }
 
-# the byte offset of a 0-based LSP (line, character) in `file`, or
-# none when the line is out of range. the UTF-16 character column is resolved
-# to a byte offset by walking the line's UTF-8, clamped to the line's end
+# `analyzed` read against the client's `live` buffer through `wins`
+#
+# Texts with no differences pair as `text_of` would. `wins` is borrowed and must
+# outlive the pairing; nil means the differences are unknown, and the pairing
+# then maps nothing rather than guessing.
 # ---
-# t:    the source file paired with its length
+# analyzed: the file the analysis offsets index
+# live:     the client's current buffer
+# wins:     the windows where `analyzed` became `live`, or nil when unknown
+# ret:      the pairing
+pub fun text_against(analyzed: *src.SourceFile, live: *src.SourceFile, wins: *textdiff.Windows) Text {
+    var t: Text = text_of(analyzed);
+    if (analyzed == nil || live == nil || analyzed == live) { ret t; }
+    if (wins != nil && wins.len == 0)                       { ret t; }
+    t.live     = live;
+    t.live_len = str_len(live.text);
+    if (wins == nil) {
+        t.blind = true;
+        ret t;
+    }
+    t.wins      = wins.items;
+    t.win_count = wins.len;
+    ret t;
+}
+
+# the first window ending after analyzed offset `a`; a window that inserted text
+# exactly at `a` ends at `a`, so it counts as before
+fun first_after_old(t: Text, a: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = t.win_count;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        if (t.wins[mid].old_end > a) { hi = mid; }
+        or                           { lo = mid + 1; }
+    }
+    ret lo;
+}
+
+# the first window ending after client offset `q`
+fun first_after_new(t: Text, q: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = t.win_count;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        if (t.wins[mid].new_end > q) { hi = mid; }
+        or                           { lo = mid + 1; }
+    }
+    ret lo;
+}
+
+# how far the text between window `i - 1` and window `i` moved
+fun shift_before(t: Text, i: usize) i64 {
+    if (i == 0) { ret 0; }
+    ret t.wins[i - 1].new_end::i64 - t.wins[i - 1].old_end::i64;
+}
+
+# `span` carried into the client's buffer, or none when it cannot be
+#
+# A span between two windows moves by what the windows before it changed. A span
+# that ENCLOSES windows - a declaration around an edit - still has both ends
+# between windows and keeps its meaning, so it is carried when `enclosing`
+# allows; a caller whose span's content is the claim refuses it. A span with an
+# end inside a window has no counterpart.
+# ---
+# t:         the pairing the span's offsets index
+# span:      a span of `t.file`
+# enclosing: whether a span around whole windows may be carried
+# ret:       the same bytes' span in the client's buffer, or none
+pub fun live_span(t: Text, span: token.Span, enclosing: bool) opt[token.Span] {
+    if (t.live == nil) { ret opt[token.Span].some{span}; }
+    if (t.blind)       { ret opt[token.Span].none{}; }
+    val a:   usize = span.offset;
+    val b:   usize = span.offset + span.len;
+    val i:   usize = first_after_old(t, a);
+    var out: token.Span;
+    out.offset = (a::i64 + shift_before(t, i))::usize;
+    out.len    = span.len;
+    if (i == t.win_count || b <= t.wins[i].old_start) { ret opt[token.Span].some{out}; }
+
+    # the span reaches window `i`: it maps only by enclosing whole windows
+    if (!enclosing || a >= t.wins[i].old_start) { ret opt[token.Span].none{}; }
+    var j: usize = i;
+    for (j + 1 < t.win_count && t.wins[j + 1].old_start < b) { j = j + 1; }
+    if (b < t.wins[j].old_end) { ret opt[token.Span].none{}; }
+    val end: usize = (b::i64 + shift_before(t, j + 1))::usize;
+    out.len = end - out.offset;
+    ret opt[token.Span].some{out};
+}
+
+# whether `span` can be reported to the client
+#
+# A span that encloses the window is refused: a name, a reference, a highlight
+# is a claim about exactly those bytes, and a change inside them changed what it
+# names. A declaration's full range is not such a claim; see `maps_around`.
+pub fun maps(t: Text, span: token.Span) bool {
+    val o: opt[token.Span] = live_span(t, span, false);
+    ret sel o.some;
+}
+
+# as `maps`, for a range that merely surrounds what it describes - a
+# declaration around an edit to its body is still that declaration
+pub fun maps_around(t: Text, span: token.Span) bool {
+    val o: opt[token.Span] = live_span(t, span, true);
+    ret sel o.some;
+}
+
+# the analyzed offset for the client's offset `q`, or none inside a window. a
+# cursor at the start of inserted or replaced text touches text the analysis
+# never saw, so it is inside
+fun analyzed_offset(t: Text, q: usize) opt[usize] {
+    if (t.live == nil) { ret opt[usize].some{q}; }
+    if (t.blind)       { ret opt[usize].none{}; }
+    val i: usize = first_after_new(t, q);
+    if (i < t.win_count && q >= t.wins[i].new_start) { ret opt[usize].none{}; }
+    ret opt[usize].some{(q::i64 - shift_before(t, i))::usize};
+}
+
+# the file the client's positions index: its live buffer when one is paired
+fun client_file(t: Text) *src.SourceFile {
+    if (t.live != nil) { ret t.live; }
+    ret t.file;
+}
+
+# the byte length of `client_file(t)`
+fun client_len(t: Text) usize {
+    if (t.live != nil) { ret t.live_len; }
+    ret t.len;
+}
+
+# the analysis offset of a 0-based LSP (line, character), or none when the
+# line is out of range or the position lies in a paired buffer's window. the
+# position indexes the client's buffer; its UTF-16 column is resolved by walking
+# that line's UTF-8, clamped to the line's end
+# ---
+# t:    the pairing the analysis indexes
 # line: 0-based LSP line
 # ch:   0-based LSP character (UTF-16 code-unit column)
-# ret:  some(offset) within the file, or none for an out-of-range line
+# ret:  some(offset) into `t.file`, or none
 pub fun offset_at(t: Text, line: usize, ch: usize) opt[usize] {
-    if (t.file == nil) { ret opt[usize].none{}; }
-    val ls: opt[usize] = src.line_start(t.file, line + 1);
+    val qo: opt[usize] = client_offset(t, line, ch);
+    if (sel qo.none) { ret qo; }
+    ret analyzed_offset(t, qo.some);
+}
+
+# as `offset_at`, for one end of a range the client uses as a filter rather
+# than a cursor: a bound inside a window widens to that window's edge instead
+# of failing, so a visible range that spans an edit still covers what the
+# analysis can say about either side of it
+# ---
+# t:      the pairing the analysis indexes
+# line:   0-based LSP line
+# ch:     0-based LSP character
+# is_end: whether this is the range's end
+# ret:    some(offset) into `t.file`, or none for an out-of-range line
+pub fun bound_at(t: Text, line: usize, ch: usize, is_end: bool) opt[usize] {
+    val qo: opt[usize] = client_offset(t, line, ch);
+    if (sel qo.none) { ret qo; }
+    val ao: opt[usize] = analyzed_offset(t, qo.some);
+    if (sel ao.some) { ret ao; }
+    if (t.blind) {
+        if (is_end) { ret opt[usize].some{t.len}; }
+        ret opt[usize].some{0};
+    }
+    val i: usize = first_after_new(t, qo.some);
+    if (is_end) { ret opt[usize].some{t.wins[i].old_end}; }
+    ret opt[usize].some{t.wins[i].old_start};
+}
+
+# the byte offset of a 0-based LSP position in the client's buffer
+fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
+    val file: *src.SourceFile = client_file(t);
+    if (file == nil) { ret opt[usize].none{}; }
+    val ls: opt[usize] = src.line_start(file, line + 1);
     if (sel ls.none) { ret opt[usize].none{}; }
     val ls_off: usize = ls.some;
 
-    var le_off: usize = t.len;
-    if (line + 1 < t.file.line_len) { le_off = t.file.line_starts[line + 1]; }
+    var le_off: usize = client_len(t);
+    if (line + 1 < file.line_len) { le_off = file.line_starts[line + 1]; }
 
-    ret opt[usize].some{u16_col_to_byte(t.file, ls_off, le_off, ch)};
+    ret opt[usize].some{u16_col_to_byte(file, ls_off, le_off, ch)};
+}
+
+# the client's LSP range for a span of the analyzed text, or none when the span
+# cannot be carried into the client's buffer (see `maps`)
+# ---
+# t:    the pairing the span indexes
+# span: a span of `t.file`
+# ret:  the 0-based range in the client's buffer, or none
+pub fun span_range(t: Text, span: token.Span) opt[LspRange] {
+    if (t.file == nil) { ret opt[LspRange].none{}; }
+    val lo: opt[token.Span] = live_span(t, span, false);
+    if (sel lo.none) { ret opt[LspRange].none{}; }
+    ret opt[LspRange].some{range_of(client_file(t), lo.some)};
+}
+
+# as `span_range`, carrying a range that surrounds the window; see `maps_around`
+pub fun span_range_around(t: Text, span: token.Span) opt[LspRange] {
+    if (t.file == nil) { ret opt[LspRange].none{}; }
+    val lo: opt[token.Span] = live_span(t, span, true);
+    if (sel lo.none) { ret opt[LspRange].none{}; }
+    ret opt[LspRange].some{range_of(client_file(t), lo.some)};
 }
 
 # the LSP range covering a byte span in `file`. a zero-length span
@@ -374,9 +584,169 @@ test "positions: the last line ends at the paired length" {
     ret 0;
 }
 
+# a stale analysis is answered through the window: before it offsets hold, after
+# it they move by the length change, inside it nothing crosses
+test "positions: a paired text maps spans around the window" {
+    var old_starts: [3]usize;
+    old_starts[0] = 0;
+    old_starts[1] = 7;
+    old_starts[2] = 8;
+    var new_starts: [3]usize;
+    new_starts[0] = 0;
+    new_starts[1] = 10;
+    new_starts[2] = 11;
+    # "val a;" became "val abcd;" on line 0; the rest is untouched
+    var old: src.SourceFile = t_file("val a;\n\nfoo bar", ?old_starts[0], 3);
+    var new: src.SourceFile = t_file("val abcd;\n\nfoo bar", ?new_starts[0], 3);
+    var pa:  Allocator;
+    page.make(?pa);
+    var wins: textdiff.Windows = textdiff.empty();
+    val t:    Text             = t_against(?pa, ?old, ?new, ?wins);
+    var fail: bool             = false;
+    if (t.live != (?new))                              { fail = true; }
+    if (t.win_count != 1 || !win_is(t, 0, 5, 5, 5, 8)) { fail = true; }
+
+    # "val " is before the window
+    if (!span_is(live_span(t, t_span(0, 3), false), 0, 3)) { fail = true; }
+    # "foo" moves by three bytes
+    if (!span_is(live_span(t, t_span(8, 3), false), 11, 3)) { fail = true; }
+    # "a" ends at an insertion point and keeps its place
+    if (!span_is(live_span(t, t_span(4, 1), false), 4, 1)) { fail = true; }
+    # ";" starts at the insertion point and moves with what follows
+    if (!span_is(live_span(t, t_span(5, 1), false), 8, 1)) { fail = true; }
+    # "a;" encloses the insertion: carried only when enclosing is allowed
+    if (!span_is(live_span(t, t_span(4, 2), true), 4, 5)) { fail = true; }
+    if (span_present(live_span(t, t_span(4, 2), false)))  { fail = true; }
+
+    # a cursor on the inserted "bcd" has no analysis; one on "foo" does
+    if (some_present(offset_at(t, 0, 6))) { fail = true; }
+    if (!some_is(offset_at(t, 2, 1), 9))  { fail = true; }
+    if (!some_is(offset_at(t, 0, 2), 2))  { fail = true; }
+    # a range bound inside the window widens to its edge
+    if (!some_is(bound_at(t, 0, 6, false), 5)) { fail = true; }
+    if (!some_is(bound_at(t, 0, 6, true), 5))  { fail = true; }
+
+    # the reported range indexes the client's lines
+    val ro: opt[LspRange] = span_range(t, t_span(8, 3));
+    if (sel ro.some) {
+        if (ro.some.start_line != 2 || ro.some.start_char != 0) { fail = true; }
+    }
+    or { fail = true; }
+    textdiff.dnit(?pa, ?wins);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a replacement removes bytes, so a span inside what was replaced has no
+# counterpart even at the window's first byte
+test "positions: a replaced range refuses what it replaced" {
+    var starts: [1]usize;
+    starts[0] = 0;
+    var old: src.SourceFile = t_file("abcXYZdef", ?starts[0], 1);
+    var new: src.SourceFile = t_file("abcQdef", ?starts[0], 1);
+    var pa:  Allocator;
+    page.make(?pa);
+    var wins: textdiff.Windows = textdiff.empty();
+    val t:    Text             = t_against(?pa, ?old, ?new, ?wins);
+    var fail: bool             = false;
+    if (!win_is(t, 0, 3, 6, 3, 4))                         { fail = true; }
+    if (span_present(live_span(t, t_span(3, 1), true)))    { fail = true; }
+    if (span_present(live_span(t, t_span(5, 2), true)))    { fail = true; }
+    if (!span_is(live_span(t, t_span(6, 3), false), 4, 3)) { fail = true; }
+    # an empty span at the window's start is a point before it
+    if (!span_is(live_span(t, t_span(3, 0), false), 3, 0)) { fail = true; }
+    # the cursor at the replacement's first byte is in text the analysis never saw
+    if (some_present(offset_at(t, 0, 3))) { fail = true; }
+    if (!some_is(offset_at(t, 0, 4), 6))  { fail = true; }
+    textdiff.dnit(?pa, ?wins);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the edit a single window cannot serve: an import at the top and its use far
+# below leave everything between them answerable
+test "positions: text between two windows moves by the first one" {
+    var old_starts: [5]usize;
+    old_starts[0] = 0;
+    old_starts[1] = 6;
+    old_starts[2] = 10;
+    old_starts[3] = 14;
+    old_starts[4] = 18;
+    var new_starts: [7]usize;
+    new_starts[0] = 0;
+    new_starts[1] = 6;
+    new_starts[2] = 12;
+    new_starts[3] = 16;
+    new_starts[4] = 20;
+    new_starts[5] = 25;
+    new_starts[6] = 29;
+    # "use b\n" is added after "use a\n", and "b();\n" after "x2;\n"
+    var old: src.SourceFile = t_file("use a\nx1;\nx2;\nx3;\n", ?old_starts[0], 5);
+    var new: src.SourceFile = t_file("use a\nuse b\nx1;\nx2;\nb();\nx3;\n", ?new_starts[0], 7);
+    var pa:  Allocator;
+    page.make(?pa);
+    var wins: textdiff.Windows = textdiff.empty();
+    val t:    Text             = t_against(?pa, ?old, ?new, ?wins);
+    var fail: bool             = false;
+    if (t.win_count != 2) { fail = true; }
+    # "x1" sits between the windows and moves by six
+    if (!span_is(live_span(t, t_span(6, 2), false), 12, 2)) { fail = true; }
+    # "x3" sits after both and moves by eleven
+    if (!span_is(live_span(t, t_span(14, 2), false), 25, 2)) { fail = true; }
+    # a cursor on "x2" in the client's text is x2 in the analysis
+    if (!some_is(offset_at(t, 3, 1), 11)) { fail = true; }
+    # a cursor on the inserted "b();" is not
+    if (some_present(offset_at(t, 4, 1))) { fail = true; }
+    # a span from "x1" through "x3" encloses the second window
+    if (!span_is(live_span(t, t_span(6, 10), true), 12, 15)) { fail = true; }
+    if (span_present(live_span(t, t_span(6, 10), false)))    { fail = true; }
+    textdiff.dnit(?pa, ?wins);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# identical texts pair as an unmapped text, so a current snapshot costs nothing,
+# and unknown differences map nothing at all
+test "positions: identical texts carry no window" {
+    var starts: [1]usize;
+    starts[0] = 0;
+    var a:  src.SourceFile = t_file("same", ?starts[0], 1);
+    var b:  src.SourceFile = t_file("same", ?starts[0], 1);
+    var pa: Allocator;
+    page.make(?pa);
+    var wins: textdiff.Windows = textdiff.empty();
+    val t:    Text             = t_against(?pa, ?a, ?b, ?wins);
+    if (t.live != nil) { ret 1; }
+    val u: Text = text_against(?a, ?b, nil);
+    if (!u.blind || maps(u, t_span(0, 1))) { ret 1; }
+    ret 0;
+}
+
+fun t_against(pa: *Allocator, old: *src.SourceFile, new: *src.SourceFile, wins: *textdiff.Windows) Text {
+    textdiff.compute(pa, old, str_len(old.text), new, str_len(new.text), wins);
+    ret text_against(old, new, wins);
+}
+
+fun win_is(t: Text, i: usize, os: usize, oe: usize, ns: usize, ne: usize) bool {
+    if (i >= t.win_count) { ret false; }
+    val w: textdiff.Window = t.wins[i];
+    ret w.old_start == os && w.old_end == oe && w.new_start == ns && w.new_end == ne;
+}
+
+fun span_is(o: opt[token.Span], offset: usize, len: usize) bool {
+    if (sel o.some) { ret o.some.offset == offset && o.some.len == len; }
+    ret false;
+}
+
+fun span_present(o: opt[token.Span]) bool {
+    ret sel o.some;
+}
+
 # a SourceFile over `text` with a real line index, for the tests above
 fun t_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     var f: src.SourceFile;
+    f.present     = true;
+    f.revision    = 0;
     f.path        = "t.mach";
     f.text        = text;
     f.line_starts = starts;

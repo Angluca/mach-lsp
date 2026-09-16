@@ -10,13 +10,14 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 HEADER_MAX = 8 * 1024
 BODY_MAX = 16 * 1024 * 1024
@@ -123,10 +124,10 @@ class LspSession:
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        started = time.monotonic()
+        started = time.perf_counter()
         self._send(message)
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.monotonic() - started))
+        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
@@ -153,7 +154,7 @@ class LspSession:
         for message in messages:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
             frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
-        started = time.monotonic()
+        started = time.perf_counter()
         try:
             self.proc.stdin.write(b"".join(frames))
             self.proc.stdin.flush()
@@ -161,10 +162,22 @@ class LspSession:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.monotonic() - started))
+        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
+
+    def send_all(self, messages: list[dict[str, Any]]) -> None:
+        """Write several complete messages in one write, so they queue together."""
+        frames = []
+        for message in messages:
+            payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
+            frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
+        try:
+            self.proc.stdin.write(b"".join(frames))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
     def respond_error(self, request: dict[str, Any], code: int, message: str) -> None:
         """Reject one server-initiated request."""
@@ -486,18 +499,86 @@ need = []
     return main, dep, main_text, live_dep_text
 
 
+class BuildLog:
+    """The server's own record of the project builds it ran, read from its trace.
+
+    Every background build logs when it is scheduled and when it finishes, and
+    the inline first load also logs that it was analyzed, so subtracting those
+    leaves the background ones. Counting the server's record is deterministic,
+    where waiting for the diagnostics stream to fall quiet is not: a build that
+    is still running is quiet.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def env(self) -> dict[str, str]:
+        return {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(self.path)}
+
+    def text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return ""
+
+    def scheduled(self) -> int:
+        return self.text().count("off the analysis thread")
+
+    def quiesced(self) -> bool:
+        log = self.text()
+        done = max(0, log.count("project: rebuilt") - log.count("project: analyzed"))
+        return done >= log.count("off the analysis thread")
+
+    def settle(self, at_least: int, description: str, deadline: float = 60.0) -> None:
+        """Wait until at least `at_least` background builds ran and none is running."""
+        eventually(lambda: self.scheduled() >= at_least and self.quiesced(),
+                   lambda done: done, description, deadline)
+
+
+def eventually(
+    probe: Callable[[], Any],
+    want: Callable[[Any], bool],
+    description: str,
+    deadline: float = 20.0,
+) -> Any:
+    """Poll a project-backed probe until the rebuild behind it has landed.
+
+    A rebuild runs off the analysis thread, so the edit that scheduled it is
+    answered from the PREVIOUS snapshot and the new one is swapped in a moment
+    later. How long that moment is belongs to the machine, not the contract, so
+    these are asserted with a deadline rather than a sleep.
+
+    Waiting for the diagnostics stream to fall quiet cannot serve here: a
+    rebuild that is still running IS quiet, so silence reads as settled on any
+    machine slow enough for the question to matter.
+    """
+    end = time.monotonic() + deadline
+    last: Any = None
+    while True:
+        last = probe()
+        if want(last):
+            return last
+        if time.monotonic() >= end:
+            raise ProtocolError(f"{description} never settled; last result {last!r}")
+        time.sleep(0.05)
+
+
+def settled_result(session: LspSession, method: str, params: dict[str, Any],
+                   want: Callable[[Any], bool], description: str) -> Any:
+    """Issue `method` until its result settles into `want`."""
+    return eventually(lambda: session.request(method, params).get("result"),
+                      want, description)
+
+
 def assert_definition(session: LspSession, main: Path, definition: Path, text: str) -> None:
     """Check that `answer` resolves into the expected project root."""
     lines = text.splitlines()
     line = next(index for index, value in enumerate(lines) if " + direct + " in value)
-    response = session.request(
-        "textDocument/definition",
-        {
-            "textDocument": {"uri": main.as_uri()},
-            "position": {"line": line, "character": lines[line].index("direct") + 1},
-        },
-    )
-    result = response.get("result")
+    result = settled_result(
+        session, "textDocument/definition",
+        {"textDocument": {"uri": main.as_uri()},
+         "position": {"line": line, "character": lines[line].index("direct") + 1}},
+        lambda r: isinstance(r, dict), "definition of `direct`")
     require(isinstance(result, dict), f"definition is not a Location: {result!r}")
     require(result.get("uri") == definition.as_uri(), f"definition escaped its root: {result!r}")
     assert_range(result.get("range"), "definition.range")
@@ -508,12 +589,11 @@ def definition_after(session: LspSession, path: Path, text: str, prefix: str) ->
     lines = text.splitlines()
     line = next(i for i, value in enumerate(lines) if prefix in value and "use " not in value)
     character = lines[line].index(prefix) + len(prefix) + 1
-    response = session.request(
-        "textDocument/definition",
+    result = settled_result(
+        session, "textDocument/definition",
         {"textDocument": {"uri": path.as_uri()},
          "position": {"line": line, "character": character}},
-    )
-    result = response.get("result")
+        lambda r: isinstance(r, dict), f"definition after {prefix!r}")
     require(isinstance(result, dict), f"definition after {prefix!r} is not a Location: {result!r}")
     return result
 
@@ -522,12 +602,11 @@ def definition(session: LspSession, path: Path, text: str, name: str) -> dict[st
     """Request a definition at the last occurrence of name."""
     lines = text.splitlines()
     line = next(index for index in range(len(lines) - 1, -1, -1) if name in lines[index])
-    response = session.request(
-        "textDocument/definition",
+    result = settled_result(
+        session, "textDocument/definition",
         {"textDocument": {"uri": path.as_uri()},
          "position": {"line": line, "character": lines[line].index(name) + 1}},
-    )
-    result = response.get("result")
+        lambda r: isinstance(r, dict), f"definition for {name}")
     require(isinstance(result, dict), f"definition for {name} is not a Location: {result!r}")
     return result
 
@@ -610,12 +689,12 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             alpha_manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(alpha_manifest_text + "\n[broken\n", encoding="utf-8")
-            started = time.monotonic()
+            started = time.perf_counter()
             symbols = session.request(
                 "textDocument/documentSymbol",
                 {"textDocument": {"uri": alpha[0].as_uri()}},
             )
-            require(time.monotonic() - started < 1.0,
+            require(time.perf_counter() - started < 1.0,
                     "syntax-only documentSymbol blocked on project analysis")
             require(isinstance(symbols.get("result"), list) and symbols["result"],
                     f"documentSymbol depended on project loading: {symbols!r}")
@@ -661,27 +740,40 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
 
             # A rejected dynamic registration must leave manifest fingerprint
-            # fallback active: a broken manifest disables the snapshot, and a
-            # restored one is retried without a watcher notification.
+            # fallback active. A broken manifest is a FAILED REBUILD, not a
+            # dropped snapshot: the failure is reported and the previous
+            # snapshot keeps answering, so what is asserted is that the scan
+            # fired and said so - not that cross-module features went dark.
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
             # the fingerprint fallback coalesces to at most one scan per 250 ms
-            # per root, so a request issued inside that window is answered from
-            # the still-live snapshot. wait past it, or this asserts nothing.
+            # per root, so a request issued inside that window never scans at
+            # all. wait past it, or this asserts nothing.
             time.sleep(0.4)
-            broken = session.request(
+            session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": alpha[0].as_uri()},
                  "position": {"line": 3, "character": 9}},
             )
-            require(broken.get("result") is None,
-                    f"watcher rejection disabled manifest fallback: {broken!r}")
+            warning = session.wait_for(
+                lambda item: (item.get("method") == "window/showMessage"
+                              and isinstance(item.get("params"), dict)
+                              and "failed to load project"
+                              in str(item["params"].get("message", ""))),
+                "broken manifest warning",
+            )
+            require(warning["params"].get("type") == 2,
+                    f"load failure was not reported as a warning: {warning!r}")
+            # the rebuild failed, so the snapshot it would have replaced is
+            # still the one serving
+            assert_definition(session, *alpha)
             alpha_manifest.write_text(manifest_text, encoding="utf-8")
             # and again on the way back: a failed root retries on the next
             # fingerprint scan, not on the next request
             time.sleep(0.4)
             assert_definition(session, *alpha)
+
 
             # An unsaved export change in one module must be visible from another
             # open module through the retained compiler snapshot, not editor fallback.
@@ -729,12 +821,12 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": broken_text}]},
             )
             session.diagnostics(alpha_main.as_uri(), 3)
-            broken_overlay = session.request(
-                "textDocument/definition",
+            broken_overlay = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": alpha_main.as_uri()},
                  "position": {"line": 8, "character": 30}},
-            )
-            require(broken_overlay.get("result") is None,
+                lambda r: r is None, "invalid unsaved import stops resolving")
+            require(broken_overlay is None,
                     f"invalid unsaved import unexpectedly analyzed: {broken_overlay!r}")
             session.notify(
                 "textDocument/didChange",
@@ -747,12 +839,12 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
 
             session.notify("textDocument/didClose", {"textDocument": {"uri": alpha_def.as_uri()}})
             assert_diagnostics(session.diagnostics(alpha_def.as_uri(), None), False)
-            after_close = session.request(
-                "textDocument/definition",
+            after_close = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": alpha_main.as_uri()},
                  "position": {"line": 5, "character": 35}},
-            )
-            require(after_close.get("result") is None,
+                lambda r: r is None, "closed unsaved export stops being authoritative")
+            require(after_close is None,
                     f"closed unsaved export remained authoritative: {after_close!r}")
             session.notify(
                 "textDocument/didChange",
@@ -847,6 +939,600 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 session.abort()
 
 
+def write_wide_project(parent: Path, project_id: str, modules: int) -> tuple[Path, str]:
+    """Create a project whose import closure is big enough to take real time.
+
+    The rebuild has to outlast one request round-trip for the concurrency test
+    to mean anything: against a three-file project, "answered during the
+    rebuild" and "answered after it" are the same millisecond.
+    """
+    root = parent / project_id
+    source = root / "src"
+    source.mkdir(parents=True)
+    (root / "mach.toml").write_text(
+        f"""[project]
+id = "{project_id}"
+version = "0.1.0"
+src = "src"
+out = "out/{{target.name}}/{{profile.name}}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+""",
+        encoding="utf-8",
+    )
+    for index in range(modules):
+        body = [f"pub val base{index}: i32 = {index};"]
+        for k in range(24):
+            body.append(f"pub fun f{index}_{k}(a: i32, b: i32) i32 {{ ret a * {k + 1} + b + base{index}; }}")
+            body.append(f"pub rec R{index}_{k} {{ x: i32; y: i32; }}")
+        (source / f"m{index}.mach").write_text("\n".join(body) + "\n", encoding="utf-8")
+    uses = "\n".join(f"use {project_id}.m{index}.base{index};" for index in range(modules))
+    total = " + ".join(f"base{index}" for index in range(modules))
+    text = f"{uses}\n\npub fun main() i32 {{\n    ret {total};\n}}\n"
+    main = source / "main.mach"
+    main.write_text(text, encoding="utf-8")
+    return main, text
+
+
+def run_disk_change_during_build(server: Path, timeout: float) -> None:
+    """A file written while a build runs is rebuilt, not mistaken for the snapshot's.
+
+    A build reads a module early and records its disk fingerprint at the end. A
+    write landing in between leaves a snapshot of the old bytes beside a
+    fingerprint of the new ones, and a fingerprint scan then finds nothing to
+    rebuild. Where in a build the write lands is not observable from outside, so
+    it is tried across the build's duration; the window is most of the build,
+    and every attempt must converge on what is on disk.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-midbuild-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "mid", 384)
+        module = main.parent / "m0.mach"
+        module_text = module.read_text(encoding="utf-8")
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if value.lstrip().startswith("ret "))
+            position = {"line": line, "character": lines[line].index("base0") + 2}
+            version = 1
+
+            def rebuild() -> None:
+                nonlocal version
+                version += 1
+                before = builds.scheduled()
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
+                )
+                eventually(builds.scheduled, lambda n: n > before, "the rebuild to start")
+
+            # the spare's first build is cold, so two rebuilds warm both sessions,
+            # and the second says how long a warm one takes on this machine
+            for _ in range(2):
+                rebuild()
+                builds.settle(0, "a timing rebuild")
+            durations = re.findall(r"project: rebuilt .* in (\d+)ms", builds.text())
+            warm = int(durations[-1]) / 1000.0
+
+            for attempt, fraction in enumerate((0.1, 0.3, 0.5, 0.7, 0.9)):
+                value = 1000 + attempt
+                rebuild()
+                time.sleep(warm * fraction)
+                module.write_text(module_text.replace("pub val base0: i32 = 0;",
+                                                      f"pub val base0: i32 = {value};"),
+                                  encoding="utf-8")
+                builds.settle(0, "the interrupted rebuild")
+                time.sleep(FINGERPRINT_WINDOW)
+                settled_result(
+                    session, "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()}, "position": position},
+                    lambda r, want=value: f"base0: i32 = {want}" in json.dumps(r),
+                    f"hover reflecting a write at {int(fraction * 100)}% of a rebuild")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+
+STALE_MODULES = 192
+
+
+def stale_fixture(root: Path, name: str, extra: str = "") -> tuple[Path, str, int]:
+    """A project whose rebuild outlasts a request round-trip by a wide margin.
+
+    `extra` is spliced into `main` just before its `ret`, and the returned line
+    is the `ret` line's index in the opened text.
+    """
+    main, text = write_wide_project(root, name, STALE_MODULES)
+    if extra:
+        text = text.replace("    ret ", extra + "    ret ", 1)
+        main.write_text(text, encoding="utf-8")
+    ret_line = next(i for i, value in enumerate(text.splitlines()) if value.startswith("    ret "))
+    return main, text, ret_line
+
+
+def open_stale_session(server: Path, root: Path, timeout: float, main: Path, text: str,
+                       capabilities: dict[str, Any] | None = None) -> tuple[LspSession, BuildLog]:
+    builds = BuildLog(root / "trace.log")
+    session = LspSession(server, root, timeout, builds.env())
+    session.request("initialize", {"rootUri": root.as_uri(), "capabilities": capabilities or {}})
+    session.notify("initialized", {})
+    session.notify(
+        "textDocument/didOpen",
+        {"textDocument": {"uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}},
+    )
+    session.diagnostics(main.as_uri(), 1)
+    return session, builds
+
+
+def rebuilt(builds: BuildLog) -> int:
+    return builds.text().count("project: rebuilt")
+
+
+def change(uri: str, version: int, text: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "method": "textDocument/didChange",
+            "params": {"textDocument": {"uri": uri, "version": version},
+                       "contentChanges": [{"text": text}]}}
+
+
+def at(uri: str, line: int, character: int) -> dict[str, Any]:
+    return {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}
+
+
+def stale_request(session: LspSession, builds: BuildLog, edit: dict[str, Any],
+                  method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Send an edit and a request in one write, and prove the answer was stale.
+
+    Written together, the request is handled before the rebuild the edit
+    started can finish, and the build log confirms it: no build completed
+    between the edit and the answer.
+    """
+    before = rebuilt(builds)
+    request_id = session.next_id
+    session.next_id += 1
+    session.send_all([edit, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}])
+    response = session.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
+    require(rebuilt(builds) == before,
+            f"{method} was answered after the rebuild landed, so it proves nothing about staleness")
+    return response
+
+
+def run_stale_hover(server: Path, timeout: float) -> None:
+    """A snapshot behind the buffer answers through the edit window (#251).
+
+    Before the window an answer keeps its place, after it an answer moves with
+    the text, and a cursor or a result touching the window answers nothing
+    rather than a position the client no longer has.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-hover-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "stale")
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            column = text.splitlines()[ret_line].index("base3 ")
+
+            def hover_lands(response: dict[str, Any], line: int, what: str) -> None:
+                result = response.get("result")
+                require(isinstance(result, dict), f"stale hover {what} answered nothing: {response!r}")
+                require("base3" in json.dumps(result.get("contents")),
+                        f"stale hover {what} described something else: {result!r}")
+                start = result.get("range", {}).get("start")
+                require(start == {"line": line, "character": column},
+                        f"stale hover {what} is not where the client's text has it: {start!r}")
+
+            # a line inserted above: the answer moves down with the text
+            above = "# a line the snapshot never saw\n" + text
+            before = rebuilt(builds)
+            hover_lands(stale_request(session, builds, change(uri, 2, above),
+                                      "textDocument/hover", at(uri, ret_line + 1, column + 2)),
+                        ret_line + 1, "after the window")
+            # the inserted line has no analysis, even where the same column of the
+            # snapshot's first line holds a name
+            inserted = session.request("textDocument/hover", at(uri, 0, len("use stale.m0.ba")))
+            require(rebuilt(builds) == before, "the rebuild landed before the inserted line was asked about")
+            require(inserted.get("result") is None,
+                    f"a cursor on text the snapshot never saw answered: {inserted!r}")
+            builds.settle(1, "the first edit's rebuild")
+
+            # text appended below: the answer keeps its place
+            below = above + "# and one after everything\n"
+            hover_lands(stale_request(session, builds, change(uri, 3, below),
+                                      "textDocument/hover", at(uri, ret_line + 1, column + 2)),
+                        ret_line + 1, "before the window")
+            builds.settle(2, "the second edit's rebuild")
+
+            # the name itself replaced: the cursor still sits on bytes that exist
+            # in both texts, but the name it resolves to overlaps the window
+            renamed = below.replace("ret base0 + base1 + base2 + base3 ", "ret base0 + base1 + base2 + base9 ", 1)
+            require(renamed != below, "the fixture's ret line changed shape")
+            inside = stale_request(session, builds, change(uri, 4, renamed),
+                                   "textDocument/hover", at(uri, ret_line + 1, column + 1))
+            require(inside.get("result") is None,
+                    f"a hover on a name the client has since edited answered: {inside!r}")
+            builds.settle(3, "the third edit's rebuild")
+
+            # and once the rebuild lands, the same position is answered afresh
+            fresh = session.request("textDocument/hover", at(uri, ret_line + 1, column + 1))
+            require("base9" in json.dumps(fresh.get("result")),
+                    f"the rebuilt snapshot did not answer for the new name: {fresh!r}")
+
+            # two edits far apart - a line at the top, a statement above `ret` -
+            # leave the imports between them answerable, each moved by the first
+            lines = renamed.splitlines(keepends=True)
+            use_line = next(i for i, value in enumerate(lines) if value.startswith("use stale.m5.base5;"))
+            spread = ("# top\n" + "".join(lines[:ret_line + 1])
+                      + "    val late: i32 = base7;\n" + "".join(lines[ret_line + 1:]))
+            between = stale_request(session, builds, change(uri, 5, spread),
+                                    "textDocument/hover", at(uri, use_line + 1, len("use stale.m5.ba")))
+            result = between.get("result")
+            require(isinstance(result, dict) and "base5" in json.dumps(result.get("contents")),
+                    f"a name between two edits answered nothing: {between!r}")
+            require(result.get("range", {}).get("start", {}).get("line") == use_line + 1,
+                    f"a name between two edits is not where the client has it: {result!r}")
+            builds.settle(4, "the fourth edit's rebuild")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_stale_strict_requests(server: Path, timeout: float) -> None:
+    """A rename or reference list waits for the snapshot that covers its edit.
+
+    Answered from the stale snapshot, a rename would miss an occurrence the
+    client just typed. Held, it is answered once the rebuild lands; withdrawing
+    or closing while held is `run_stale_held_release`.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-strict-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "strict")
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            column = text.splitlines()[ret_line].index("base1 ")
+            holds = lambda: builds.text().count("holding a request")
+
+            # a new use of base1 is typed together with the rename request
+            edited = text.replace("    ret base0 ", "    val again: i32 = base1;\n    ret base0 ", 1)
+            request_id = session.next_id
+            session.next_id += 1
+            session.send_all([
+                change(uri, 2, edited),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/rename",
+                 "params": {**at(uri, ret_line + 1, column + 2), "newName": "renamed"}},
+            ])
+            response = session.wait_for(lambda item: item.get("id") == request_id, "held rename")
+            require(holds() == 1, f"the rename was not held: {holds()} holds")
+            edits = response.get("result", {}).get("changes", {}).get(uri, [])
+            lines = sorted(e["range"]["start"]["line"] for e in edits)
+            require(ret_line in lines and ret_line + 1 in lines,
+                    f"the rename missed the occurrence typed with it: {lines!r}")
+            builds.settle(1, "the rename's rebuild")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def held_behind_busy_root(server: Path, timeout: float, prefix: str,
+                          release: Callable[[LspSession, str, int], None],
+                          check: Callable[[dict[str, Any]], None]) -> None:
+    """Hold a request for as long as the build slot is taken, then act on it.
+
+    How long a rebuild takes belongs to the machine, so a request held only by
+    its own root's rebuild can be answered before anything is done to it. Here
+    the slot is first given to a much larger root's cold rebuild, and the held
+    root cannot even start its own until that one finishes.
+    """
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        root = Path(directory).resolve()
+        held, held_text = write_wide_project(root, "heldroot", 64)
+        busy, busy_text = write_wide_project(root, "busyroot", 768)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            for doc, text in ((busy, busy_text), (held, held_text)):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": doc.as_uri(), "languageId": "mach", "version": 1, "text": text}},
+                )
+                session.diagnostics(doc.as_uri(), 1)
+
+            def rebuilds(name: str) -> int:
+                return sum(1 for line in builds.text().splitlines()
+                           if "project: rebuilt" in line and name in line)
+
+            loaded = rebuilds("busyroot")
+            session.send_all([change(busy.as_uri(), 2, busy_text + "# takes the build slot\n")])
+            session.diagnostics(busy.as_uri(), 2)
+            eventually(builds.scheduled, lambda n: n >= 1, "the busy root's rebuild to start")
+
+            lines = held_text.splitlines()
+            ret_line = next(i for i, value in enumerate(lines) if value.startswith("    ret "))
+            request_id = session.next_id
+            session.next_id += 1
+            before = builds.text().count("holding a request")
+            session.send_all([
+                change(held.as_uri(), 2, held_text + "# held behind the busy root\n"),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/references",
+                 "params": {**at(held.as_uri(), ret_line, lines[ret_line].index("base1") + 2),
+                            "context": {"includeDeclaration": True}}},
+            ])
+            eventually(lambda: builds.text().count("holding a request"), lambda n: n > before,
+                       "the request to be held")
+            release(session, held.as_uri(), request_id)
+            answer = session.wait_for(lambda item: item.get("id") == request_id, "the held request's answer")
+            # answered while the busy root still holds the slot: nothing but the
+            # release itself can have produced the answer
+            require(rebuilds("busyroot") == loaded,
+                    "the answer only came once the build slot freed up")
+            check(answer)
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def cancel_request(session: LspSession, uri: str, request_id: int) -> None:
+    session.notify("$/cancelRequest", {"id": request_id})
+
+
+def close_document(session: LspSession, uri: str, request_id: int) -> None:
+    session.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+
+def run_stale_held_release(server: Path, timeout: float) -> None:
+    """A held request is answered at once when withdrawn or when its document closes."""
+    held_behind_busy_root(
+        server, timeout, "mls-held-cancel-", cancel_request,
+        lambda answer: require(answer.get("error", {}).get("code") == -32800,
+                               f"a withdrawn held request was not cancelled: {answer!r}"))
+    held_behind_busy_root(
+        server, timeout, "mls-held-close-", close_document,
+        lambda answer: require(answer.get("error", {}).get("code") == -32801,
+                               f"a held request outlived its document: {answer!r}"))
+
+
+def run_stale_refresh(server: Path, timeout: float) -> None:
+    """Answers given from a stale snapshot are replaced once the rebuild lands.
+
+    Semantic tokens and inlay hints are re-requested by a client only when told
+    to, so the server asks - and only a client that said it can take the request.
+    """
+    for supported in (True, False):
+        with tempfile.TemporaryDirectory(prefix="mls-stale-refresh-") as directory:
+            root = Path(directory).resolve()
+            main, text, _ = stale_fixture(root, "refresh")
+            uri = main.as_uri()
+            capabilities = {"workspace": {"semanticTokens": {"refreshSupport": supported},
+                                          "inlayHint": {"refreshSupport": supported}}}
+            session, builds = open_stale_session(server, root, timeout, main, text, capabilities)
+            finished = False
+            try:
+                tokens = stale_request(session, builds, change(uri, 2, "# moved\n" + text),
+                                       "textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+                require(tokens.get("result", {}).get("data"),
+                        f"stale semantic tokens answered nothing: {tokens!r}")
+                builds.settle(1, "the rebuild behind the stale tokens")
+                refreshes = lambda item: item.get("method") in (
+                    "workspace/semanticTokens/refresh", "workspace/inlayHint/refresh")
+                if supported:
+                    for _ in range(2):
+                        request = session.wait_for(refreshes, "a refresh request")
+                        session.respond_result(request)
+                else:
+                    session.assert_no_message(refreshes, "refresh request to a client that cannot take one")
+                session.finish()
+                finished = True
+            finally:
+                if not finished:
+                    session.abort()
+
+
+def run_stale_diagnostics(server: Path, timeout: float) -> None:
+    """While the root rebuilds, a buffer shows what can still be said about it.
+
+    A semantic error away from the edit is carried to its new line; a buffer
+    that no longer parses shows its syntax errors and nothing older.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-diags-") as directory:
+        root = Path(directory).resolve()
+        main, text, _ = stale_fixture(root, "diags", "    val bad: i32 = nowhere;\n")
+        uri = main.as_uri()
+        bad_line = next(i for i, value in enumerate(text.splitlines()) if "nowhere" in value)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": uri, "languageId": "mach", "version": 1, "text": text}},
+            )
+            opened = session.diagnostics(uri, 1)["params"]["diagnostics"]
+            require(bad_line in [d["range"]["start"]["line"] for d in opened],
+                    f"the fixture's unresolved name was not reported: {opened!r}")
+
+            def publish(version: int, new_text: str) -> list[int]:
+                before = rebuilt(builds)
+                session.send_all([change(uri, version, new_text)])
+                published = session.diagnostics(uri, version)
+                require(rebuilt(builds) == before, "the publish came after the rebuild")
+                return [d["range"]["start"]["line"] for d in published["params"]["diagnostics"]]
+
+            moved = "# pushes everything down\n" + text
+            lines = publish(2, moved)
+            require(bad_line + 1 in lines,
+                    f"the unresolved name was not carried to its new line: {lines!r}")
+            builds.settle(1, "the first edit's rebuild")
+            session.diagnostics(uri, 2)
+
+            broken = moved + "pub fun half( {\n"
+            lines = publish(3, broken)
+            require(lines, "a buffer that no longer parses showed no errors")
+            require(bad_line + 1 not in lines,
+                    f"a stale semantic error was shown beside the syntax errors: {lines!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_version(server: Path, timeout: float) -> None:
+    """The binary reports the version it was built from, and starts nothing to do so.
+
+    A release asset is checked against its tag by this flag, and a client learns
+    the same value from `initialize`; both come from `[project].version`.
+    """
+    manifest = Path(__file__).resolve().parents[1] / "mach.toml"
+    match = re.search(r'^version = "([^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
+    require(match is not None, "mach.toml has no project version")
+    expected = match.group(1)
+
+    done = subprocess.run([str(server), "--version"], stdin=subprocess.DEVNULL,
+                          capture_output=True, timeout=timeout)
+    require(done.returncode == 0, f"--version exited {done.returncode}: {done.stderr!r}")
+    require(done.stdout.decode().strip() == f"mls {expected}",
+            f"--version printed {done.stdout!r}, expected mls {expected}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-version-") as directory:
+        session = LspSession(server, Path(directory), timeout)
+        finished = False
+        try:
+            info = session.request("initialize", {"capabilities": {}})["result"].get("serverInfo", {})
+            require(info == {"name": "mach-lsp", "version": expected},
+                    f"initialize reported {info!r}, expected version {expected}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_rebuild_concurrency(server: Path, timeout: float) -> None:
+    """Prove a request is ANSWERED while a project rebuild is still running.
+
+    This is the contract the off-thread rebuild exists for, so it is asserted by
+    ordering rather than by a clock: the edit's own diagnostics arrive first, the
+    request is answered next, and only then does the republish that follows the
+    swap appear. If the rebuild still owned the analysis thread, the request
+    could not be answered until it finished, and the republish could not arrive
+    after an answer that never came before it.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-rebuild-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "wide", 48)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            builds.settle(0, "the initial load to quiesce")
+
+            edited = text + "\n# one edit, one rebuild\n"
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            # the edit is answered immediately, from editor analysis of the live
+            # buffer, while the rebuild it scheduled is still running
+            session.diagnostics(main.as_uri(), 2)
+
+            symbols = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(isinstance(symbols.get("result"), list) and symbols["result"],
+                    f"a request during a rebuild was not answered: {symbols!r}")
+            # nothing republished while that request was outstanding, so the
+            # rebuild had not finished when it was answered
+            early = [item for item in session.pending
+                     if item.get("method") == "textDocument/publishDiagnostics"]
+            require(not early,
+                    f"the rebuild finished before the request was answered: {early!r}")
+
+            # and the rebuild does land, republishing the document it moved
+            session.diagnostics(main.as_uri(), 2)
+            builds.settle(0, "the rebuild to quiesce")
+
+            # a burst of edits during a build coalesces into ONE follow-up build,
+            # not one per edit. counted from the server's own log, not timed.
+            before = builds.scheduled()
+            version = 2
+            for _ in range(12):
+                version += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
+                )
+            session.diagnostics(main.as_uri(), version)
+            builds.settle(0, "the burst's rebuilds to quiesce")
+            after = builds.scheduled()
+            require(after - before <= 2,
+                    f"a burst of 12 edits started {after - before} rebuilds, not at most 2")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_import_navigation(server: Path, timeout: float) -> None:
     """A `use` / `fwd` path must navigate like a body reference to the same symbol.
 
@@ -931,10 +1617,488 @@ def run_import_navigation(server: Path, timeout: float) -> None:
             bline = next(i for i, v in enumerate(blines) if v.startswith("fwd "))
             fwd = {"textDocument": {"uri": bridge.as_uri()},
                    "position": {"line": bline, "character": blines[bline].index("answer") + 1}}
-            response = session.request("textDocument/definition", fwd)
-            result = response.get("result")
+            result = eventually(
+                lambda: session.request("textDocument/definition", fwd).get("result"),
+                lambda r: isinstance(r, dict) and r.get("uri") == defs.as_uri(),
+                "fwd re-export path")
             require(isinstance(result, dict) and result.get("uri") == defs.as_uri(),
                     f"a fwd re-export path did not resolve: {result!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+NAV_MANIFEST = """[project]
+id = "nav"
+version = "0.1.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+"""
+
+NAV_DEFS = """pub rec Inner { w: i32; }
+pub rec Box { v: i32; inner: Inner; }
+pub tag Color: u8 { red; blue: i32; }
+pub fun make() Color { ret Color.red{}; }
+pub fun helper(n: i32) i32 { ret n + 1; }
+"""
+
+LONE_BUFFER = """pub fun leaf(n: i32) i32 {
+    ret n + 1;
+}
+
+pub fun trunk(n: i32) i32 {
+    ret leaf(n) + leaf(n + 1);
+}
+"""
+
+NAV_OTHER = """use nav.defs.helper;
+
+pub fun elsewhere(n: i32) i32 {
+    ret helper(n);
+}
+"""
+
+NAV_MAIN = """use nav.other;
+use nav.defs.Box;
+use nav.defs.Color;
+use nav.defs.make;
+use nav.defs.helper;
+
+pub def Handler: fun(i32) i32;
+
+pub rec Table { fn: Handler; }
+
+pub fun local(n: i32) i32 {
+    ret helper(n) + helper(n + 1);
+}
+
+pub fun pick() Color {
+    ret make();
+}
+
+pub fun indirect(f: Handler, t: Table) i32 {
+    ret f(1) + t.fn(2);
+}
+
+pub fun measure(p: *Box) i32 {
+    ret p.v;
+}
+
+pub fun main() i32 {
+    var b: Box;
+    val c: Color = make();
+    val n: i32   = b.v + b.inner.w;
+    ret local(n) + indirect(helper, Table{fn: helper});
+}
+"""
+
+
+def write_nav_project(parent: Path) -> tuple[Path, Path, str]:
+    """A two-module project covering the navigation features' interesting shapes.
+
+    One module declares a record, a nested record, a tag and two functions; a
+    second imports them and calls across the module boundary, directly and through
+    a `fun` value; a third calls the same function without being the open buffer or
+    the declaring file. Cross-module is the point: a single file would let a walk
+    that never leaves the open buffer pass, and the third module is the one that
+    neither end of the request names.
+    """
+    root = parent / "nav"
+    (root / "src").mkdir(parents=True)
+    (root / "mach.toml").write_text(NAV_MANIFEST, encoding="utf-8")
+    main = root / "src" / "main.mach"
+    defs = root / "src" / "defs.mach"
+    main.write_text(NAV_MAIN, encoding="utf-8")
+    defs.write_text(NAV_DEFS, encoding="utf-8")
+    (root / "src" / "other.mach").write_text(NAV_OTHER, encoding="utf-8")
+    return main, defs, NAV_MAIN
+
+
+def nav_position(text: str, within: str, needle: str) -> dict[str, Any]:
+    """A cursor in the middle of `needle`, on the unique line holding `within`.
+
+    The middle, not one past the start: a one-character name is a real cursor
+    target - `var b: Box;` - and start + 1 lands on the colon after it, where
+    every positional request answers null for the wrong reason.
+    """
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if within in value)
+    start = lines[line].index(needle, lines[line].index(within))
+    return {"line": line, "character": start + len(needle) // 2}
+
+
+def nav_range(text: str, needle: str) -> dict[str, Any]:
+    """The LSP range of the first occurrence of `needle` in `text`."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if needle in value)
+    start = lines[line].index(needle)
+    return {"start": {"line": line, "character": start},
+            "end": {"line": line, "character": start + len(needle)}}
+
+
+def nav_ranges(text: str, within: str, needle: str) -> list[dict[str, Any]]:
+    """Every range of `needle` on the single line holding `within`."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if within in value)
+    found: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        at = lines[line].find(needle, start)
+        if at < 0:
+            return found
+        found.append({"start": {"line": line, "character": at},
+                      "end": {"line": line, "character": at + len(needle)}})
+        start = at + len(needle)
+
+
+def run_call_hierarchy(server: Path, timeout: float) -> None:
+    """Call hierarchy resolves items by position, across modules, including
+    calls whose target is not statically known.
+
+    Three things here can only fail against a real project. An item's uri is the
+    declaring module's, which for a cross-module callee is a file the editor never
+    opened, so item resolution has to reach the project snapshot rather than the
+    open-document store - `defs.mach` is never opened in this session. A caller
+    that imported the function binds it without a DeclId of its own, so a
+    decl-keyed identity test reports that nothing outside the declaring file calls
+    it. And a fromRange is a span in the caller's file, which has a different line
+    index from the callee's.
+
+    Calls through a `fun` value are reported rather than omitted: the call exists
+    and the target does not, and the item says which by its kind and its detail.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-callhier-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}},
+            )["result"]["capabilities"]
+            require(capabilities.get("callHierarchyProvider") is True,
+                    f"call hierarchy is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+
+            def prepare(within: str, needle: str) -> Any:
+                return session.request(
+                    "textDocument/prepareCallHierarchy",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": nav_position(text, within, needle)},
+                )["result"]
+
+            def one_item(within: str, needle: str) -> dict[str, Any]:
+                result = prepare(within, needle)
+                require(isinstance(result, list) and len(result) == 1,
+                        f"prepare on {needle!r} is not a single item: {result!r}")
+                return result[0]
+
+            def calls(item: dict[str, Any], which: str) -> list[dict[str, Any]]:
+                result = session.request(
+                    f"callHierarchy/{which}Calls", {"item": item},
+                )["result"]
+                require(isinstance(result, list),
+                        f"{which}Calls is not a list: {result!r}")
+                return result
+
+            # prepare answers with the declaration, which is in the other module
+            helper = one_item("ret helper(n) + helper(n + 1);", "helper")
+            require(helper["name"] == "helper" and helper["kind"] == 12,
+                    f"prepare named the wrong thing: {helper!r}")
+            require(helper["uri"] == defs.as_uri(),
+                    f"prepare did not land in the declaring module: {helper!r}")
+            require(helper["selectionRange"] == nav_range(NAV_DEFS, "helper"),
+                    f"prepare selected the wrong span: {helper!r}")
+
+            # incoming finds the caller in the other module - the item names
+            # `defs.mach`, which this session never opened
+            incoming = calls(helper, "incoming")
+            callers = sorted((entry["from"]["name"], entry["from"]["uri"].rsplit("/", 1)[-1],
+                              len(entry["fromRanges"])) for entry in incoming)
+            require(callers == [("elsewhere", "other.mach", 1), ("local", "main.mach", 2)],
+                    f"incoming did not find both callers: {incoming!r}")
+            local_call = next(e for e in incoming if e["from"]["name"] == "local")
+            require(local_call["from"]["uri"] == main.as_uri(),
+                    f"incoming named the wrong file: {local_call!r}")
+            require(local_call["fromRanges"]
+                    == nav_ranges(text, "ret helper(n) + helper(n + 1);", "helper"),
+                    f"incoming ranges are not the two call sites: {local_call!r}")
+            other_call = next(e for e in incoming if e["from"]["name"] == "elsewhere")
+            require(other_call["fromRanges"] == nav_ranges(NAV_OTHER, "ret helper(n);", "helper"),
+                    f"a caller in a third module indexed the wrong file: {other_call!r}")
+
+            # outgoing is the mirror, and its ranges index the caller's file
+            local = one_item("pub fun local(n: i32) i32 {", "local")
+            outgoing = calls(local, "outgoing")
+            require(len(outgoing) == 1,
+                    f"outgoing did not find exactly one callee: {outgoing!r}")
+            require(outgoing[0]["to"]["uri"] == defs.as_uri()
+                    and outgoing[0]["to"]["selectionRange"] == nav_range(NAV_DEFS, "helper"),
+                    f"outgoing named the wrong callee: {outgoing[0]!r}")
+            require(outgoing[0]["fromRanges"]
+                    == nav_ranges(text, "ret helper(n) + helper(n + 1);", "helper"),
+                    f"outgoing ranges do not index the caller's file: {outgoing[0]!r}")
+
+            # two calls to the same function are one entry with two ranges, and
+            # distinct callees are distinct entries
+            entries = calls(one_item("pub fun main() i32 {", "main"), "outgoing")
+            require([e["to"]["name"] for e in entries] == ["make", "local", "indirect"],
+                    f"outgoing did not list every callee once: {entries!r}")
+
+            # a call through a `fun` value is reported, and says what it is: a
+            # parameter of function type, and a function held in a record field,
+            # which resolves to no symbol at all
+            through = calls(one_item("pub fun indirect(f: Handler, t: Table) i32 {",
+                                     "indirect"), "outgoing")
+            require([e["to"]["name"] for e in through] == ["f", "fn"],
+                    f"a call through a fun value was dropped: {through!r}")
+            for entry in through:
+                require(entry["to"]["kind"] == 13,
+                        f"an indirect call is not reported as a value: {entry!r}")
+                require("not statically known" in entry["to"].get("detail", ""),
+                        f"an indirect call does not say its target is unknown: {entry!r}")
+            require(through[1]["to"]["uri"] == main.as_uri()
+                    and through[1]["to"]["selectionRange"]
+                    == nav_ranges(text, "ret f(1) + t.fn(2);", "fn")[0],
+                    f"an unresolved callee is not anchored on its call: {through[1]!r}")
+            require(through[0]["fromRanges"] == nav_ranges(text, "ret f(1) + t.fn(2);", "f")[:1],
+                    f"an indirect fromRange is not the call site: {through[0]!r}")
+            require(through[1]["fromRanges"] == nav_ranges(text, "ret f(1) + t.fn(2);", "fn"),
+                    f"an unresolved fromRange is not the call site: {through[1]!r}")
+
+            # only a function anchors a hierarchy: a value that holds one is not
+            # one, and its incoming calls would be a runtime fact
+            for within, needle in (("var b: Box;", "b"),
+                                   ("var b: Box;", "Box"),
+                                   ("pub def Handler: fun(i32) i32;", "Handler")):
+                require(prepare(within, needle) is None,
+                        f"prepare minted an item for {needle!r}, which is not a function")
+
+            # an item this server did not mint is answered, not left hanging
+            bogus = {"name": "nowhere", "kind": 12, "uri": main.as_uri(),
+                     "range": nav_range(text, "pub fun main() i32 {"),
+                     "selectionRange": {"start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 0}}}
+            require(calls(bogus, "incoming") == [],
+                    "an unresolvable item did not answer empty")
+            require(calls(bogus, "outgoing") == [],
+                    "an unresolvable item did not answer empty")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+    run_call_hierarchy_standalone(server, timeout)
+
+
+def run_call_hierarchy_standalone(server: Path, timeout: float) -> None:
+    """A buffer belonging to no project still has callers: its own.
+
+    There is no module array to walk here, and answering nothing would be the
+    easy reading of "no project". The buffer is the whole world, so it is the
+    whole walk - the same fallback `build_refs` makes for references.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-callhier-lone-") as directory:
+        root = Path(directory).resolve()
+        lone = root / "lone.mach"
+        lone.write_text(LONE_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": lone.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": LONE_BUFFER}},
+            )
+            session.diagnostics(lone.as_uri(), 1)
+
+            item = session.request(
+                "textDocument/prepareCallHierarchy",
+                {"textDocument": {"uri": lone.as_uri()},
+                 "position": nav_position(LONE_BUFFER, "pub fun leaf(n: i32) i32 {", "leaf")},
+            )["result"]
+            require(isinstance(item, list) and len(item) == 1,
+                    f"prepare failed on a project-less buffer: {item!r}")
+
+            incoming = session.request(
+                "callHierarchy/incomingCalls", {"item": item[0]},
+            )["result"]
+            require(len(incoming) == 1 and incoming[0]["from"]["name"] == "trunk",
+                    f"a project-less buffer reported no callers: {incoming!r}")
+            require(incoming[0]["fromRanges"]
+                    == nav_ranges(LONE_BUFFER, "ret leaf(n) + leaf(n + 1);", "leaf"),
+                    f"the caller's ranges are wrong: {incoming[0]!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_type_definition(server: Path, timeout: float) -> None:
+    """typeDefinition lands on the declaration of an expression's type.
+
+    Distinct from definition, which lands on the declaration of the name itself.
+    The cases that matter are the ones a record-only back-link would get wrong: a
+    `tag` names the type of every `opt` and `res` in the language, and a callee's
+    own type is a function type, so a pivot that commits to the tightest typed
+    node answers null exactly where a user puts the cursor.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-typedef-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}},
+            )["result"]["capabilities"]
+            require(capabilities.get("typeDefinitionProvider") is True,
+                    f"typeDefinition is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+
+            def type_definition(within: str, needle: str) -> Any:
+                return session.request(
+                    "textDocument/typeDefinition",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": nav_position(text, within, needle)},
+                )["result"]
+
+            def lands_on(within: str, needle: str, name: str) -> None:
+                result = type_definition(within, needle)
+                require(isinstance(result, dict),
+                        f"typeDefinition on {needle!r} is not a Location: {result!r}")
+                require(result.get("uri") == defs.as_uri(),
+                        f"typeDefinition on {needle!r} left the declaring module: {result!r}")
+                require(result.get("range") == nav_range(NAV_DEFS, name),
+                        f"typeDefinition on {needle!r} is not {name!r}: {result!r}")
+
+            # a value lands on its type's declaration, in the other module
+            lands_on("var b: Box;", "b", "Box")
+            # a written type does too, from the annotation itself
+            lands_on("var b: Box;", "Box", "Box")
+            # a field access lands on the record declaring the field's type
+            lands_on("b.v + b.inner.w", "inner", "Inner")
+            # a call reaches its return type, not the callee's function type. in
+            # `ret make();` no enclosing binding can stand in for it, so this is
+            # the position that proves the call itself is consulted
+            lands_on("ret make();", "make", "Color")
+            lands_on("val c: Color = make();", "make", "Color")
+            # and a tag is a type like any other
+            lands_on("val c: Color = make();", "Color", "Color")
+            # a parameter is no decl of its own, and its pointer is peeled
+            lands_on("measure(p: *Box)", "(p", "Box")
+            lands_on("ret p.v;", "p", "Box")
+
+            # a type with no nominal site has nowhere to go
+            for within, needle in (("val n: i32   = b.v", "b.v"),
+                                   ("val n: i32   = b.v", "v"),
+                                   ("ret local(n)", "n"),
+                                   ("local(n: i32)", "(n")):
+                result = type_definition(within, needle)
+                require(result is None,
+                        f"typeDefinition on the primitive {needle!r} answered {result!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+KIND_BUFFER = """pub rec R { v: i32; }
+pub uni U { a: i32; b: f32; }
+pub tag T: u8 { one; two: i32; }
+pub def D: fun(i32) i32;
+pub val V: i32 = 1;
+pub var W: i32 = 2;
+
+pub fun f(n: i32) i32 {
+    ret n;
+}
+"""
+
+
+def run_document_symbol_kinds(server: Path, timeout: float) -> None:
+    """One SymbolKind table, shared by every feature that names a declaration.
+
+    documentSymbol and the call hierarchy both report declarations, and each had
+    its own copy of the mapping. They disagreed: a `tag` was SymbolKind.Variable
+    on one side, which is what a copy drifts into. `render.symbol_kind` is the one
+    spelling, and this pins what it says.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-dsymkind-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "kinds.mach"
+        buffer.write_text(KIND_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": KIND_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            symbols = session.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            require(isinstance(symbols, list) and symbols,
+                    f"documentSymbol returned nothing: {symbols!r}")
+            kinds = {entry["name"]: entry["kind"] for entry in symbols}
+            expected = {"R": 23, "U": 10, "D": 26, "V": 14, "W": 13, "f": 12}
+            for name, kind in expected.items():
+                require(kinds.get(name) == kind,
+                        f"{name} is SymbolKind {kinds.get(name)!r}, expected {kind}")
+
+            # `tag` has no arm in `features.decl_name_span`, so it never reaches
+            # the outline at all - #249. Asserted rather than described: fixing
+            # that issue turns this red, which is the prompt to add "T": 10 above.
+            require("T" not in kinds,
+                    "a tag now reaches documentSymbol - #249 is fixed, so assert its kind")
 
             session.finish()
             finished = True
@@ -1044,10 +2208,10 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
             manifest_text = manifest.read_text(encoding="utf-8")
             manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
             time.sleep(0.4)
-            started = time.monotonic()
+            started = time.perf_counter()
             broken = session.request(
                 "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
-            require(time.monotonic() - started < 1.0,
+            require(time.perf_counter() - started < 1.0,
                     "documentSymbol blocked on project analysis")
             require(isinstance(broken.get("result"), list) and broken["result"],
                     f"documentSymbol needed a loaded project: {broken!r}")
@@ -1058,6 +2222,228 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
         finally:
             if not finished:
                 session.abort()
+
+
+class SyntaxOnlyFeature(NamedTuple):
+    """One request answered from a PHASE_PARSE analysis of the open buffer alone."""
+
+    name: str
+    method: str
+    params: Callable[[str, str], dict[str, Any]]
+    valid: Callable[[Any], bool]
+
+
+# every handler that reaches `analysis.standalone` at `editor.PHASE_PARSE`, which
+# today is `document_symbol` by way of `analysis.syntax_tree`. a syntax-only
+# handler answers from the buffer and must never touch the project, so each one
+# is held to the same latency contract; #221 foldingRange and #222 selectionRange
+# join the table when they land.
+SYNTAX_ONLY_FEATURES = (
+    SyntaxOnlyFeature(
+        name="documentSymbol",
+        method="textDocument/documentSymbol",
+        params=lambda uri, text: {"textDocument": {"uri": uri}},
+        valid=lambda result: isinstance(result, list) and bool(result),
+    ),
+)
+
+# the first requests against a healthy project pay a one-time cold project load,
+# so the contract is about steady state and these samples are discarded
+SYNTAX_ONLY_WARMUP = 2
+# odd, so the median is a sample rather than a mean of two
+SYNTAX_ONLY_SAMPLES = 9
+# healthy-project median over standalone median. measured in the same process on
+# the same machine, so machine load cancels: over seven runs each way the
+# absolute medians moved by 5x while the ratio stayed inside 2.77-5.41x against
+# mach v5.0.4 and 0.53-1.20x against v5.1.0. 2.0 separates them.
+SYNTAX_ONLY_RATIO = 2.0
+# under a few milliseconds both paths are dominated by framing rather than by
+# analysis and a ratio means nothing. a project reload never measured below
+# 6.6ms, so this cannot mask one.
+SYNTAX_ONLY_FLOOR = 0.003
+# the manifest fingerprint fallback coalesces to at most one scan per 250 ms per
+# root, so a request inside that window still sees the previous state
+FINGERPRINT_WINDOW = 0.4
+# a reload costs what the project's dependencies cost to load, so a fixture with
+# no dependencies cannot show one: a dependency-free project reloaded in under
+# 3ms even while broken, and the regression was invisible against it. these are
+# the std modules the fixture imports, aliased because several share a leaf name.
+SYNTAX_ONLY_STD_MODULES = (
+    "std.allocator", "std.allocator.arena", "std.allocator.bump", "std.allocator.fixed",
+    "std.allocator.heap", "std.allocator.page", "std.chrono.date", "std.chrono.duration",
+    "std.chrono.format", "std.chrono.time", "std.collections.bitset", "std.collections.deque",
+    "std.collections.heap", "std.collections.map", "std.collections.set",
+    "std.collections.slice", "std.collections.sort", "std.collections.vector",
+    "std.compress.gzip", "std.compress.inflate", "std.compress.zlib", "std.crypto.ct",
+    "std.crypto.hash.crc32", "std.crypto.hash.sha256", "std.crypto.hash.sha512",
+    "std.crypto.hash.keccak", "std.crypto.rand", "std.data.json", "std.data.toml",
+    "std.encoding.base64", "std.encoding.binary", "std.encoding.hex", "std.filesystem",
+    "std.format", "std.input", "std.io.file", "std.io.reader", "std.io.writer",
+    "std.log", "std.math", "std.math.bignum", "std.math.bits", "std.math.float",
+    "std.math.mat4", "std.math.quat", "std.memory", "std.net.dns", "std.net.ip",
+)
+
+
+def write_std_backed_project(parent: Path) -> tuple[Path, str]:
+    """Create an app whose vendored dependency is this repo's own `dep/std`.
+
+    A reload's cost is its dependencies', so the project has to carry a real one
+    for the reload to be visible at all. `dep/std` is already on disk in any tree
+    that could have built the server under test.
+    """
+    source = Path(__file__).resolve().parents[1] / "dep" / "std"
+    require((source / "mach.toml").is_file(),
+            f"the std dependency is not realized: {source} (run `mach dep pull .`)")
+    root = parent / "stdapp"
+    (root / "src").mkdir(parents=True)
+    shutil.copytree(source, root / "dep" / "std",
+                    ignore=shutil.ignore_patterns(".git", "out", "dep"))
+    (root / "mach.toml").write_text(
+        """[project]
+id = "stdapp"
+version = "0.1.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+
+[dep.std]
+path = "dep/std"
+""",
+        encoding="utf-8",
+    )
+    uses = "".join(f"use m{i}: {module};\n"
+                   for i, module in enumerate(SYNTAX_ONLY_STD_MODULES))
+    text = f"{uses}\npub fun main() i32 {{\n    ret 0;\n}}\n"
+    main = root / "src" / "main.mach"
+    main.write_text(text, encoding="utf-8")
+    return main, text
+
+
+def ratio_text(healthy: float, standalone: float) -> str:
+    """Format a latency ratio, or say so when the baseline is too small to divide."""
+    if standalone <= 0.0:
+        return "unmeasurable baseline"
+    return f"{healthy / standalone:.2f}x"
+
+
+def syntax_only_median(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
+                       text: str, label: str, samples: int) -> tuple[float, Any]:
+    """Median latency over `samples` identical requests, with the last reply.
+
+    perf_counter, not monotonic: monotonic ticks about every 15.6ms on Windows,
+    which reads a millisecond-scale request as zero elapsed.
+    """
+    durations: list[float] = []
+    result: Any = None
+    for _ in range(samples):
+        started = time.perf_counter()
+        response = session.request(feature.method, feature.params(uri, text))
+        durations.append(time.perf_counter() - started)
+        result = response.get("result")
+        require(feature.valid(result),
+                f"{feature.name} answered nothing usable {label}: {response!r}")
+    durations.sort()
+    return durations[len(durations) // 2], result
+
+
+def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, float, float]]:
+    """A syntax-only request must not reload the project through the editor session.
+
+    Until mach#3431, `editor.analyze` tore the project down on every call, so a
+    request needing nothing but a parse of the open buffer paid a full project
+    reload: against this repo, 1586.9ms healthy versus 34.8ms under a manifest
+    that cannot load, a 45.6x gap that shipped in 0.18.0 unnoticed. The only
+    latency assertion documentSymbol had broke the manifest first, so it measured
+    the one path that was never slow.
+
+    Two things make this able to fail where that one could not. The project
+    carries a real dependency, because a reload costs what its dependencies cost
+    and a dependency-free fixture shows nothing. And the bound is a ratio against
+    the standalone path measured in the same run rather than a wall-clock
+    threshold, so it neither flakes under machine load nor passes because the
+    machine was fast.
+    """
+    require(SYNTAX_ONLY_FEATURES, "no syntax-only feature is under a latency assertion")
+    measured: list[tuple[str, float, float]] = []
+    with tempfile.TemporaryDirectory(prefix="mls-synlat-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_std_backed_project(root)
+        manifest = main.parents[1] / "mach.toml"
+        manifest_text = manifest.read_text(encoding="utf-8")
+        uri = main.as_uri()
+        session = LspSession(server, main.parents[1], timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": main.parents[1].as_uri(),
+                                           "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": uri, "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            # the fixture must load cleanly, or "healthy" is not healthy and the
+            # comparison is between two standalone paths
+            assert_diagnostics(session.diagnostics(uri, 1), False, 1)
+
+            for feature in SYNTAX_ONLY_FEATURES:
+                syntax_only_median(session, feature, uri, text,
+                                   "warming the project load", SYNTAX_ONLY_WARMUP)
+                healthy, healthy_result = syntax_only_median(
+                    session, feature, uri, text,
+                    "against a healthy project", SYNTAX_ONLY_SAMPLES)
+
+                manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+                time.sleep(FINGERPRINT_WINDOW)
+                try:
+                    standalone, standalone_result = syntax_only_median(
+                        session, feature, uri, text,
+                        "under a broken manifest", SYNTAX_ONLY_SAMPLES)
+                finally:
+                    manifest.write_text(manifest_text, encoding="utf-8")
+                    time.sleep(FINGERPRINT_WINDOW)
+
+                # a syntax-only answer is a function of the buffer, so losing the
+                # project must not change it. without this the ratio could be met
+                # by answering less.
+                require(healthy_result == standalone_result,
+                        f"{feature.name} answered differently once the project was lost")
+
+                allowed = max(standalone * SYNTAX_ONLY_RATIO, SYNTAX_ONLY_FLOOR)
+                # require's message is built whether or not it fails, so the
+                # ratio cannot be divided here unguarded
+                require(healthy <= allowed,
+                        f"{feature.name} reloads the project on a healthy root: "
+                        f"{healthy * 1000:.1f}ms healthy vs {standalone * 1000:.1f}ms "
+                        f"standalone ({ratio_text(healthy, standalone)}, allowed "
+                        f"{allowed * 1000:.1f}ms)")
+                measured.append((feature.name, healthy, standalone))
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+    return measured
 
 
 def run_completion_context(server: Path, timeout: float) -> None:
@@ -1099,13 +2485,20 @@ def run_completion_context(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
                 )
                 session.diagnostics(main.as_uri(), version[0])
-                response = session.request(
-                    "textDocument/completion",
+                # this case is about what PROJECT-backed completion offers, so it
+                # waits for the rebuild the edit scheduled. `isIncomplete` is the
+                # server's own word for which analysis answered, so it is both
+                # the thing waited on and the thing asserted - without it this
+                # would silently grade the isolated editor result instead.
+                result = settled_result(
+                    session, "textDocument/completion",
                     {"textDocument": {"uri": main.as_uri()},
                      "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
-                )
-                result = response.get("result")
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                    f"project-backed completion for {probe!r}")
                 require(isinstance(result, dict), f"completion is not a list: {result!r}")
+                require(result.get("isIncomplete") is False,
+                        f"completion answered from isolated analysis: {result!r}")
                 items = result.get("items")
                 require(isinstance(items, list), f"completion has no items: {result!r}")
                 for item in items:
@@ -1213,11 +2606,12 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
                     f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
 
             session.diagnostics(main.as_uri(), version)
-            rebuilt = session.request(
-                "textDocument/completion",
+            rebuilt = settled_result(
+                session, "textDocument/completion",
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": stale_line, "character": len("    current.")}},
-            ).get("result")
+                lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                "completion after the deferred rebuild")
             require(isinstance(rebuilt, dict) and rebuilt.get("isIncomplete") is False,
                     f"completion stayed isolated after the deferred rebuild: {rebuilt!r}")
             rebuilt_labels = [item.get("label") for item in rebuilt.get("items", [])]
@@ -1320,9 +2714,9 @@ def run_workspace_symbol(server: Path, timeout: float) -> None:
                 return items
 
             # nothing is loaded yet: a query must answer, not block on a build
-            started = time.monotonic()
+            started = time.perf_counter()
             require(query("answer") == [], "an unloaded workspace returned symbols")
-            require(time.monotonic() - started < 2.0,
+            require(time.perf_counter() - started < 2.0,
                     "workspace/symbol forced a cold project load")
 
             session.notify(
@@ -1381,7 +2775,7 @@ def run_signature_help(server: Path, timeout: float) -> None:
             anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
             version = [1]
 
-            def help_at(probe: str) -> dict[str, Any] | None:
+            def help_at(probe: str, want: Callable[[Any], bool] | None = None) -> dict[str, Any] | None:
                 edited = list(lines)
                 edited.insert(anchor_line + 1, "    " + probe)
                 version[0] += 1
@@ -1391,12 +2785,12 @@ def run_signature_help(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
                 )
                 session.diagnostics(main.as_uri(), version[0])
-                response = session.request(
-                    "textDocument/signatureHelp",
+                settled = want or (lambda r: isinstance(r, dict) and r.get("signatures"))
+                return settled_result(
+                    session, "textDocument/signatureHelp",
                     {"textDocument": {"uri": main.as_uri()},
                      "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
-                )
-                return response.get("result")
+                    settled, f"signatureHelp for {probe!r}")
 
             # the argument list is unclosed at every one of these positions
             opened = help_at("take[i32](")
@@ -1420,9 +2814,9 @@ def run_signature_help(server: Path, timeout: float) -> None:
             require(quoted, "a paren inside a string broke the enclosing call")
 
             # a cursor outside any call, and a callee that resolves to nothing
-            require(help_at("val zz: i64 = 1;") is None,
+            require(help_at("val zz: i64 = 1;", lambda r: r is None) is None,
                     "signatureHelp answered outside a call")
-            require(help_at("no_such_function(") is None,
+            require(help_at("no_such_function(", lambda r: r is None) is None,
                     "signatureHelp answered for an unresolvable callee")
 
             session.finish()
@@ -2129,6 +3523,70 @@ def run_hover_presentation(server: Path, timeout: float) -> None:
                 s.abort()
 
 
+def run_failed_rebuild_keeps_serving(server: Path, timeout: float) -> None:
+    """A rebuild that fails must leave the previous snapshot answering.
+
+    The case that matters is a SIBLING buffer moving. The failed attempt is
+    recorded against the root while the snapshot revision is not, so a root-wide
+    staleness test would call the root stale forever with nothing left to
+    schedule - every cross-module feature dead until some unrelated edit
+    happened to succeed. The buffer being asked about never moved, and the last
+    good snapshot still describes it exactly.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-failed-rebuild-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "keep", 13)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            defs_text = defs.read_text(encoding="utf-8")
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": defs_text}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            assert_definition(session, main, defs, text)
+
+            manifest = main.parents[1] / "mach.toml"
+            original = manifest.read_text(encoding="utf-8")
+            manifest.write_text(original + "\n[broken\n", encoding="utf-8")
+            # past the 250 ms fingerprint-scan window, or nothing rescans
+            time.sleep(0.4)
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": defs.as_uri(), "version": 2},
+                 "contentChanges": [{"text": defs_text + "\npub val extra: i32 = 1;\n"}]},
+            )
+            session.diagnostics(defs.as_uri(), 2)
+            warning = session.wait_for(
+                lambda item: (item.get("method") == "window/showMessage"
+                              and isinstance(item.get("params"), dict)
+                              and "failed to load project"
+                              in str(item["params"].get("message", ""))),
+                "failed rebuild warning",
+            )
+            require(warning["params"].get("type") == 2,
+                    f"load failure was not reported as a warning: {warning!r}")
+
+            assert_definition(session, main, defs, text)
+
+            manifest.write_text(original, encoding="utf-8")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -2160,34 +3618,55 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
             assert_definition(session, main, defs, text)
 
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
+            character = lines[line].index("watched") + 1
+
+            def poke() -> None:
+                """Trigger the fingerprint scan that notices the on-disk change.
+
+                The scan runs inside a request and only schedules the rebuild, so
+                one request schedules and a later one observes. Sleeping past the
+                250 ms scan window is what makes the scan happen at all; the
+                polling assertions that follow are what make the result visible.
+                """
+                session.request(
+                    "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": character}},
+                )
+
             # the edit must keep the project compiling: mach 5.0 releases a
             # project whose sema phase is rejected (briar-systems/mach#3337)
             changed = defs.read_text(encoding="utf-8").replace(
                 "pub val watched: i32 = 9;", "pub val watched: i32 = 99;")
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
-            lines = text.splitlines()
-            line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
-            hover = session.request(
-                "textDocument/hover",
+            poke()
+            hover = settled_result(
+                session, "textDocument/hover",
                 {"textDocument": {"uri": main.as_uri()},
-                 "position": {"line": line, "character": lines[line].index("watched") + 1}},
-            )
-            require("watched: i32 = 99" in json.dumps(hover.get("result")),
+                 "position": {"line": line, "character": character}},
+                lambda r: "watched: i32 = 99" in json.dumps(r),
+                "hover reflecting the on-disk change")
+            require("watched: i32 = 99" in json.dumps(hover),
                     f"active watcher suppressed source fingerprint fallback: {hover!r}")
 
             broken = changed + "use watch.missing.nope;\n"
             defs.write_text(broken, encoding="utf-8")
             time.sleep(0.3)
-            failed = session.request(
-                "textDocument/definition",
+            poke()
+            failed = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": main.as_uri()},
-                 "position": {"line": line, "character": lines[line].index("watched") + 1}},
-            )
-            require(failed.get("result") is None,
+                 "position": {"line": line, "character": character}},
+                lambda r: r is None, "broken on-disk source stops resolving")
+            require(failed is None,
                     f"broken on-disk source retained a stale snapshot: {failed!r}")
+
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
+            poke()
             repaired = definition(session, main, text, "watched")
             require(repaired.get("uri") == defs.as_uri(),
                     f"failed root did not retry after disk source repair: {repaired!r}")
@@ -2936,10 +4415,23 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        run_version(server, args.timeout)
+        run_rebuild_concurrency(server, args.timeout)
+        run_stale_hover(server, args.timeout)
+        run_stale_strict_requests(server, args.timeout)
+        run_stale_held_release(server, args.timeout)
+        run_stale_refresh(server, args.timeout)
+        run_stale_diagnostics(server, args.timeout)
+        run_disk_change_during_build(server, args.timeout)
+        run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
+        run_document_symbol_kinds(server, args.timeout)
+        run_type_definition(server, args.timeout)
+        run_call_hierarchy(server, args.timeout)
+        syntax_only = run_syntax_only_latency(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
         run_document_highlight(server, args.timeout)
@@ -2969,8 +4461,15 @@ def main() -> int:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print("  a request is answered while a project rebuild is still running")
+    print("  a burst of edits during a build coalesces into one follow-up build")
+    print("  a failed rebuild leaves the previous snapshot answering")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
+    print("  one SymbolKind table: every feature that names a declaration agrees")
+    print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
+    print("  call hierarchy resolves items across modules, and reports calls through fun values")
+    print("  a syntax-only request answers from the buffer without reloading the project")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")
     print("  documentHighlight classifies reads and writes in the active file")
@@ -2993,6 +4492,9 @@ def main() -> int:
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
+    for name, healthy, standalone in syntax_only:
+        print(f"  {name} steady state: {healthy * 1000:.1f}ms healthy, "
+              f"{standalone * 1000:.1f}ms standalone ({healthy / standalone:.2f}x)")
     for label, duration in timings:
         print(f"  {label}: {duration:.3f}s")
     return 0

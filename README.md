@@ -50,6 +50,21 @@ under canonical and manifest-raw POSIX spellings (including `src = "./src"`).
 Portable Windows/UNC canonicalization is tracked by #157, mach#2998, and
 mach-std#472.
 
+While a root rebuilds, the edited buffer is still answered from the snapshot
+it has, read through the edits since that snapshot (#251). `textdiff` compares
+the snapshot's text with the buffer line by line and narrows each difference to
+its bytes. Every position going out is carried across those windows, and a
+position touching one answers nothing rather than a place the client no longer
+has. Hover, definition, typeDefinition, highlight, signature help, inlay hints,
+semantic tokens and the call hierarchy answer this way, and clients that
+support it are asked to refresh tokens and hints once the rebuild lands.
+References, rename, prepareRename and code actions must not answer from earlier
+text, so they are held until a snapshot covers every buffer of their root, and
+answered then. A cancel answers a held request at once, and closing its document
+answers it with ContentModified. Diagnostics show the buffer's own syntax errors
+when it has any, and otherwise the snapshot's semantic diagnostics that avoid
+the edits.
+
 Cross-module references and rename walk the retained graph. Rename is restricted
 to project-owned declarations, so vendored dependency sources remain read-only.
 Completion is currently a flat list of module names, import aliases, and primitive
@@ -74,11 +89,39 @@ The server binary is produced at `out/linux-x86_64/debug/bin/mls`.
 
 ## Installing
 
-Copy the built binary onto your `PATH`:
+Each release carries a prebuilt server for every supported platform. Download
+the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
+your `PATH`:
+
+```sh
+v=0.19.0 t=x86_64-linux
+curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
+curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf mls-$v-$t.tar.gz mls && install -Dm755 mls ~/.local/bin/mls
+mls --version
+```
+
+Or build it yourself and copy that binary instead:
 
 ```sh
 install -Dm755 out/linux-x86_64/debug/bin/mls ~/.local/bin/mls
 ```
+
+### Release assets
+
+The names are a contract: editor extensions download by them.
+
+| asset | contents |
+| --- | --- |
+| `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
+| `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
+| `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
+
+`<version>` has no leading `v`. `mls --version` prints `mls <version>`, and
+`initialize` reports the same value as `serverInfo.version`. Every shipped
+platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
+target without a native runner and is not shipped.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
@@ -110,8 +153,8 @@ aware that the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.0.2`
-and `v2.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.2.1`
+and `v3.2.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 `dep/` are the pins; there is no lockfile.
 
 ## Architecture
@@ -125,7 +168,9 @@ and `v2.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 | `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
 | `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback |
-| `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point |
+| `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point, including across a stale snapshot's edits |
+| `textdiff` | the windows where a snapshot's text and the client's buffer differ |
+| `parked` | requests held until their root's snapshot catches up |
 | `features` | offset → id → symbol query core over the resolve side tables |
 | `project` | stable per-root compiler Sessions and retained Project snapshots, overlays, routing, fingerprints, module views, and invalidation |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |

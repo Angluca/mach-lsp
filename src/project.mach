@@ -10,6 +10,15 @@
 # ModuleId, FileId, interner, type, and query identities never cross Root
 # boundaries. Documents inside an already-loaded ancestor dependency graph route
 # to that graph; otherwise the nearest manifest owns them.
+#
+# A root that already has a snapshot rebuilds off the analysis thread. The
+# incoming snapshot is built into a SECOND Session, from a BuildInput captured
+# on the analysis thread, so the two never share mutable state and the old
+# snapshot keeps answering every request until the new one is swapped in. The
+# swap happens in `pump`, between messages, which is what makes it safe: every
+# request runs to completion on the analysis thread, so no borrowed pointer into
+# a Session outlives the message that took it. A root with no snapshot at all
+# has nothing to serve, so its FIRST build still runs inline.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -52,10 +61,12 @@ use src:  mach.lang.source;
 use mach.lang.type;
 use std.collections.vector;
 
+use mls.build;
 use mls.documents;
 use mls.json;
 use mls.positions;
 use mls.progress;
+use mls.textdiff;
 use mls.trace;
 use mls.transport;
 use mtypes: mls.types;
@@ -109,12 +120,21 @@ rec SourceFingerprint {
 # man_mtime:         last observed manifest mtime
 # lock_mtime:        last observed lockfile mtime
 # vendored:          whether the root belongs to an ancestor dependency tree
-# s:                 separately allocated stable Session owning all identities
+# s:                 serving Session, owning every identity `p` refers to
+# spare:             the idle Session the next build runs into
+# spare_p:           a dead Project still held by `spare`, released by that build
+# spare_has_p:       whether spare_p is live
 # input_revision:    newest covered document revision mirrored into s
 # snapshot_revision: input revision captured by p
 # attempted_revision:last input revision analyzed, including a failed attempt
 # dirty:             explicit watcher/save invalidation requiring one attempt
 # last_disk_scan_ns: last fallback fingerprint scan time
+# wins:              per module, where the snapshot's text differs from the open
+#                    buffer holding that module; valid for `wins_rev`, released
+#                    whenever the snapshot is replaced
+# wins_rev:          per module, the document revision `wins` was computed for,
+#                    0 when none
+# wins_len:          length of `wins` and `wins_rev`
 pub rec Root {
     path:               str;
     loaded:             bool;
@@ -127,30 +147,43 @@ pub rec Root {
     lock_mtime:         i64;
     vendored:           bool;
     s:                  *sess.Session;
+    spare:              *sess.Session;
+    spare_p:            driver.Project;
+    spare_has_p:        bool;
     input_revision:     u64;
     snapshot_revision:  u64;
     attempted_revision: u64;
     dirty:              bool;
     last_disk_scan_ns:  i64;
+    wins:               *textdiff.Windows;
+    wins_rev:           *u64;
+    wins_len:           u32;
 }
 
 # project roots and the standalone-editor fallback
 # ---
-# s:          fallback Session for documents outside projects
-# alloc:      workspace allocator
-# roots:      movable Root slots; each Root.s itself has a stable allocation
-# root_cap:   roots allocation length
-# load_epoch: successful snapshot build counter
-# sema_epoch: semantic snapshot build counter
-# docs:       borrowed live document store
+# s:             fallback Session for documents outside projects
+# alloc:         workspace allocator
+# roots:         movable Root slots; each Root.s itself has a stable allocation
+# root_cap:      roots allocation length
+# load_epoch:    successful snapshot build counter
+# sema_epoch:    semantic snapshot build counter
+# docs:          borrowed live document store
+# builder:       the worker rebuilds run on, one build at a time
+# building:      a build is in flight or finished and uncollected
+# building_root: index of the root being built; Root slots move, so the build
+#                is tied to an index rather than a pointer
 pub rec Workspace {
-    s:          *sess.Session;
-    alloc:      *Allocator;
-    roots:      *Root;
-    root_cap:   u32;
-    load_epoch: u32;
-    sema_epoch: u32;
-    docs:       *documents.Store;
+    s:             *sess.Session;
+    alloc:         *Allocator;
+    roots:         *Root;
+    root_cap:      u32;
+    load_epoch:    u32;
+    sema_epoch:    u32;
+    docs:          *documents.Store;
+    builder:       build.Builder;
+    building:      bool;
+    building_root: u32;
 }
 
 # construct an empty workspace over the server's sessions
@@ -160,13 +193,16 @@ pub rec Workspace {
 # ret:   an empty, rootless Workspace
 pub fun init(s: *sess.Session, alloc: *Allocator) Workspace {
     var w: Workspace;
-    w.s          = s;
-    w.alloc      = alloc;
-    w.roots      = nil;
-    w.root_cap   = 0;
-    w.load_epoch = 0;
-    w.sema_epoch = 0;
-    w.docs       = nil;
+    w.s             = s;
+    w.alloc         = alloc;
+    w.roots         = nil;
+    w.root_cap      = 0;
+    w.load_epoch    = 0;
+    w.sema_epoch    = 0;
+    w.docs          = nil;
+    w.building      = false;
+    w.building_root = 0;
+    build.init(?w.builder, run_build, nil, nil);
     ret w;
 }
 
@@ -177,6 +213,22 @@ pub fun init(s: *sess.Session, alloc: *Allocator) Workspace {
 # docs: borrowed live document store
 pub fun attach_documents(w: *Workspace, docs: *documents.Store) {
     w.docs = docs;
+}
+
+# start the build worker and say how it should wake the analysis thread
+#
+# `wake` runs ON the build worker and must do nothing but wake: the analysis
+# thread is what looks at the result, in `pump`. Without a start the workspace
+# still works - `schedule_build` is refused and every build runs inline - so a
+# worker that cannot spawn degrades to the old behaviour rather than failing.
+# ---
+# w:    the workspace
+# wake: called on the worker once a build finishes
+# ctx:  opaque context handed to `wake`
+# ret:  true when the worker started
+pub fun start_builder(w: *Workspace, wake: build.WakeFn, ctx: ptr) bool {
+    build.init(?w.builder, run_build, wake, ctx);
+    ret build.start(?w.builder);
 }
 
 # the governing root's type interner, or the standalone fallback when root is nil
@@ -220,6 +272,9 @@ pub fun sema_epoch(w: *Workspace) u32 {
 # ---
 # w: workspace to tear down; all owned fields are zeroed
 pub fun dnit(w: *Workspace) {
+    # the worker owns memory this is about to release, so it stops first
+    val stranded: ptr = build.dnit(?w.builder);
+    if (stranded != nil) { free_build_output(stranded::*BuildOutput); }
     if (w.roots != nil) {
         var i: u32 = 0;
         for (i < w.root_cap) {
@@ -493,26 +548,44 @@ fun containing_root_loaded(w: *Workspace, uri: str) *Root {
 # speculative loads) gets it correct, and it survives in-place reloads (which keep
 # the slot). on failure the slot is kept as a remembered failed load and nil is
 # returned; on success the loaded Root pointer is returned
+# a separately allocated, initialized Session, or nil
+fun new_session(alloc: *Allocator) *sess.Session {
+    val p_r: res[*sess.Session, allocator.Error] = allocate[sess.Session](alloc, 1);
+    if (sel p_r.err) { ret nil; }
+    val sn: *sess.Session                = p_r.ok;
+    val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
+    if (sel sr.err) {
+        deallocate[sess.Session](alloc, sn, 1);
+        ret nil;
+    }
+    @sn = sr.ok;
+    ret sn;
+}
+
+fun free_session(alloc: *Allocator, sn: *sess.Session) {
+    if (sn == nil) { ret; }
+    sess.dnit(sn);
+    deallocate[sess.Session](alloc, sn, 1);
+}
+
 fun load_root(w: *Workspace, root_path: str) *Root {
     val slot: *Root = alloc_slot(w);
     if (slot == nil) {
         strutil.str_free(w.alloc, root_path);
         ret nil;
     }
-    val sp_r: res[*sess.Session, allocator.Error] = allocate[sess.Session](w.alloc, 1);
-    if (sel sp_r.err) {
+    # both sessions exist from the start: a root ping-pongs between them so the
+    # one not currently serving keeps its query cache warm for the next build
+    slot.s     = new_session(w.alloc);
+    slot.spare = new_session(w.alloc);
+    if (slot.s == nil || slot.spare == nil) {
+        free_session(w.alloc, slot.s);
+        free_session(w.alloc, slot.spare);
+        slot.s     = nil;
+        slot.spare = nil;
         strutil.str_free(w.alloc, root_path);
         ret nil;
     }
-    slot.s = sp_r.ok;
-    val sr: res[sess.Session, fail.Fail] = sess.init(w.alloc);
-    if (sel sr.err) {
-        deallocate[sess.Session](w.alloc, slot.s, 1);
-        slot.s = nil;
-        strutil.str_free(w.alloc, root_path);
-        ret nil;
-    }
-    @slot.s       = sr.ok;
     slot.path     = root_path;
     slot.vendored = vendored_under_ancestor(w, root_path);
     if (try_load(w, slot)) { ret slot; }
@@ -563,11 +636,16 @@ fun reset_slot(r: *Root) {
     r.lock_mtime         = 0;
     r.vendored           = false;
     r.s                  = nil;
+    r.spare              = nil;
+    r.spare_has_p        = false;
     r.input_revision     = 0;
     r.snapshot_revision  = 0;
     r.attempted_revision = 0;
     r.dirty              = false;
     r.last_disk_scan_ns  = 0;
+    r.wins               = nil;
+    r.wins_rev           = nil;
+    r.wins_len           = 0;
 }
 
 # a reusable dead slot, growing the array when every slot is
@@ -601,34 +679,258 @@ fun alloc_slot(w: *Workspace) *Root {
     ret ?w.roots[old_cap];
 }
 
-# compose the selected primary artifact request and retain the compiler-owned
-# load/resolve/sema snapshot for `r.path`
-fun try_load(w: *Workspace, r: *Root) bool {
-    val started_ns: i64 = trace.now_ns();
-    fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
+# everything one project analysis reads, captured on the analysis thread
+#
+# The worker gets this and nothing else. Every question whose answer lives in
+# the live workspace - which root mirrors this document, which root owns it -
+# is decided here, while the analysis thread still owns the answer, so what
+# crosses the thread boundary is a flat set of facts with no pointers back.
+# ---
+# path:     canonical document path, owned
+# text:     the buffer's text at capture, owned
+# belongs:  whether the root mirrors this document into its session
+# own_root: whether the root is this document's own nearest project
+rec DocSnapshot {
+    path:     str;
+    text:     str;
+    belongs:  bool;
+    own_root: bool;
+}
 
-    # Only the FIRST analysis of a root reports. A revalidation is a few
-    # hundred milliseconds, and a spinner on every keystroke teaches the reader
-    # to ignore the one that means something. `loaded` is the wrong test for
-    # this: every rebuild clears it, so it distinguishes "no snapshot right now"
-    # from "no snapshot ever", which are the same thing only once.
-    var token: str = nil;
-    if (!r.analyzed_once) { token = progress.start(w.alloc, "mach: analyzing project"); }
-    fin { progress.finish(w.alloc, token, nil); }
-    record_mtimes(w, r);
-    r.dirty = false;
-    val sor: res[bool, str] = sync_overlays(w, r);
-    if (sel sor.err) {
-        report_load_failure(w, r.path, sor.err);
-        ret false;
+# one root's pending build, owned by whoever holds it
+# ---
+# alloc:       allocator backing this input and the result built from it
+# root_path:   owned copy of the root directory
+# docs:        owned document snapshots
+# doc_count:   live entries in docs
+# span:        docs allocation length, which is the store's slot count, not doc_count
+# revision:    the input revision this build covers
+# sn:          BORROWED idle Session to build into; the Root owns it throughout
+# stale_p:     a dead Project still held by `sn`
+# has_stale_p: whether stale_p must be released before building
+rec BuildInput {
+    alloc:       *Allocator;
+    root_path:   str;
+    docs:        *DocSnapshot;
+    doc_count:   u32;
+    span:        usize;
+    revision:    u64;
+    sn:          *sess.Session;
+    stale_p:     driver.Project;
+    has_stale_p: bool;
+}
+
+# one finished build, owned by whoever holds it
+#
+# `message` is an owned copy rather than a borrow: a failure's text usually
+# points into a Fail or a manifest that is gone by the time the analysis thread
+# reads it, and the thread that may write to the client is not the thread that
+# produced the words.
+# ---
+# alloc:            allocator everything here came from
+# ok:               whether `p` and the path snapshot are valid
+# s:                BORROWED Session the build ran into; the Root owns it
+# p:                the retained Project, valid only when ok
+# mod_paths:        canonical source path per ModuleId
+# mod_fingerprints: on-disk fingerprint per mod_paths entry
+# mod_path_count:   mod_paths length
+# man_mtime:        manifest mtime observed at build start
+# lock_mtime:       lockfile mtime observed at build start
+# revision:         the input revision this build covered
+# message:          owned failure text, nil on success
+rec BuildOutput {
+    alloc:            *Allocator;
+    ok:               bool;
+    s:                *sess.Session;
+    p:                driver.Project;
+    mod_paths:        *str;
+    mod_fingerprints: *SourceFingerprint;
+    mod_path_count:   u32;
+    man_mtime:        i64;
+    lock_mtime:       i64;
+    revision:         u64;
+    message:          str;
+}
+
+# an owned copy of `text`, or nil
+fun dup_str(alloc: *Allocator, text: str) str {
+    if (text == nil) { ret nil; }
+    val r: res[str, allocator.Error] = strutil.str_dup(alloc, text);
+    if (sel r.err) { ret nil; }
+    ret r.ok;
+}
+
+# capture everything `r`'s next build needs, and record what it will cover
+#
+# Also advances `r.input_revision` to the newest covered buffer, which is what
+# a later build result is compared against to decide whether input moved on
+# while it ran.
+fun capture_input(w: *Workspace, r: *Root) *BuildInput {
+    val ir: res[*BuildInput, allocator.Error] = allocate[BuildInput](w.alloc, 1);
+    if (sel ir.err) { ret nil; }
+    val in: *BuildInput = ir.ok;
+    in.alloc       = w.alloc;
+    in.root_path   = nil;
+    in.docs        = nil;
+    in.doc_count   = 0;
+    in.span        = 0;
+    in.revision    = r.input_revision;
+    in.sn          = r.spare;
+    in.has_stale_p = r.spare_has_p;
+    if (r.spare_has_p) { in.stale_p = r.spare_p; }
+    r.spare_has_p = false;
+
+    in.root_path = dup_str(w.alloc, r.path);
+    if (in.root_path == nil) {
+        free_build_input(in);
+        ret nil;
     }
-    r.attempted_revision = r.input_revision;
 
-    val mr: res[manifest.Manifest, outcome.Fail] = driver.load_manifest(r.s, r.path);
+    var n: usize = 0;
+    if (w.docs != nil) { n = documents.slot_count(w.docs); }
+    if (n > 4294967295) {
+        free_build_input(in);
+        ret nil;
+    }
+    if (n > 0) {
+        val dr: res[*DocSnapshot, allocator.Error] = allocate[DocSnapshot](w.alloc, n);
+        if (sel dr.err) {
+            free_build_input(in);
+            ret nil;
+        }
+        in.docs = dr.ok;
+        in.span = n;
+        var latest: u64   = r.input_revision;
+        var i:      usize = 0;
+        for (i < n) {
+            val d: *documents.Document = documents.at(w.docs, i);
+            if (d != nil && d.in_use && d.path != nil) {
+                val slot: *DocSnapshot = ?in.docs[in.doc_count];
+                slot.path     = dup_str(w.alloc, d.path);
+                slot.text     = dup_str(w.alloc, d.text);
+                slot.belongs  = document_belongs(w, r, d.path);
+                slot.own_root = document_own_root(w, r, d.path);
+                if (slot.path == nil || slot.text == nil) {
+                    if (slot.path != nil) { strutil.str_free(w.alloc, slot.path); }
+                    if (slot.text != nil) { strutil.str_free(w.alloc, slot.text); }
+                    free_build_input(in);
+                    ret nil;
+                }
+                in.doc_count = in.doc_count + 1;
+                if (slot.belongs && d.revision > latest) { latest = d.revision; }
+            }
+            i = i + 1;
+        }
+        r.input_revision = latest;
+        in.revision      = latest;
+    }
+    ret in;
+}
+
+fun free_build_input(in: *BuildInput) {
+    if (in == nil) { ret; }
+    val alloc: *Allocator = in.alloc;
+    if (in.docs != nil) {
+        var i: u32 = 0;
+        for (i < in.doc_count) {
+            if (in.docs[i].path != nil) { strutil.str_free(alloc, in.docs[i].path); }
+            if (in.docs[i].text != nil) { strutil.str_free(alloc, in.docs[i].text); }
+            i = i + 1;
+        }
+        # the array is sized by the document store's slot count, and doc_count
+        # only counts the live ones, so the allocation length is not doc_count
+        deallocate[DocSnapshot](alloc, in.docs, in.span);
+    }
+    if (in.root_path != nil) { strutil.str_free(alloc, in.root_path); }
+    deallocate[BuildInput](alloc, in, 1);
+}
+
+# release a build result that was never installed
+#
+# `s` is borrowed from the Root and is deliberately not touched: an abandoned
+# result leaves the spare Session exactly where it was, ready for the next build.
+pub fun free_build_output(o: *BuildOutput) {
+    if (o == nil) { ret; }
+    val alloc: *Allocator = o.alloc;
+    if (o.ok)               { driver.dnit_project(?o.p); }
+    if (o.mod_paths != nil) { free_path_snapshot(alloc, o.mod_paths, o.mod_fingerprints, o.mod_path_count, o.mod_path_count); }
+    if (o.message != nil)   { strutil.str_free(alloc, o.message); }
+    deallocate[BuildOutput](alloc, o, 1);
+}
+
+# run one project analysis into a fresh Session
+#
+# This is the whole of what runs off the analysis thread. It reads its input and
+# the filesystem, writes only into memory it allocated, and never touches the
+# workspace, the document store, or the transport - a failure is carried back as
+# text for the analysis thread to report, because the thread that may write to
+# the client is not this one. The allocator is page-backed and stateless, so it
+# is the one thing both threads may use at once.
+fun run_build(arg: ptr) ptr {
+    val in:    *BuildInput = arg::*BuildInput;
+    val alloc: *Allocator  = in.alloc;
+
+    val or_: res[*BuildOutput, allocator.Error] = allocate[BuildOutput](alloc, 1);
+    if (sel or_.err) {
+        free_build_input(in);
+        ret nil;
+    }
+    val o: *BuildOutput = or_.ok;
+    o.alloc            = alloc;
+    o.ok               = false;
+    o.s                = in.sn;
+    o.mod_paths        = nil;
+    o.mod_fingerprints = nil;
+    o.mod_path_count   = 0;
+    o.man_mtime        = 0;
+    o.lock_mtime       = 0;
+    o.revision         = in.revision;
+    o.message          = nil;
+
+    if (o.s == nil) {
+        o.message = dup_str(alloc, "project: no session to build into");
+        free_build_input(in);
+        ret (o)::ptr;
+    }
+
+    # the session being built into was serving until the last swap, so it still
+    # holds that snapshot's Project and its overlay keys. Releasing them is the
+    # worker's job precisely because it is real work on a big closure, and the
+    # analysis thread is what this whole design exists to keep free.
+    if (in.has_stale_p) { driver.dnit_project(?in.stale_p); }
+    for (o.s.overlay_len > 0) { sess.clear_overlay(o.s, o.s.overlays[0].path); }
+
+    stat_mtimes(alloc, in.root_path, ?o.man_mtime, ?o.lock_mtime);
+    val started_ns: i64 = trace.now_ns();
+    analyze_into(in, o);
+    trace.logf("project: rebuilt {} in {}ms", in.root_path, (trace.now_ns() - started_ns) / 1000000);
+    free_build_input(in);
+    ret (o)::ptr;
+}
+
+# the analysis proper, split out so every failure path is one `ret` and the
+# session and input cleanup stay with the caller
+fun analyze_into(in: *BuildInput, o: *BuildOutput) {
+    val alloc: *Allocator    = in.alloc;
+    val sn:    *sess.Session = o.s;
+
+    var i: u32 = 0;
+    for (i < in.doc_count) {
+        if (in.docs[i].belongs) {
+            val sr: res[bool, str] = install_overlay(alloc, sn, in.docs[i].path, in.docs[i].text);
+            if (sel sr.err) {
+                o.message = dup_str(alloc, sr.err);
+                ret;
+            }
+        }
+        i = i + 1;
+    }
+
+    val mr: res[manifest.Manifest, outcome.Fail] = driver.load_manifest(sn, in.root_path);
     if (sel mr.err) {
         var mf: outcome.Fail = mr.err;
-        report_load_failure(w, r.path, fail_message(?mf));
-        ret false;
+        o.message = dup_str(alloc, fail_message(?mf));
+        ret;
     }
     var m: manifest.Manifest = mr.ok;
 
@@ -638,20 +940,19 @@ fun try_load(w: *Workspace, r: *Root) bool {
     selection.artifact     = "";
     selection.want_lib     = false;
     selection.has_artifact = false;
-    val psr: err[outcome.Fail] = manifest.select_primary_artifact(w.alloc, ?r.s.interner, ?m, ?selection);
+    val psr: err[outcome.Fail] = manifest.select_primary_artifact(alloc, ?sn.interner, ?m, ?selection);
     if (sel psr.err) {
-        var pf:  outcome.Fail = psr.err;
-        val msg: str          = fail_message(?pf);
-        manifest.dnit(?m, r.s.build_alloc);
-        report_load_failure(w, r.path, msg);
-        ret false;
+        var pf: outcome.Fail = psr.err;
+        o.message = dup_str(alloc, fail_message(?pf));
+        manifest.dnit(?m, sn.build_alloc);
+        ret;
     }
     if (!selection.has_artifact && m.artifact_count == 1) {
-        val ao: opt[str] = intern.lookup(?r.s.interner, m.artifacts[0].name);
+        val ao: opt[str] = intern.lookup(?sn.interner, m.artifacts[0].name);
         if (sel ao.none) {
-            manifest.dnit(?m, r.s.build_alloc);
-            report_load_failure(w, r.path, "project: artifact name is not interned");
-            ret false;
+            manifest.dnit(?m, sn.build_alloc);
+            o.message = dup_str(alloc, "project: artifact name is not interned");
+            ret;
         }
         selection.artifact     = ao.some;
         selection.want_lib     = m.artifacts[0].is_lib;
@@ -660,53 +961,200 @@ fun try_load(w: *Workspace, r: *Root) bool {
 
     var cli: request.CliArgs                         = empty_cli();
     val rr:  res[request.BuildRequest, outcome.Fail] = request.compose(
-        w.alloc, ?r.s.interner, ?m, ?cli, r.path, request.GOAL_OBJECTS, ?selection);
+        alloc, ?sn.interner, ?m, ?cli, in.root_path, request.GOAL_OBJECTS, ?selection);
     if (sel rr.err) {
         var f: outcome.Fail = rr.err;
-        manifest.dnit(?m, r.s.build_alloc);
-        report_load_failure(w, r.path, fail_message(?f));
-        ret false;
+        o.message = dup_str(alloc, fail_message(?f));
+        manifest.dnit(?m, sn.build_alloc);
+        ret;
     }
     var req: request.BuildRequest = rr.ok;
 
     var extra: *intern.StrId = nil;
-    val ecr:   res[u32, str] = collect_extra_roots(w, r, ?m, ?extra);
+    val ecr:   res[u32, str] = collect_extra_roots(in, sn, ?m, ?extra);
     if (sel ecr.err) {
-        val msg: str = ecr.err;
+        o.message = dup_str(alloc, ecr.err);
         vector.dnit[request.LinkToken](?req.link_tokens);
         vector.dnit[str](?req.lib_dirs);
-        manifest.dnit(?m, r.s.build_alloc);
-        report_load_failure(w, r.path, msg);
-        ret false;
+        manifest.dnit(?m, sn.build_alloc);
+        ret;
     }
     val extra_count: u32 = ecr.ok;
     # the tolerant entry point keeps the project through a rejected phase, so
     # the products behind the diagnostics stay readable while the user types
-    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(r.s, ?m, ?req, extra, extra_count, driver.FRONTEND_SEMA);
-    if (extra != nil) { deallocate[intern.StrId](w.alloc, extra, documents.slot_count(w.docs)); }
+    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(sn, ?m, ?req, extra, extra_count, driver.FRONTEND_SEMA);
+    if (extra != nil) { deallocate[intern.StrId](alloc, extra, in.doc_count::usize); }
     vector.dnit[request.LinkToken](?req.link_tokens);
     vector.dnit[str](?req.lib_dirs);
-    manifest.dnit(?m, r.s.build_alloc);
+    manifest.dnit(?m, sn.build_alloc);
     if (sel pr.err) {
         var f: outcome.Fail = pr.err;
-        report_load_failure(w, r.path, fail_message(?f));
+        o.message = dup_str(alloc, fail_message(?f));
+        ret;
+    }
+
+    o.p = pr.ok;
+    val bpr: res[bool, str] = snapshot_mod_paths(alloc, sn, ?o.p, o);
+    if (sel bpr.err) {
+        driver.dnit_project(?o.p);
+        o.message = dup_str(alloc, bpr.err);
+        ret;
+    }
+    o.ok = true;
+}
+
+# install a finished build as `r`'s serving snapshot, releasing the old one
+#
+# The incoming Session replaces the outgoing one wholesale. Every identity a
+# feature borrowed - Ast, SourceFile, Symbol, TypeId - belongs to the outgoing
+# Session, which is why this may only run between messages: a request that has
+# already returned holds nothing, and one that has not started has taken
+# nothing.
+fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
+    r.attempted_revision = o.revision;
+    r.man_mtime          = o.man_mtime;
+    r.lock_mtime         = o.lock_mtime;
+
+    if (!o.ok) {
+        # the previous snapshot keeps serving; only the attempt is recorded
+        if (o.message != nil) { report_load_failure(w, r.path, o.message); }
+        free_build_output(o);
         ret false;
     }
 
-    r.p      = pr.ok;
-    r.loaded = true;
-    val bpr: res[bool, str] = build_mod_paths(w, r);
-    if (sel bpr.err) {
-        driver.dnit_project(?r.p);
-        r.loaded = false;
-        report_load_failure(w, r.path, bpr.err);
-        ret false;
+    # the outgoing Session becomes the spare and KEEPS its query cache. That
+    # cache is the whole reason a rebuild costs a fraction of a cold build, and
+    # building into a fresh session each time would discard it - measured on
+    # this repo, a rebuild goes from ~7s to ~34s without it. Its Project rides
+    # along to be released by the next build, on the worker.
+    free_mod_paths(w, r);
+    free_windows(w, r);
+    if (r.loaded) {
+        r.spare_p     = r.p;
+        r.spare_has_p = true;
     }
-    r.snapshot_revision = r.input_revision;
+    r.spare = r.s;
+
+    r.s                 = o.s;
+    r.p                 = o.p;
+    r.loaded            = true;
+    r.mod_paths         = o.mod_paths;
+    r.mod_fingerprints  = o.mod_fingerprints;
+    r.mod_path_count    = o.mod_path_count;
+    r.snapshot_revision = o.revision;
     r.analyzed_once     = true;
     w.load_epoch        = w.load_epoch + 1;
     w.sema_epoch        = w.sema_epoch + 1;
+
+    # the Project and the path snapshot moved into the Root; the Session was
+    # only ever borrowed from it
+    o.s         = nil;
+    o.ok        = false;
+    o.mod_paths = nil;
+    deallocate[BuildOutput](w.alloc, o, 1);
     ret true;
+}
+
+# build `r`'s first snapshot on this thread
+#
+# A root with no snapshot has nothing to serve, so there is no latency to hide:
+# deferring the first build would only mean answering from a project that does
+# not exist yet. This is also the only build that reports progress - a
+# revalidation is short, and a spinner on every keystroke teaches the reader to
+# ignore the one that means something.
+fun try_load(w: *Workspace, r: *Root) bool {
+    val started_ns: i64 = trace.now_ns();
+    fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
+
+    var token: str = nil;
+    if (!r.analyzed_once) { token = progress.start(w.alloc, "mach: analyzing project"); }
+    fin { progress.finish(w.alloc, token, nil); }
+
+    r.dirty = false;
+    val in: *BuildInput = capture_input(w, r);
+    if (in == nil) { ret false; }
+    val out: ptr = run_build((in)::ptr);
+    if (out == nil) { ret false; }
+    ret apply_build(w, r, out::*BuildOutput);
+}
+
+# start `r`'s rebuild on the build worker, keeping the current snapshot serving
+#
+# Refused, harmlessly, when a build is already in flight: the root stays stale
+# and `pump` schedules it again once the slot frees.
+fun schedule_build(w: *Workspace, r: *Root, index: u32) bool {
+    if (build.busy(?w.builder)) { ret false; }
+    r.dirty = false;
+    val in: *BuildInput = capture_input(w, r);
+    if (in == nil) { ret false; }
+    if (!build.submit(?w.builder, (in)::ptr)) {
+        free_build_input(in);
+        ret false;
+    }
+    w.building      = true;
+    w.building_root = index;
+    trace.logf("project: rebuilding {} off the analysis thread", r.path);
+    ret true;
+}
+
+# whether `r` should be built again
+#
+# `attempted_revision` is what stops a failing root from spinning. A build that
+# failed still recorded the input it failed on, and rebuilding that same input
+# would fail identically while holding the one build slot - starving every other
+# root. So a retry waits for the input to actually move, or for `dirty`, which
+# is how a disk change says the same input may now produce a different result.
+fun snapshot_stale(r: *Root) bool {
+    if (r.dirty)                                  { ret true; }
+    if (r.input_revision == r.attempted_revision) { ret false; }
+    if (!r.loaded)                                { ret true; }
+    ret r.input_revision != r.snapshot_revision;
+}
+
+# what `pump` did, so the caller knows whether diagnostics moved
+pub val PUMP_IDLE:    u8 = 0;
+pub val PUMP_SWAPPED: u8 = 1;
+
+# collect a finished rebuild and start the next one
+#
+# The analysis thread calls this at every message boundary and whenever the
+# build worker signals. It is the only place a Root's Session changes, and it is
+# by construction between messages, which is the whole safety argument for
+# rebuilding off-thread.
+#
+# Coalescing lives here: a swap is immediately followed by at most one new build,
+# and only when input actually advanced past what the finished one covered. A
+# burst of edits during a build therefore costs one follow-up, not one per edit.
+# ---
+# w:   the workspace
+# ret: PUMP_SWAPPED when a snapshot changed and diagnostics must republish
+pub fun pump(w: *Workspace) u8 {
+    var moved: u8 = PUMP_IDLE;
+
+    val done: ptr = build.take(?w.builder);
+    if (done != nil) {
+        val idx: u32 = w.building_root;
+        w.building = false;
+        if (idx < w.root_cap && w.roots[idx].path != nil) {
+            if (apply_build(w, ?w.roots[idx], done::*BuildOutput)) { moved = PUMP_SWAPPED; }
+        }
+        or { free_build_output(done::*BuildOutput); }
+    }
+    or {
+        # a run that produced nothing frees the slot without a result
+        if (w.building && !build.busy(?w.builder)) { w.building = false; }
+    }
+
+    if (w.roots == nil || build.busy(?w.builder)) { ret moved; }
+    var i: u32 = 0;
+    for (i < w.root_cap) {
+        val r: *Root = ?w.roots[i];
+        if (r.path != nil && r.s != nil && r.loaded && snapshot_stale(r)) {
+            if (schedule_build(w, r, i)) { ret moved; }
+        }
+        i = i + 1;
+    }
+    ret moved;
 }
 
 fun empty_cli() request.CliArgs {
@@ -733,137 +1181,111 @@ fun empty_cli() request.CliArgs {
     ret c;
 }
 
-# mirror every open filesystem buffer covered by a root into its persistent
-# compiler session and capture the latest input revision.
-fun sync_overlays(w: *Workspace, r: *Root) res[bool, str] {
-    if (w.docs == nil) { ret res[bool, str].ok{true}; }
-    # Reset keys before reconstructing them from the authoritative open set. This
-    # removes normalized and manifest-raw spellings for documents closed since
-    # the previous snapshot.
-    for (r.s.overlay_len > 0) { sess.clear_overlay(r.s, r.s.overlays[0].path); }
-    val n:      usize = documents.slot_count(w.docs);
-    var latest: u64   = r.input_revision;
-    var i:      usize = 0;
-    for (i < n) {
-        val d: *documents.Document = documents.at(w.docs, i);
-        if (d != nil && d.in_use && d.path != nil && document_belongs(w, r, d.path)) {
-            val sr: res[bool, str] = set_document_overlay(w, r, d);
-            if (sel sr.err)          { ret sr; }
-            if (d.revision > latest) { latest = d.revision; }
-        }
-        i = i + 1;
-    }
-    r.input_revision = latest;
-    ret res[bool, str].ok{true};
-}
-
 # install an open document under both its canonical path and the exact raw
 # `<project root>/<manifest src>/<relative module>` spelling the compiler driver
 # currently constructs. The second key covers `src = "./src"` in project and
 # dependency manifests until Mach #2998 centralizes normalization upstream.
-fun set_document_overlay(w: *Workspace, r: *Root, d: *documents.Document) res[bool, str] {
-    val nr: err[fail.Fail] = sess.set_overlay(r.s, d.path, d.text);
+fun install_overlay(alloc: *Allocator, sn: *sess.Session, path: str, buffer: str) res[bool, str] {
+    val nr: err[fail.Fail] = sess.set_overlay(sn, path, buffer);
     if (sel nr.err) { ret res[bool, str].err{fail.describe(nr.err)}; }
-    val own: str = project_root_for(w.alloc, d.path);
+    val own: str = project_root_for(alloc, path);
     if (own == nil) { ret res[bool, str].ok{true}; }
-    val mp_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, own, "mach.toml");
+    val mp_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, own, "mach.toml");
     if (sel mp_r.err) {
-        strutil.str_free(w.alloc, own);
+        strutil.str_free(alloc, own);
         ret res[bool, str].err{outcome.alloc_text(mp_r.err)};
     }
     val mp:     str                  = mp_r.ok;
-    val text_r: res[str, fs.FsError] = fs.read_string(w.alloc, mp);
-    strutil.str_free(w.alloc, mp);
+    val text_r: res[str, fs.FsError] = fs.read_string(alloc, mp);
+    strutil.str_free(alloc, mp);
     if (sel text_r.err) {
-        strutil.str_free(w.alloc, own);
+        strutil.str_free(alloc, own);
         ret res[bool, str].err{outcome.fs_text(text_r.err)};
     }
     val text:    str                             = text_r.ok;
-    val table_r: res[toml.Table, toml.TomlError] = toml.parse(w.alloc, text);
-    strutil.str_free(w.alloc, text);
+    val table_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, text);
+    strutil.str_free(alloc, text);
     if (sel table_r.err) {
-        strutil.str_free(w.alloc, own);
+        strutil.str_free(alloc, own);
         ret res[bool, str].err{"project: manifest is not valid toml"};
     }
     var table: toml.Table = table_r.ok;
-    fin { toml.dnit(w.alloc, ?table); }
+    fin { toml.dnit(alloc, ?table); }
     val src_o: opt[str] = toml.get_str(?table, "project.src");
     if (sel src_o.none) {
-        strutil.str_free(w.alloc, own);
+        strutil.str_free(alloc, own);
         ret res[bool, str].ok{true};
     }
     val src_dir:   str                                = src_o.some;
-    val raw_src_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, own, src_dir);
-    strutil.str_free(w.alloc, own);
+    val raw_src_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, own, src_dir);
+    strutil.str_free(alloc, own);
     if (sel raw_src_r.err) { ret res[bool, str].err{outcome.alloc_text(raw_src_r.err)}; }
     val raw_src:  str = raw_src_r.ok;
-    val src_norm: str = normalize_path(w.alloc, raw_src);
+    val src_norm: str = normalize_path(alloc, raw_src);
     if (src_norm == nil) {
-        strutil.str_free(w.alloc, raw_src);
+        strutil.str_free(alloc, raw_src);
         ret res[bool, str].err{"project: failed to normalize document source directory"};
     }
-    if (!is_under(d.path, src_norm) || str_len(d.path) <= str_len(src_norm)) {
-        strutil.str_free(w.alloc, src_norm);
-        strutil.str_free(w.alloc, raw_src);
+    if (!is_under(path, src_norm) || str_len(path) <= str_len(src_norm)) {
+        strutil.str_free(alloc, src_norm);
+        strutil.str_free(alloc, raw_src);
         ret res[bool, str].ok{true};
     }
-    val raw_path_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, raw_src,
-        (d.path::usize + str_len(src_norm) + 1)::str);
-    strutil.str_free(w.alloc, src_norm);
-    strutil.str_free(w.alloc, raw_src);
+    val raw_path_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, raw_src,
+        (path::usize + str_len(src_norm) + 1)::str);
+    strutil.str_free(alloc, src_norm);
+    strutil.str_free(alloc, raw_src);
     if (sel raw_path_r.err) { ret res[bool, str].err{outcome.alloc_text(raw_path_r.err)}; }
     val raw_path: str            = raw_path_r.ok;
-    val rr:       err[fail.Fail] = sess.set_overlay(r.s, raw_path, d.text);
+    val rr:       err[fail.Fail] = sess.set_overlay(sn, raw_path, buffer);
     var out:      res[bool, str] = res[bool, str].ok{true};
     if (sel rr.err) { out = res[bool, str].err{fail.describe(rr.err)}; }
-    strutil.str_free(w.alloc, raw_path);
+    strutil.str_free(alloc, raw_path);
     ret out;
 }
 
 # build compiler-owned extra roots for open files under this project's source
 # directory. files already in the artifact closure are harmless duplicates.
-fun collect_extra_roots(w: *Workspace, r: *Root, m: *manifest.Manifest, out: **intern.StrId) res[u32, str] {
+fun collect_extra_roots(in: *BuildInput, sn: *sess.Session, m: *manifest.Manifest, out: **intern.StrId) res[u32, str] {
     @out = nil;
-    if (w.docs == nil) { ret res[u32, str].ok{0}; }
-    val n: usize = documents.slot_count(w.docs);
-    if (n == 0)         { ret res[u32, str].ok{0}; }
-    if (n > 4294967295) { ret res[u32, str].err{"project: too many open documents"}; }
-    val ar: res[*intern.StrId, allocator.Error] = allocate[intern.StrId](w.alloc, n);
+    val alloc: *Allocator = in.alloc;
+    val n:     usize      = in.doc_count::usize;
+    if (n == 0) { ret res[u32, str].ok{0}; }
+    val ar: res[*intern.StrId, allocator.Error] = allocate[intern.StrId](alloc, n);
     if (sel ar.err) { ret res[u32, str].err{outcome.alloc_text(ar.err)}; }
     val roots: *intern.StrId = ar.ok;
 
-    val io: opt[str] = intern.lookup(?r.s.interner, m.id);
-    val so: opt[str] = intern.lookup(?r.s.interner, m.src);
+    val io: opt[str] = intern.lookup(?sn.interner, m.id);
+    val so: opt[str] = intern.lookup(?sn.interner, m.src);
     if (sel io.none) {
-        deallocate[intern.StrId](w.alloc, roots, n);
+        deallocate[intern.StrId](alloc, roots, n);
         ret res[u32, str].err{"project: manifest source path is not interned"};
     }
     if (sel so.none) {
-        deallocate[intern.StrId](w.alloc, roots, n);
+        deallocate[intern.StrId](alloc, roots, n);
         ret res[u32, str].err{"project: manifest source path is not interned"};
     }
-    val src_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, r.path, so.some);
+    val src_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, in.root_path, so.some);
     if (sel src_r.err) {
-        deallocate[intern.StrId](w.alloc, roots, n);
+        deallocate[intern.StrId](alloc, roots, n);
         ret res[u32, str].err{outcome.alloc_text(src_r.err)};
     }
-    val src_norm: str = normalize_path(w.alloc, src_r.ok);
-    strutil.str_free(w.alloc, src_r.ok);
+    val src_norm: str = normalize_path(alloc, src_r.ok);
+    strutil.str_free(alloc, src_r.ok);
     if (src_norm == nil) {
-        deallocate[intern.StrId](w.alloc, roots, n);
+        deallocate[intern.StrId](alloc, roots, n);
         ret res[u32, str].err{"project: failed to normalize source directory"};
     }
 
     var count: u32   = 0;
     var i:     usize = 0;
     for (i < n) {
-        val d: *documents.Document = documents.at(w.docs, i);
-        if (d != nil && d.in_use && d.path != nil && is_under(d.path, src_norm)
-            && document_own_root(w, r, d.path)) {
-            val fr: res[intern.StrId, str] = document_fqn(r, io.some, src_norm, d.path);
+        val d: *DocSnapshot = ?in.docs[i::u32];
+        if (d.own_root && is_under(d.path, src_norm)) {
+            val fr: res[intern.StrId, str] = document_fqn(sn, io.some, src_norm, d.path);
             if (sel fr.err) {
-                strutil.str_free(w.alloc, src_norm);
-                deallocate[intern.StrId](w.alloc, roots, n);
+                strutil.str_free(alloc, src_norm);
+                deallocate[intern.StrId](alloc, roots, n);
                 ret res[u32, str].err{fr.err};
             }
             roots[count] = fr.ok;
@@ -871,16 +1293,16 @@ fun collect_extra_roots(w: *Workspace, r: *Root, m: *manifest.Manifest, out: **i
         }
         i = i + 1;
     }
-    strutil.str_free(w.alloc, src_norm);
+    strutil.str_free(alloc, src_norm);
     if (count == 0) {
-        deallocate[intern.StrId](w.alloc, roots, n);
+        deallocate[intern.StrId](alloc, roots, n);
         ret res[u32, str].ok{0};
     }
     @out = roots;
     ret res[u32, str].ok{count};
 }
 
-fun document_fqn(r: *Root, id_text: str, src_dir: str, path: str) res[intern.StrId, str] {
+fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[intern.StrId, str] {
     val prefix: usize = str_len(src_dir);
     val plen:   usize = str_len(path);
     if (plen <= prefix + 6 || path[prefix] != '/') { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
@@ -889,7 +1311,7 @@ fun document_fqn(r: *Root, id_text: str, src_dir: str, path: str) res[intern.Str
     val rel_len: usize                     = plen - prefix - 1 - 5;
     val id_len:  usize                     = str_len(id_text);
     val total:   usize                     = id_len + 1 + rel_len;
-    val br:      res[*u8, allocator.Error] = allocate[u8](r.s.alloc, total);
+    val br:      res[*u8, allocator.Error] = allocate[u8](sn.alloc, total);
     if (sel br.err) { ret res[intern.StrId, str].err{outcome.alloc_text(br.err)}; }
     val buf: *u8   = br.ok;
     var i:   usize = 0;
@@ -905,8 +1327,8 @@ fun document_fqn(r: *Root, id_text: str, src_dir: str, path: str) res[intern.Str
         or            { buf[id_len + 1 + j] = c; }
         j = j + 1;
     }
-    val ir: res[intern.StrId, allocator.Error] = intern.intern_bytes(?r.s.interner, buf::str, total);
-    deallocate[u8](r.s.alloc, buf, total);
+    val ir: res[intern.StrId, allocator.Error] = intern.intern_bytes(?sn.interner, buf::str, total);
+    deallocate[u8](sn.alloc, buf, total);
     if (sel ir.err) { ret res[intern.StrId, str].err{outcome.alloc_text(ir.err)}; }
     ret res[intern.StrId, str].ok{ir.ok};
 }
@@ -916,17 +1338,14 @@ fun document_fqn(r: *Root, id_text: str, src_dir: str, path: str) res[intern.Str
 # are allocation-free string compares. replacement is transactional: a failed
 # allocation or normalization rejects the new Project and preserves the last
 # successful path/fingerprint set for disk-change retry detection.
-fun build_mod_paths(w: *Workspace, r: *Root) res[bool, str] {
-    val n: u32 = r.p.module_len;
-    if (n == 0) {
-        free_mod_paths(w, r);
-        ret res[bool, str].ok{true};
-    }
-    val arr_r: res[*str, allocator.Error] = allocate[str](w.alloc, n::usize);
+fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, pr: *driver.Project, o: *BuildOutput) res[bool, str] {
+    val n: u32 = pr.module_len;
+    if (n == 0) { ret res[bool, str].ok{true}; }
+    val arr_r: res[*str, allocator.Error] = allocate[str](alloc, n::usize);
     if (sel arr_r.err) { ret res[bool, str].err{outcome.alloc_text(arr_r.err)}; }
-    val mt_r: res[*SourceFingerprint, allocator.Error] = allocate[SourceFingerprint](w.alloc, n::usize);
+    val mt_r: res[*SourceFingerprint, allocator.Error] = allocate[SourceFingerprint](alloc, n::usize);
     if (sel mt_r.err) {
-        deallocate[str](w.alloc, arr_r.ok, n::usize);
+        deallocate[str](alloc, arr_r.ok, n::usize);
         ret res[bool, str].err{outcome.alloc_text(mt_r.err)};
     }
     val paths:        *str               = arr_r.ok;
@@ -937,23 +1356,22 @@ fun build_mod_paths(w: *Workspace, r: *Root) res[bool, str] {
         paths[i]              = nil;
         fingerprints[i].mtime = 0;
         fingerprints[i].size  = 0;
-        val fo: opt[*src.SourceFile] = src.get(?r.s.sources, (?r.p.modules[i]).file_id);
+        val fo: opt[*src.SourceFile] = src.get(?sn.sources, (?pr.modules[i]).file_id);
         if (sel fo.none) {
-            free_path_snapshot(w.alloc, paths, fingerprints, n, i);
+            free_path_snapshot(alloc, paths, fingerprints, n, i);
             ret res[bool, str].err{"project: loaded module source is unavailable"};
         }
-        paths[i] = normalize_path(w.alloc, fo.some.path);
+        paths[i] = normalize_path(alloc, fo.some.path);
         if (paths[i] == nil) {
-            free_path_snapshot(w.alloc, paths, fingerprints, n, i);
+            free_path_snapshot(alloc, paths, fingerprints, n, i);
             ret res[bool, str].err{"project: failed to normalize loaded module path"};
         }
-        fingerprints[i] = file_fingerprint(paths[i]);
+        fingerprints[i] = verified_fingerprint(alloc, sn, fo.some, paths[i]);
         i               = i + 1;
     }
-    free_mod_paths(w, r);
-    r.mod_paths        = paths;
-    r.mod_fingerprints = fingerprints;
-    r.mod_path_count   = n;
+    o.mod_paths        = paths;
+    o.mod_fingerprints = fingerprints;
+    o.mod_path_count   = n;
     ret res[bool, str].ok{true};
 }
 
@@ -976,11 +1394,15 @@ fun free_mod_paths(w: *Workspace, r: *Root) {
     r.mod_path_count   = 0;
 }
 
-# rebuild `r`'s graph when its manifest or lockfile changed on
+# mark `r` stale when its manifest or lockfile changed on
 # disk since the last load attempt - the conservative fallback for clients that
 # do not deliver `workspace/didChangeWatchedFiles`, and the retry path for a
 # root whose previous load failed. watcher delivery improves latency but does
-# not disable this correctness fallback. a no-op when nothing changed
+# not disable this correctness fallback. a no-op when nothing changed.
+#
+# Marking, not rebuilding: this runs on the analysis thread inside a request,
+# and `refresh_inputs` is what decides whether the rebuild it implies can go
+# off-thread.
 fun maybe_reload(w: *Workspace, r: *Root) {
     val clock: chrono.Clock = chrono.monotonic();
     if (sel clock.err) { ret; }
@@ -989,7 +1411,7 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     r.last_disk_scan_ns = now;
     var man:  i64 = 0;
     var lock: i64 = 0;
-    stat_mtimes(w, r.path, ?man, ?lock);
+    stat_mtimes(w.alloc, r.path, ?man, ?lock);
     var changed: bool = man != r.man_mtime || lock != r.lock_mtime;
     var i:       u32  = 0;
     for (!changed && i < r.mod_path_count) {
@@ -998,21 +1420,36 @@ fun maybe_reload(w: *Workspace, r: *Root) {
         i = i + 1;
     }
     if (!changed) { ret; }
-    free_root_graph(w, r);
-    try_load(w, r);
+    r.dirty = true;
 }
 
-# rebuild a retained snapshot when any covered open document has advanced past
-# the revision captured by the compiler-owned project.
+# bring `r`'s snapshot up to date with its input
+#
+# A root with a snapshot never blocks here: the rebuild is handed to the build
+# worker and the existing snapshot answers this request, one revision behind.
+# That staleness is bounded by one build and resolved by `pump`, and it is the
+# whole point - the alternative is the request waiting seconds for a snapshot
+# the next keystroke would invalidate anyway.
+#
+# A root with no snapshot has nothing to answer from, so its build runs inline.
 fun refresh_inputs(w: *Workspace, r: *Root) res[bool, str] {
-    if (r.dirty || (r.loaded && r.input_revision != r.snapshot_revision)) {
-        free_root_graph(w, r);
-        try_load(w, r);
+    if (!snapshot_stale(r)) { ret res[bool, str].ok{r.loaded}; }
+    if (r.loaded) {
+        schedule_build(w, r, root_index(w, r));
+        ret res[bool, str].ok{true};
     }
-    or (!r.loaded && r.input_revision != r.attempted_revision) {
-        try_load(w, r);
-    }
+    try_load(w, r);
     ret res[bool, str].ok{r.loaded};
+}
+
+# a root's slot index, or root_cap when it is not one of ours
+fun root_index(w: *Workspace, r: *Root) u32 {
+    var i: u32 = 0;
+    for (i < w.root_cap) {
+        if (?w.roots[i] == r) { ret i; }
+        i = i + 1;
+    }
+    ret w.root_cap;
 }
 
 # mirror a changed document into every already-tracked root it belongs to and
@@ -1063,7 +1500,9 @@ pub fun invalidate_uri(w: *Workspace, uri: str) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && (root_covers(w, norm, r.path)
             || has_module_for_norm(module_for_norm(r, norm)))) {
-            free_root_graph(w, r);
+            # the snapshot is kept, not dropped: it is what answers requests
+            # until the rebuild this schedules has actually produced a
+            # replacement, and a root left with nothing serves nothing
             r.man_mtime  = 0 - 1;
             r.lock_mtime = 0 - 1;
             r.dirty      = true;
@@ -1138,13 +1577,17 @@ pub fun root_covers_document(w: *Workspace, r: *Root, d: *documents.Document) bo
 
 # release a root's retained Project, source index, Session, and owned path
 fun free_root(w: *Workspace, r: *Root) {
+    free_windows(w, r);
     free_root_graph(w, r);
     free_mod_paths(w, r);
-    if (r.s != nil) {
-        sess.dnit(r.s);
-        deallocate[sess.Session](w.alloc, r.s, 1);
-        r.s = nil;
+    if (r.spare_has_p) {
+        driver.dnit_project(?r.spare_p);
+        r.spare_has_p = false;
     }
+    free_session(w.alloc, r.s);
+    free_session(w.alloc, r.spare);
+    r.s     = nil;
+    r.spare = nil;
     if (r.path != nil) { strutil.str_free(w.alloc, r.path); }
     reset_slot(r);
 }
@@ -1161,14 +1604,14 @@ fun free_root_graph(w: *Workspace, r: *Root) {
 # snapshot the root's manifest / lockfile mtimes for the
 # conservative reload check
 fun record_mtimes(w: *Workspace, r: *Root) {
-    stat_mtimes(w, r.path, ?r.man_mtime, ?r.lock_mtime);
+    stat_mtimes(w.alloc, r.path, ?r.man_mtime, ?r.lock_mtime);
 }
 
 # write the mtimes of `<root_path>/mach.toml` and
 # `<root_path>/mach.lock` (0 when absent) into `man` / `lock`
-fun stat_mtimes(w: *Workspace, root_path: str, man: *i64, lock: *i64) {
-    @man  = join_mtime(w.alloc, root_path, "mach.toml");
-    @lock = join_mtime(w.alloc, root_path, "mach.lock");
+fun stat_mtimes(alloc: *Allocator, root_path: str, man: *i64, lock: *i64) {
+    @man  = join_mtime(alloc, root_path, "mach.toml");
+    @lock = join_mtime(alloc, root_path, "mach.lock");
 }
 
 # the mtime of `<dir>/<name>` in unix nanoseconds, or 0 when the file is
@@ -1205,6 +1648,38 @@ fun file_fingerprint(path: str) SourceFingerprint {
     ret fp;
 }
 
+# a fingerprint no stat produces, so the next scan always reports a change
+fun unknown_fingerprint() SourceFingerprint {
+    var fp: SourceFingerprint;
+    fp.mtime = -1;
+    fp.size  = ~(0::usize);
+    ret fp;
+}
+
+# the on-disk fingerprint of `path`, provided the file still holds exactly the
+# text the build analyzed
+#
+# A fingerprint taken after the build can describe bytes written after the
+# compiler read the file. Recorded as-is, that change would read as the
+# snapshot's own and never be rebuilt. So the stat comes first and the file is
+# then compared with what was analyzed, through the same read the loader uses: a
+# write that landed in between is a mismatch, recorded as unknown so the next
+# scan rebuilds it. An open document is analyzed from its overlay, whose bytes
+# the disk is not expected to hold, and is not compared.
+fun verified_fingerprint(alloc: *Allocator, sn: *sess.Session, file: *src.SourceFile, path: str) SourceFingerprint {
+    val fp: SourceFingerprint = file_fingerprint(path);
+    val ov: opt[str]          = sess.overlay_get(sn, file.path);
+    if (sel ov.some) { ret fp; }
+    val tr:   res[str, fs.FsError] = fs.read_string(alloc, path);
+    var same: bool                 = false;
+    if (sel tr.ok) {
+        same = str_equals(tr.ok, file.text);
+        strutil.str_free(alloc, tr.ok);
+    }
+    if (same) { ret fp; }
+    ret unknown_fingerprint();
+}
+
 # whether `path` still matches the fingerprint recorded in `prev`
 #
 # `prev` is refreshed on a mismatch so one disk change triggers one rebuild
@@ -1228,19 +1703,19 @@ fun fingerprint_matches(path: str, prev: *SourceFingerprint) bool {
 # free (see `free_site`). none when there is no project, or the defining module
 # cannot be located
 # ---
-# w:     the workspace
-# root:  the root the buffer resolved against, or nil
-# own:   the buffer's own module id
-# own_a: the buffer's Ast
-# own_file:the buffer's SourceFile
-# uri: the request document's URI
-# sym: the symbol whose declaration site is wanted
-# ret: some(Site), or none when the defining module cannot be located
-pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, uri: str, sym: *rslv.Symbol) opt[Site] {
+# w:        the workspace
+# root:     the root the buffer resolved against, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's Ast
+# own_text: the buffer's text, as the request reads it
+# uri:      the request document's URI
+# sym:      the symbol whose declaration site is wanted
+# ret:      some(Site), or none when the defining module cannot be located
+pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_text: positions.Text, uri: str, sym: *rslv.Symbol) opt[Site] {
     if (sym.origin == own) {
         var s: Site;
         s.a     = own_a;
-        s.text  = positions.text_of(own_file);
+        s.text  = own_text;
         s.uri   = uri;
         s.sym   = sym;
         s.owned = false;
@@ -1259,7 +1734,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
 
     var s: Site;
     s.a     = m.a;
-    s.text  = positions.text_of(fo.some);
+    s.text  = module_text(w, root, sym.origin, fo.some);
     s.uri   = furi;
     s.sym   = local;
     s.owned = true;
@@ -1293,6 +1768,23 @@ fun defining_symbol(rr: *rslv.ResolveResult, sym: *rslv.Symbol) *rslv.Symbol {
 # loaded module `mid`'s entry in `root`, or nil when there is no
 # loaded project or the id is out of range
 # the loaded module whose source is `file`, or none
+# the source of `fid` in `root`'s session, read against the client's buffer
+# when an open document holds it and has moved past the snapshot. a file that is
+# not a loaded module pairs as it is
+# ---
+# w:    the workspace
+# root: the loaded root whose session `fid` belongs to
+# fid:  a file id in that session
+# ret:  the pairing; its file is nil when `fid` is unknown
+pub fun file_text(w: *Workspace, root: *Root, fid: src.FileId) positions.Text {
+    if (root == nil || !root.loaded) { ret positions.text_of(nil); }
+    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, fid);
+    if (sel fo.none) { ret positions.text_of(nil); }
+    val mo: opt[sess.ModuleId] = module_for_file(root, fid);
+    if (sel mo.none) { ret positions.text_of(fo.some); }
+    ret module_text(w, root, mo.some, fo.some);
+}
+
 fun module_for_file(root: *Root, file: src.FileId) opt[sess.ModuleId] {
     if (root == nil || !root.loaded) { ret opt[sess.ModuleId].none{}; }
     var i: u32 = 0;
@@ -1321,16 +1813,24 @@ pub fun free_site(w: *Workspace, site: *Site) {
 # a borrowed view of one loaded module for the workspace-wide
 # use-site walk - its parsed Ast, resolve side tables, and backing source file
 # ---
-# a:    the module's parsed Ast (decl / expr / type ids index into it)
-# rr:   the module's ResolveResult side tables
-# text: the SourceFile backing `a`, paired with its length (positions, span text)
+# a:       the module's parsed Ast (decl / expr / type ids index into it)
+# rr:      the module's ResolveResult side tables
+# sr:      the module's SemaResult, or nil when its sema did not run
+# text:    the SourceFile backing `a`, paired with its length (positions, span text)
+# file_id: FileId of that source file, the identity a nominal type names
 pub rec ModuleView {
-    a:    *ast.Ast;
-    rr:   *rslv.ResolveResult;
-    text: positions.Text;
+    a:       *ast.Ast;
+    rr:      *rslv.ResolveResult;
+    sr:      *sema.SemaResult;
+    text:    positions.Text;
+    file_id: src.FileId;
 }
 
 # compiler-owned snapshot of one open document.
+# ---
+# stale:    the snapshot predates the document's current text; `text` then maps
+#           the snapshot's offsets into the client's buffer
+# parse_ok: the snapshot's own parse of this module was accepted
 pub rec DocumentView {
     root:     *Root;
     module:   sess.ModuleId;
@@ -1341,17 +1841,32 @@ pub rec DocumentView {
     interner: *intern.Interner;
     revision: u64;
     file_id:  src.FileId;
+    stale:    bool;
+    parse_ok: bool;
 }
 
 # analyze through the retained project containing `d` and return its exact
-# ModuleEntry. the input/snapshot revision equality is the staleness boundary.
+# ModuleEntry, current or not
+#
+# A snapshot built before `d`'s current text describes EARLIER text. It is
+# still returned, marked `stale`, with its `text` read against the client's
+# buffer: every offset it reports is carried through the one window where the
+# two texts differ, and nothing inside that window crosses (#251). A feature that
+# can answer from earlier semantics does so with no further knowledge; one that
+# cannot - a rename, a reference list - refuses a stale view, and the server
+# holds it until the rebuild already scheduled here lands.
+#
+# The test is per document, not per root, and that distinction is load-bearing
+# rather than merely tighter. A root-wide test says "stale" whenever ANY covered
+# buffer has moved, including when the move was a rebuild that FAILED: the
+# attempt is recorded, the snapshot revision is not, and the root is then
+# permanently stale with nothing left to schedule. Keyed on the document, a
+# failed rebuild leaves every buffer the last good snapshot still describes
+# exactly where it was, which is what "a failure keeps serving" has to mean.
 pub fun document_view(w: *Workspace, d: *documents.Document) res[DocumentView, str] {
     val root: *Root = root_for(w, d.uri);
     if (root == nil || !root.loaded) { ret res[DocumentView, str].err{"project: document has no compiler project"}; }
-    if (!root.loaded || root.input_revision != root.snapshot_revision) {
-        ret res[DocumentView, str].err{"project: document snapshot is stale"};
-    }
-    ret view_from_root(root, d);
+    ret view_from_root(w, root, d);
 }
 
 # return a document view only when an already-loaded project captured its latest
@@ -1362,14 +1877,57 @@ pub fun document_view(w: *Workspace, d: *documents.Document) res[DocumentView, s
 # ret: current compiler view, or an error requiring fallback diagnostics
 pub fun document_view_loaded(w: *Workspace, d: *documents.Document) res[DocumentView, str] {
     val root: *Root = root_for_loaded(w, d.uri);
-    if (root == nil || !root.loaded || root.input_revision != root.snapshot_revision
-        || d.revision > root.snapshot_revision) {
+    if (root == nil || !root.loaded || d.revision > root.snapshot_revision) {
         ret res[DocumentView, str].err{"project: no current loaded snapshot"};
     }
-    ret view_from_root(root, d);
+    ret view_from_root(w, root, d);
 }
 
-fun view_from_root(root: *Root, d: *documents.Document) res[DocumentView, str] {
+# whether `root`'s snapshot covers the current text of every buffer it mirrors
+#
+# A request whose answer must be complete or must edit text - a rename, a
+# reference list - needs this rather than the per-document test: an edit to a
+# SIBLING buffer leaves the requesting one current while the snapshot's picture
+# of the sibling, and so of what the answer covers there, is out of date.
+# ---
+# root: a root, or nil
+# ret:  true when the root is loaded and caught up
+pub fun root_current(root: *Root) bool {
+    if (root == nil || !root.loaded) { ret false; }
+    ret root.input_revision == root.snapshot_revision;
+}
+
+# whether `d`'s text has moved past the snapshot that analyzes it
+pub fun document_behind(w: *Workspace, d: *documents.Document) bool {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded) { ret false; }
+    ret d.revision > root.snapshot_revision;
+}
+
+# start the build that will bring `d`'s root up to date, when the slot is free.
+# never swaps a snapshot in, so it is safe while a request's tree is live
+pub fun catch_up(w: *Workspace, d: *documents.Document) {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded || !snapshot_stale(root)) { ret; }
+    schedule_build(w, root, root_index(w, root));
+}
+
+# whether a request on `d` that needs a current root can wait for one: the root
+# is behind, and a build that would bring it up to date is scheduled or running.
+# a failed attempt at this input is not pending, and waiting for it would wait
+# forever
+# ---
+# w:   the workspace
+# d:   an open document
+# ret: true when a current snapshot for `d`'s root is on its way
+pub fun current_pending(w: *Workspace, d: *documents.Document) bool {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || root_current(root)) { ret false; }
+    if (snapshot_stale(root))              { ret true; }
+    ret w.building && w.building_root == root_index(w, root);
+}
+
+fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[DocumentView, str] {
     val mo: opt[sess.ModuleId] = module_for_norm(root, d.path);
     if (sel mo.none) { ret res[DocumentView, str].err{"project: document module was not loaded"}; }
     val mid: sess.ModuleId       = mo.some;
@@ -1383,15 +1941,18 @@ fun view_from_root(root: *Root, d: *documents.Document) res[DocumentView, str] {
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
     if (sel fo.none) { ret res[DocumentView, str].err{"project: document source unavailable"}; }
     var v: DocumentView;
-    v.root     = root;
-    v.module   = mid;
-    v.a        = m.a;
-    v.rr       = m.resolve_result;
-    v.sr       = m.sema_result;
-    v.text     = positions.text_of(fo.some);
+    v.root   = root;
+    v.module = mid;
+    v.a      = m.a;
+    v.rr     = m.resolve_result;
+    v.sr     = m.sema_result;
+    v.stale  = d.revision > root.snapshot_revision;
+    v.text   = positions.text_of(fo.some);
+    if (v.stale) { v.text = positions.text_against(fo.some, documents.live_file(w.docs, d), module_windows(w, root, mid, fo.some, d)); }
     v.interner = ?root.s.interner;
     v.revision = root.snapshot_revision;
     v.file_id  = m.file_id;
+    v.parse_ok = sel m.parse_status.kind.accepted;
     ret res[DocumentView, str].ok{v};
 }
 
@@ -1420,22 +1981,102 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
     if (sel fo.none) { ret opt[ModuleView].none{}; }
     var v: ModuleView;
-    v.a    = m.a;
-    v.rr   = m.resolve_result;
-    v.text = positions.text_of(fo.some);
+    v.a       = m.a;
+    v.rr      = m.resolve_result;
+    v.sr      = m.sema_result;
+    v.text    = module_text(w, root, mid, fo.some);
+    v.file_id = m.file_id;
     ret opt[ModuleView].some{v};
 }
 
-# loaded module `mid`'s compiler-owned SemaResult
+# where loaded module `mid`'s snapshot text differs from `d`'s current buffer,
+# computed once per document revision for this snapshot, or nil when it cannot
+# be computed
+#
+# The list is owned by the root and lives until the snapshot is replaced, which
+# only happens between messages, so every Text that borrows it during a request
+# stays valid for the whole request.
 # ---
 # w:    the workspace
-# root: the root governing the request, or nil
-# mid:  a loaded module id in [0, module_count)
-# ret:  some(*SemaResult), or none
-pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[*sema.SemaResult] {
-    val m: *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil || m.sema_result == nil) { ret opt[*sema.SemaResult].none{}; }
-    ret opt[*sema.SemaResult].some{m.sema_result};
+# root: the loaded root
+# mid:  the module
+# file: the module's snapshot source
+# d:    the open document holding the module
+# ret:  the windows, or nil
+fun module_windows(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile, d: *documents.Document) *textdiff.Windows {
+    val live: *src.SourceFile = documents.live_file(w.docs, d);
+    if (live == nil) { ret nil; }
+    if (root.wins == nil) {
+        val n:  u32                                     = root.p.module_len;
+        val wr: res[*textdiff.Windows, allocator.Error] = allocate[textdiff.Windows](w.alloc, n::usize);
+        if (sel wr.err) { ret nil; }
+        val rr: res[*u64, allocator.Error] = allocate[u64](w.alloc, n::usize);
+        if (sel rr.err) {
+            deallocate[textdiff.Windows](w.alloc, wr.ok, n::usize);
+            ret nil;
+        }
+        root.wins     = wr.ok;
+        root.wins_rev = rr.ok;
+        root.wins_len = n;
+        var i: u32 = 0;
+        for (i < n) {
+            root.wins[i]     = textdiff.empty();
+            root.wins_rev[i] = 0;
+            i                = i + 1;
+        }
+    }
+    if (mid::u32 >= root.wins_len) { ret nil; }
+    val slot: *textdiff.Windows = ?root.wins[mid::u32];
+    if (root.wins_rev[mid::u32] == d.revision) { ret slot; }
+    root.wins_rev[mid::u32] = 0;
+    if (!textdiff.compute(w.alloc, file, str_len(file.text), live, str_len(live.text), slot)) { ret nil; }
+    root.wins_rev[mid::u32] = d.revision;
+    ret slot;
+}
+
+# release a root's window cache, which describes the snapshot being replaced
+fun free_windows(w: *Workspace, r: *Root) {
+    if (r.wins == nil) { ret; }
+    var i: u32 = 0;
+    for (i < r.wins_len) {
+        textdiff.dnit(w.alloc, ?r.wins[i]);
+        i = i + 1;
+    }
+    deallocate[textdiff.Windows](w.alloc, r.wins, r.wins_len::usize);
+    deallocate[u64](w.alloc, r.wins_rev, r.wins_len::usize);
+    r.wins     = nil;
+    r.wins_rev = nil;
+    r.wins_len = 0;
+}
+
+# loaded module `mid`'s source read against the client's buffer, when an open
+# document holds that module and has moved past the snapshot
+#
+# Every Text a feature can report through is built here or in `view_from_root`,
+# so a site in a sibling buffer the user is also editing is mapped exactly like
+# one in the buffer the request names.
+# ---
+# w:    the workspace
+# root: the loaded root
+# mid:  the module
+# file: the module's snapshot source
+# ret:  the pairing
+fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile) positions.Text {
+    val plain: positions.Text = positions.text_of(file);
+    if (w.docs == nil || root.mod_paths == nil || mid::u32 >= root.mod_path_count) { ret plain; }
+    val path: str = root.mod_paths[mid::u32];
+    if (path == nil) { ret plain; }
+    val n: usize = documents.slot_count(w.docs);
+    var i: usize = 0;
+    for (i < n) {
+        val d: *documents.Document = documents.at(w.docs, i);
+        if (d != nil && d.in_use && d.path != nil && str_equals(d.path, path)) {
+            if (d.revision <= root.snapshot_revision) { ret plain; }
+            ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mid, file, d));
+        }
+        i = i + 1;
+    }
+    ret plain;
 }
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
@@ -1459,6 +2100,17 @@ pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
 # ret: the declaration's TypeId, or TYPE_NIL
 pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
     ret mtypes.decl_type_of(sr, did);
+}
+
+# the semantic type a written Ast type node denotes, or TYPE_NIL when
+# unavailable. the type-position twin of `type_of`, for a cursor sitting on a
+# type annotation rather than on a value
+# ---
+# sr:  a buffer's / module's SemaResult, or nil
+# tid: the Ast type id to resolve
+# ret: the written type's TypeId, or TYPE_NIL
+pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
+    ret mtypes.type_ref_of(sr, tid);
 }
 
 # the nominal back-link from a record / union TypeId to its declaring
@@ -1514,7 +2166,7 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite
     if (sel fo.none) { ret opt[RecordSite].none{}; }
     val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
     if (sel decl.none) { ret opt[RecordSite].none{}; }
-    ret record_site_from(mid.some, decl.some, m.file_id, n.name, m.a, fo.some);
+    ret record_site_from(mid.some, decl.some, m.file_id, n.name, m.a, module_text(w, root, mid.some, fo.some));
 }
 
 # `record_decl` extended to resolve a record / union declared in
@@ -1522,29 +2174,29 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite
 # module id (`own`), which is not in the loaded module array, so `record_decl`
 # alone would miss a field access on a record the edited buffer itself declares.
 # when the nominal's origin is `own`, the declaration is read from the buffer's
-# live Ast / file (`own_a` / `own_file`); otherwise it defers to a loaded module
+# live Ast / text (`own_a` / `own_text`); otherwise it defers to a loaded module
 # ---
 # w:        the workspace
 # root:     the root the type was resolved under, or nil
 # own:      the buffer's own module id
 # own_a:    the buffer's live Ast
-# own_file: the buffer's SourceFile
+# own_text: the buffer's text, as the request reads it
 # tid:      a TypeId, typically read from a SemaResult via `type_of`
 # ret:      some(RecordSite), or none
-pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) opt[RecordSite] {
+pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[RecordSite] {
     val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
     if (sel no.none) { ret opt[RecordSite].none{}; }
     val n: mtypes.Nominal = no.some;
-    if (own_file != nil && n.file == own_fid) {
-        val decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, positions.text_of(own_file), interner(w, root), n);
+    if (own_text.file != nil && n.file == own_fid) {
+        val decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
         if (sel decl.none) { ret opt[RecordSite].none{}; }
-        ret record_site_from(own, decl.some, own_fid, n.name, own_a, own_file);
+        ret record_site_from(own, decl.some, own_fid, n.name, own_a, own_text);
     }
     ret record_decl(w, root, tid);
 }
 
 # a RecordSite for the rec / uni declaration `decl` in the active
-# buffer (`own` / `own_a` / `own_file`), or none when `decl` is not a rec / uni.
+# buffer (`own` / `own_a` / `own_text`), or none when `decl` is not a rec / uni.
 # the buffer-side entry point for a cursor sitting on a field's own declaration
 # name: the decl is in the buffer being edited, so its Ast / file are the live
 # ones. the resulting site carries the declaring file and the interned record
@@ -1555,12 +2207,12 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: 
 # own:      the buffer's own module id
 # own_fid:  the buffer's own FileId
 # own_a:    the buffer's live Ast
-# own_file: the buffer's SourceFile
+# own_text: the buffer's text, as the request reads it
 # decl:     the rec / uni DeclId in the buffer
 # ret:      some(RecordSite), or none
-pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, decl: id.DeclId) opt[RecordSite] {
+pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, decl: id.DeclId) opt[RecordSite] {
     if (decl == id.DECL_NIL) { ret opt[RecordSite].none{}; }
-    val site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_file);
+    val site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_text);
     if (sel site.none) { ret site; }
     var rs:   RecordSite = site.some;
     val text: str        = positions.span_text(rs.text, rs.name_span, alloc);
@@ -1570,6 +2222,93 @@ pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.Modul
     if (sel ir.err) { ret opt[RecordSite].none{}; }
     rs.name = ir.ok;
     ret opt[RecordSite].some{rs};
+}
+
+# the declaring site of a nominal type, whatever kind declares it
+# ---
+# origin:    ModuleId of the declaring module
+# decl:      DeclId of the rec / uni / tag declaration in `origin`'s Ast
+# file:      FileId of the declaring source file
+# name_span: byte span of the declared type name in `text`
+# a:         the declaring module's parsed Ast
+# text:      SourceFile backing `a`, paired with its length
+# kind:      the declaration kind that named the type
+pub rec TypeSite {
+    origin:    sess.ModuleId;
+    decl:      id.DeclId;
+    file:      src.FileId;
+    name_span: token.Span;
+    a:         *ast.Ast;
+    text:      positions.Text;
+    kind:      adecl.DeclKind;
+}
+
+# the declaring site of a nominal TypeId, whatever its declaration
+# kind - the back-link `textDocument/typeDefinition` follows from a value to the
+# declaration that names its type
+#
+# `RecordSite` answers the narrower question a field feature asks (where are this
+# type's fields), so it admits rec / uni only. A type reference carries no such
+# restriction, and a `tag` is the type of every `opt` and `res` a cursor can land
+# on, so reusing RecordSite here would answer null for the most common types in
+# the language. A pointer is peeled and a generic instance maps to its template,
+# both through `nominal_of`.
+#
+# A type declared in the active buffer is interned under the buffer's synthetic
+# module id, which is not in the loaded module array, so the buffer's live Ast is
+# consulted first - the same split `record_decl_in` makes.
+# ---
+# w:        the workspace
+# root:     the root the type was resolved under, or nil
+# own:      the buffer's own module id
+# own_fid:  the buffer's own FileId
+# own_a:    the buffer's live Ast
+# own_text: the buffer's text, as the request reads it
+# tid:      a TypeId, typically read from a SemaResult
+# ret:      some(TypeSite), or none for a type with no nominal declaration
+pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[TypeSite] {
+    val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (sel no.none) { ret opt[TypeSite].none{}; }
+    val n: mtypes.Nominal = no.some;
+
+    if (own_text.file != nil && n.file == own_fid) {
+        val own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
+        if (sel own_decl.none) { ret opt[TypeSite].none{}; }
+        ret type_site_from(own, own_decl.some, own_fid, own_a, own_text);
+    }
+
+    val mid: opt[sess.ModuleId] = module_for_file(root, n.file);
+    if (sel mid.none) { ret opt[TypeSite].none{}; }
+    val m: *driver.ModuleEntry = module_entry(root, mid.some);
+    if (m == nil) { ret opt[TypeSite].none{}; }
+    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
+    if (sel fo.none) { ret opt[TypeSite].none{}; }
+    val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
+    if (sel decl.none) { ret opt[TypeSite].none{}; }
+    ret type_site_from(mid.some, decl.some, m.file_id, m.a, module_text(w, root, mid.some, fo.some));
+}
+
+# build a TypeSite for the decl `decl` in `a` (backed by `file`), or
+# none when the decl is absent or declares no type name. the one place a new
+# type-declaring kind is admitted
+fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
+    val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
+    if (sel d_opt.none) { ret opt[TypeSite].none{}; }
+    val d: *adecl.Decl = d_opt.some;
+
+    var ts: TypeSite;
+    if (d.kind == adecl.DECL_KIND_REC) { ts.name_span = d.data.rec_.name; }
+    or (d.kind == adecl.DECL_KIND_UNI) { ts.name_span = d.data.uni_.name; }
+    or (d.kind == adecl.DECL_KIND_TAG) { ts.name_span = d.data.tag_.name; }
+    or                                 { ret opt[TypeSite].none{}; }
+
+    ts.origin = origin;
+    ts.decl   = decl;
+    ts.file   = fid;
+    ts.a      = a;
+    ts.text   = text;
+    ts.kind   = d.kind;
+    ret opt[TypeSite].some{ts};
 }
 
 # the nominal back-link of `tid` against the session type interner,
@@ -1583,7 +2322,7 @@ fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) opt[mtypes.Nomi
 # by `file`), or none when the decl is absent or not a rec / uni. the shared core
 # of `record_decl` / `record_decl_in` - both having chosen which Ast / file the
 # declaration lives in
-fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, file: *src.SourceFile) opt[RecordSite] {
+fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, text: positions.Text) opt[RecordSite] {
     val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
     if (sel d_opt.none) { ret opt[RecordSite].none{}; }
     val d:      *adecl.Decl = d_opt.some;
@@ -1596,7 +2335,7 @@ fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, na
     rs.file   = fid;
     rs.name   = name;
     rs.a      = a;
-    rs.text   = positions.text_of(file);
+    rs.text   = text;
     rs.is_rec = is_rec;
     if (is_rec) {
         rs.name_span    = d.data.rec_.name;
@@ -1747,8 +2486,18 @@ pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
 # the project root governing `uri` - the nearest ancestor of its
 # decoded filesystem path holding a `mach.toml` - as an owned string, or nil
 # for a non-file URI or a document outside any project
+# the project root governing `uri`, in the SAME spelling a document path uses
+#
+# `project_root_for` keeps whatever spelling it is handed, so feeding it the raw
+# URI path while documents carry the normalized one gives the same directory two
+# names - `C:/x/alpha` against `C:\x\alpha` on windows - and every later
+# `str_equals` between a root and a document's own root silently says no. That
+# is what decides whether a buffer is mirrored into a root at all, so on windows
+# a root's first build captured no open buffer and its snapshot revision never
+# left zero. One canonical spelling, produced here, is what keeps those
+# comparisons meaning what they read as.
 fun document_root(w: *Workspace, uri: str) str {
-    val path: str = uri_to_path(w.alloc, uri);
+    val path: str = uri_to_norm(w.alloc, uri);
     if (path == nil) { ret nil; }
     val root: str = project_root_for(w.alloc, path);
     strutil.str_free(w.alloc, path);

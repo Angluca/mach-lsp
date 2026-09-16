@@ -31,12 +31,14 @@ use sess: mach.lang.session;
 use src:  mach.lang.source;
 
 use mls.actions;
+use mls.callhierarchy;
 use mls.diagnostics;
 use mls.documents;
 use mls.hints;
 use mls.jobs;
 use mls.json;
 use mls.language;
+use mls.parked;
 use mls.positions;
 use mls.progress;
 use mls.project;
@@ -46,6 +48,7 @@ use mls.textedit;
 use mls.tokens;
 use mls.trace;
 use mls.transport;
+use mls.version;
 use mls.workspace;
 use sj: std.data.json;
 use std.process.exec;
@@ -70,6 +73,10 @@ val FEATURE_SIGNATURE_HELP:     u8 = 8;
 val FEATURE_INLAY_HINT:         u8 = 9;
 val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
 val FEATURE_CODE_ACTION:        u8 = 11;
+val FEATURE_TYPE_DEFINITION:    u8 = 12;
+val FEATURE_CALL_PREPARE:       u8 = 13;
+val FEATURE_CALL_INCOMING:      u8 = 14;
+val FEATURE_CALL_OUTGOING:      u8 = 15;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -100,6 +107,15 @@ val WATCH_ACTIVE:   u8 = 2;
 # hover_markdown: whether the client renders markdown hover content
 # watch_dynamic:  whether the client supports dynamic file-watch registration
 #                 (`workspace/didChangeWatchedFiles`), advertised at initialize
+# held:           requests waiting for a snapshot that has caught up (#251)
+# holding:        the message being handled was held rather than answered
+# body:           the text of the message being handled, for holding it
+# body_len:       byte length of `body`
+# refresh_tokens: the client re-requests semantic tokens when asked
+# refresh_hints:  the client re-requests inlay hints when asked
+# served_stale:   an answer came from a snapshot behind its buffer since the
+#                 last swap, so the client is asked to refresh after the next
+# refresh_seq:    ids for the refresh requests the server sends
 pub rec Server {
     status:         u8;
     exit_code:      i64;
@@ -117,6 +133,14 @@ pub rec Server {
     hover_markdown: bool;
     watch_dynamic:  bool;
     watch_state:    u8;
+    held:           parked.Queue;
+    holding:        bool;
+    body:           str;
+    body_len:       usize;
+    refresh_tokens: bool;
+    refresh_hints:  bool;
+    served_stale:   bool;
+    refresh_seq:    u64;
 }
 
 # build a server over the given allocator
@@ -125,11 +149,19 @@ pub rec Server {
 # alloc: allocator backing all server-owned memory; must outlive the server
 # ret:   true on success, false when the compiler session fails to initialize
 pub fun init(srv: *Server, alloc: *Allocator) bool {
-    srv.status        = STATUS_UNINITIALIZED;
-    srv.exit_code     = 0;
-    srv.alloc         = alloc;
-    srv.watch_dynamic = false;
-    srv.watch_state   = WATCH_FALLBACK;
+    srv.status         = STATUS_UNINITIALIZED;
+    srv.exit_code      = 0;
+    srv.alloc          = alloc;
+    srv.watch_dynamic  = false;
+    srv.watch_state    = WATCH_FALLBACK;
+    srv.held           = parked.init(alloc);
+    srv.holding        = false;
+    srv.body           = nil;
+    srv.body_len       = 0;
+    srv.refresh_tokens = false;
+    srv.refresh_hints  = false;
+    srv.served_stale   = false;
+    srv.refresh_seq    = 0;
 
     val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
     if (sel sr.err) { ret false; }
@@ -153,6 +185,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # ---
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
+    parked.dnit(?srv.held);
     jobs.dnit(?srv.q);
     jobs.cancels_dnit(?srv.cancels);
     json.reader_dnit(?srv.rd_client);
@@ -180,9 +213,16 @@ pub fun dnit(srv: *Server) {
 pub fun run(srv: *Server) i64 {
     trace.log("=== mach-lsp started ===\n");
 
-    if (!jobs.start(?srv.q, handle_job, (srv)::ptr)) {
+    if (!jobs.start(?srv.q, handle_job, handle_signal, (srv)::ptr)) {
         trace.log("server: could not start the analysis thread\n");
         ret 1;
+    }
+    # a project rebuild is seconds of compiler work, and run on the analysis
+    # thread it stops the server answering anything for its whole duration.
+    # without the worker every build runs inline, which is correct but slow, so
+    # a failure to spawn is reported and not fatal.
+    if (!project.start_builder(?srv.ws, wake_analysis, (srv)::ptr)) {
+        trace.log("server: could not start the build thread; rebuilds will block analysis\n");
     }
 
     var last_read: transport.ReadStatus = transport.READ_OK;
@@ -238,6 +278,9 @@ fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
                 jobs.cancel_add(?srv.cancels, id_token);
                 trace.logf("server: cancel requested for id {}", id_token);
                 json.free_str(id_token, srv.alloc);
+                # a held request is not in the queue, so nothing would look at the
+                # cancellation until the next message; wake the analysis thread
+                jobs.signal(?srv.q);
             }
             handled = true;
         }
@@ -268,16 +311,26 @@ fun trace_method(srv: *Server, root: *sj.Value) {
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
 
+    # a message boundary is the only place a rebuilt snapshot may be swapped in,
+    # because it is the only place no request holds a pointer into the outgoing
+    # session. doing it before dispatch also means this message is answered from
+    # the freshest snapshot that has actually finished building.
+    collect_rebuilds(srv);
+
     trace.frame("recv:", body, len);
 
     val started_ns: i64          = trace.now_ns();
     var parsed:     json.Message = json.read(?srv.rd, body, len);
+    srv.body     = body;
+    srv.body_len = len;
     if (parsed.valid) {
         trace_method(srv, ?parsed.root);
         dispatch(srv, ?parsed.root);
     }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
+    srv.body     = nil;
+    srv.body_len = 0;
 
     # a coalesced burst leaves the newest text unanalyzed; the moment the queue
     # drains is when that debt comes due, whatever the last message happened to
@@ -291,6 +344,117 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     if (srv.status == STATUS_EXITED || transport.write_failed()) {
         atomic.store(?srv.stop, 1);
     }
+}
+
+# swap in any finished rebuild and republish what it moved
+#
+# Runs on the analysis thread only.
+fun collect_rebuilds(srv: *Server) {
+    val moved: u8 = project.pump(?srv.ws);
+    if (srv.status != STATUS_RUNNING) { ret; }
+    if (moved == project.PUMP_SWAPPED) {
+        republish_all(srv);
+        request_refresh(srv);
+    }
+    release_held(srv);
+}
+
+# answer every held request that no longer has anything to wait for: its root
+# caught up, its awaited build failed, or the client withdrew it. the rest keep
+# their place, in arrival order. runs only where no parse tree is live
+fun release_held(srv: *Server) {
+    if (srv.held.len == 0) { ret; }
+    var batch: parked.Queue = parked.take(?srv.held);
+    var i:     usize        = 0;
+    for (i < batch.len) {
+        val e: *parked.Entry = ?batch.items[i];
+        if (jobs.cancel_has(?srv.cancels, e.id) || !still_waiting(srv, e)) { redispatch(srv, e); }
+        or {
+            if (!parked.push(?srv.held, e.body, e.len, e.uri, e.id)) {
+                send_error_token(srv, e.id, render.CONTENT_MODIFIED, "the request could not be held");
+            }
+        }
+        i = i + 1;
+    }
+    parked.dnit(?batch);
+}
+
+# whether a held request's document still has a catching-up build on its way
+fun still_waiting(srv: *Server, e: *parked.Entry) bool {
+    val d: *documents.Document = documents.find(?srv.docs, e.uri);
+    if (d == nil) { ret false; }
+    ret project.current_pending(?srv.ws, d);
+}
+
+# run a held request as if it had just arrived
+fun redispatch(srv: *Server, e: *parked.Entry) {
+    var parsed: json.Message = json.read(?srv.rd, e.body, e.len);
+    srv.body     = e.body;
+    srv.body_len = e.len;
+    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    or                { send_error_token(srv, e.id, INTERNAL_ERROR, "a held request could not be read back"); }
+    json.release(?srv.rd);
+    srv.body     = nil;
+    srv.body_len = 0;
+}
+
+# answer every held request for `uri`, or all of them when `uri` is nil, with
+# ContentModified: what they were waiting to answer about is gone
+fun abandon_held(srv: *Server, uri: str, message: str) {
+    if (srv.held.len == 0) { ret; }
+    var batch: parked.Queue = parked.take(?srv.held);
+    var i:     usize        = 0;
+    for (i < batch.len) {
+        val e: *parked.Entry = ?batch.items[i];
+        if (uri == nil || parked.names(e, uri)) { send_error_token(srv, e.id, render.CONTENT_MODIFIED, message); }
+        or {
+            if (!parked.push(?srv.held, e.body, e.len, e.uri, e.id)) {
+                send_error_token(srv, e.id, render.CONTENT_MODIFIED, "the request could not be held");
+            }
+        }
+        i = i + 1;
+    }
+    parked.dnit(?batch);
+}
+
+# ask the client to re-request what it was given from a stale snapshot
+fun request_refresh(srv: *Server) {
+    if (!srv.served_stale) { ret; }
+    srv.served_stale = false;
+    if (srv.refresh_tokens) { send_refresh(srv, "workspace/semanticTokens/refresh"); }
+    if (srv.refresh_hints)  { send_refresh(srv, "workspace/inlayHint/refresh"); }
+}
+
+fun send_refresh(srv: *Server, method: str) {
+    srv.refresh_seq = srv.refresh_seq + 1;
+    var b: json.Buf = json.buf_init(srv.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":\"mls/refresh/");
+    json.buf_push_usize(?b, srv.refresh_seq::usize);
+    json.buf_push(?b, "\",\"method\":");
+    json.buf_push_quoted(?b, method);
+    json.buf_push_byte(?b, '}');
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, srv.alloc); }
+    json.buf_dnit(?b);
+}
+
+# the build worker telling the analysis thread a rebuild is ready
+#
+# Runs ON THE BUILD WORKER, so it does exactly one thing: wake. Everything that
+# touches compiler state, the document store, or the transport happens in
+# `handle_signal`, back on the thread that owns them.
+fun wake_analysis(ctx: ptr) {
+    val srv: *Server = ctx::*Server;
+    jobs.signal(?srv.q);
+}
+
+# the analysis thread answering that wake
+#
+# A rebuild that finishes while the client is idle still has to reach the
+# editor, so the swap and its republish cannot wait for the next keystroke.
+fun handle_signal(ctx: ptr) {
+    val srv: *Server = ctx::*Server;
+    collect_rebuilds(srv);
 }
 
 # a response has an id, no method, and exactly one of `result` or `error`.
@@ -324,7 +488,13 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     # never hears back waits forever. Rather than asking every handler to
     # remember, the dispatcher checks and backstops.
     val before: u64 = render.responses();
+    srv.holding = false;
     dispatch_inner(srv, root);
+    if (srv.holding) {
+        # held, to be answered when the snapshot it needs lands
+        srv.holding = false;
+        ret;
+    }
     if (render.responses() == before) {
         trace.log("server: handler produced no response; answering internal error\n");
         send_error(srv, id, INTERNAL_ERROR, "the server produced no response for this request");
@@ -412,6 +582,11 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_DEFINITION);
         ret;
     }
+    if (str_equals(method, "textDocument/typeDefinition")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_TYPE_DEFINITION);
+        ret;
+    }
     if (str_equals(method, "textDocument/references")) {
         json.free_str(method, a);
         handle_feature(srv, root, params, FEATURE_REFERENCES);
@@ -462,6 +637,21 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_CODE_ACTION);
         ret;
     }
+    if (str_equals(method, "textDocument/prepareCallHierarchy")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_PREPARE);
+        ret;
+    }
+    if (str_equals(method, "callHierarchy/incomingCalls")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_INCOMING);
+        ret;
+    }
+    if (str_equals(method, "callHierarchy/outgoingCalls")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_OUTGOING);
+        ret;
+    }
     if (str_equals(method, "workspace/symbol")) {
         json.free_str(method, a);
         handle_workspace_symbol(srv, root, params);
@@ -491,6 +681,12 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     progress.configure(json.boolean(
         json.member(json.member2(params, "capabilities", "window"), "workDoneProgress"), false));
 
+    # an answer from a stale snapshot (#251) is replaced once the rebuild lands,
+    # for the features a client re-requests on its own only when told to
+    val ws_caps: *sj.Value = json.member2(params, "capabilities", "workspace");
+    srv.refresh_tokens = json.boolean(json.member(json.member(ws_caps, "semanticTokens"), "refreshSupport"), false);
+    srv.refresh_hints  = json.boolean(json.member(json.member(ws_caps, "inlayHint"), "refreshSupport"), false);
+
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push_id(?b, json.member(root, "id"));
@@ -498,7 +694,9 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
+    json.buf_push_quoted(?b, version.VERSION);
+    json.buf_push(?b, "}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -556,6 +754,7 @@ fun handle_did_change_watched_files(srv: *Server, params: *sj.Value) {
 
 # acknowledge a shutdown request and enter the shutting-down phase
 fun handle_shutdown(srv: *Server, root: *sj.Value) {
+    abandon_held(srv, nil, "the server is shutting down");
     if (json.member(root, "id") != nil) {
         var b: json.Buf = json.buf_init(srv.alloc);
         json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -646,12 +845,52 @@ fun apply_changes(srv: *Server, uri: str, changes: *sj.Value, n: usize) str {
 fun handle_did_close(srv: *Server, params: *sj.Value) {
     val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
     if (uri == nil) { ret; }
+    abandon_held(srv, uri, "the document was closed");
     val doc: *documents.Document = documents.closing(?srv.docs, uri);
     if (doc != nil) { project.document_closed(?srv.ws, doc); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
     republish_all(srv);
     json.free_str(uri, srv.alloc);
+}
+
+# whether a feature must answer from a snapshot that has caught up with every
+# buffer of its root: a reference list is wrong when incomplete, and a rename or
+# a code action edits text the snapshot no longer describes
+fun needs_current(which: u8) bool {
+    ret which == FEATURE_REFERENCES || which == FEATURE_RENAME
+        || which == FEATURE_PREPARE_RENAME || which == FEATURE_CODE_ACTION;
+}
+
+# keep the message being handled until its snapshot lands
+#
+# The build that will release it is started here if the slot is free; otherwise
+# the build worker's signal starts it when the running one finishes. Nothing
+# that could swap a snapshot runs here, because this message's tree is live.
+fun hold(srv: *Server, id: *sj.Value, uri: str, d: *documents.Document) bool {
+    if (srv.body == nil || id == nil) { ret false; }
+    val token: str = json.id_text(id, srv.alloc);
+    if (token == nil) { ret false; }
+    val held: bool = parked.push(?srv.held, srv.body, srv.body_len, uri, token);
+    json.free_str(token, srv.alloc);
+    if (!held) { ret false; }
+    project.catch_up(?srv.ws, d);
+    srv.holding = true;
+    trace.log("server: holding a request until its snapshot catches up\n");
+    ret true;
+}
+
+# send a JSON-RPC error for a request known only by its id token
+fun send_error_token(srv: *Server, id_token: str, code: i64, message: str) {
+    var b: json.Buf = json.buf_init(srv.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_token);
+    json.buf_push(?b, ",\"error\":{\"code\":");
+    json.buf_push_i64(?b, code);
+    json.buf_push(?b, ",\"message\":");
+    json.buf_push_quoted(?b, message);
+    json.buf_push(?b, "}}");
+    send_buf(srv, ?b);
 }
 
 # route a language-feature request to its handler in `language`
@@ -664,6 +903,18 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     if (withdrawn(srv, id)) { ret; }
     val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
 
+    # a request whose answer must be complete or edits text waits for a current
+    # snapshot when one is on its way; every other feature answers now, from
+    # whatever snapshot there is, through its mapping (#251)
+    val d: *documents.Document = documents.find(?srv.docs, uri);
+    if (d != nil && project.current_pending(?srv.ws, d)) {
+        if (needs_current(which) && hold(srv, id, uri, d)) {
+            json.free_str(uri, srv.alloc);
+            ret;
+        }
+        if (!needs_current(which) && project.document_behind(?srv.ws, d)) { srv.served_stale = true; }
+    }
+
     # snapshot compiler epochs so a feature-triggered rebuild republishes the
     # now-current diagnostics for every affected open document
     val epoch_before: u32 = project.load_epoch(?srv.ws);
@@ -671,6 +922,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
 
     if (which == FEATURE_HOVER)              { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
     or (which == FEATURE_DEFINITION)         { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_TYPE_DEFINITION)    { language.type_definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_REFERENCES)         { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_RENAME)             { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_PREPARE_RENAME)     { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
@@ -681,6 +933,9 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_INLAY_HINT)         { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_SEMANTIC_TOKENS)    { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_CODE_ACTION)        { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CALL_PREPARE)       { callhierarchy.prepare(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CALL_INCOMING)      { callhierarchy.incoming(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params); }
+    or (which == FEATURE_CALL_OUTGOING)      { callhierarchy.outgoing(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 

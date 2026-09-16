@@ -71,7 +71,14 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
         ret;
     }
     val v: project.DocumentView = vr.ok;
-    val s: *sess.Session        = project.root_session(v.root);
+    # a fix's edits are computed against the snapshot's text; applied to a buffer
+    # that has moved on they would rewrite the wrong bytes, so a stale view offers
+    # nothing. the server holds this request until the rebuild lands
+    if (v.stale) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+    val s: *sess.Session = project.root_session(v.root);
     if (s == nil) {
         render.reply_empty_array(alloc, id_raw);
         ret;
@@ -102,9 +109,10 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
         if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
             var f: usize = 0;
             for (f < dg.fixes.len) {
-                push_action(?b, ws, alloc, ?s.sources, v.text.file, uri, dg, ?dg.fixes.data[f], emitted > 0);
-                emitted = emitted + 1;
-                f       = f + 1;
+                if (push_action(?b, ws, alloc, ?s.sources, v.text, uri, dg, ?dg.fixes.data[f], emitted > 0)) {
+                    emitted = emitted + 1;
+                }
+                f = f + 1;
             }
         }
         i = i + 1;
@@ -118,16 +126,19 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 #
 # The originating diagnostic rides along so a client can associate the action
 # with the squiggle it is offered under, and so applying it can clear that entry.
+# nothing is written, and false returned, when a span cannot be reported
 fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-    file: *src.SourceFile, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) {
-    if (comma) { json.buf_push_byte(b, ','); }
+    text: positions.Text, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) bool {
+    if (!positions.maps(text, dg.loc.span)) { ret false; }
+    if (!edits_map(sources, text, fix))     { ret false; }
+    if (comma)                              { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"title\":");
     json.buf_push_quoted(b, fix.label);
     json.buf_push(b, ",\"kind\":");
     json.buf_push_quoted(b, KIND_QUICKFIX);
 
     json.buf_push(b, ",\"diagnostics\":[{\"range\":");
-    render.span_range(b, file, dg.loc.span);
+    render.span_range(b, text, dg.loc.span);
     json.buf_push(b, ",\"severity\":");
     json.buf_push_i64(b, severity_of(dg.severity));
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
@@ -137,8 +148,20 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
     # every edit of one fix lands in the same WorkspaceEdit, because they apply
     # together or not at all
     json.buf_push(b, ",\"edit\":{\"changes\":{");
-    push_edits(b, ws, alloc, sources, file, uri, fix);
+    push_edits(b, ws, alloc, sources, text, uri, fix);
     json.buf_push(b, "}}}");
+    ret true;
+}
+
+# whether every edit of `fix` in the requested document can be reported
+fun edits_map(sources: *src.SourceMap, text: positions.Text, fix: *diag.Fix) bool {
+    var e: usize = 0;
+    for (e < fix.edits.len) {
+        val ed: *diag.Edit = ?fix.edits.data[e];
+        if (edit_file(sources, ed) == text.file && !positions.maps(text, ed.loc.span)) { ret false; }
+        e = e + 1;
+    }
+    ret true;
 }
 
 # append the `changes` map for a fix's edits, grouped by document
@@ -147,12 +170,12 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
 # without a lookup; an edit naming another file resolves its own URI through the
 # source map rather than being silently dropped into the wrong document.
 fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-    file: *src.SourceFile, uri: str, fix: *diag.Fix) {
+    text: positions.Text, uri: str, fix: *diag.Fix) {
     var wrote_group: bool  = false;
     var e:           usize = 0;
     for (e < fix.edits.len) {
         val ed:   *diag.Edit = ?fix.edits.data[e];
-        val same: bool       = edit_file(sources, ed) == file;
+        val same: bool       = edit_file(sources, ed) == text.file;
         if (same) {
             if (!wrote_group) {
                 json.buf_push_quoted(b, uri);
@@ -161,7 +184,7 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
                 wrote_group = true;
             }
             or { json.buf_push_byte(b, ','); }
-            render.text_edit(b, file, ed.loc.span, ed.replacement);
+            render.text_edit(b, text, ed.loc.span, ed.replacement);
         }
         e = e + 1;
     }
@@ -193,8 +216,8 @@ fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
 fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) bool {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret false; }
-    val so: opt[usize] = offset_of(rng, "start", file);
-    val eo: opt[usize] = offset_of(rng, "end", file);
+    val so: opt[usize] = bound_of(rng, "start", file, false);
+    val eo: opt[usize] = bound_of(rng, "end", file, true);
     if (sel so.none) { ret false; }
     if (sel eo.none) { ret false; }
     @lo = so.some;
@@ -203,12 +226,12 @@ fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usiz
     ret true;
 }
 
-fun offset_of(rng: *sj.Value, key: str, file: positions.Text) opt[usize] {
+fun bound_of(rng: *sj.Value, key: str, file: positions.Text, is_end: bool) opt[usize] {
     val p:    *sj.Value = json.member(rng, key);
     val line: i64       = json.number(json.member(p, "line"), -1);
     val ch:   i64       = json.number(json.member(p, "character"), -1);
-    if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
-    ret positions.offset_at(file, line::usize, ch::usize);
+    if (line < 0 || ch < 0) { ret positions.bound_at(file, 0, 0, is_end); }
+    ret positions.bound_at(file, line::usize, ch::usize, is_end);
 }
 
 # whether the request's `only` filter admits quickfix

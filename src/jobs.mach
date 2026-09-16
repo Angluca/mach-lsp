@@ -40,6 +40,14 @@ use std.system.os;
 # for the duration of the call and released by the queue afterwards.
 pub def JobFn: fun(ptr, str, usize);
 
+# what the worker does when something other than a client message wakes it
+#
+# The analysis thread has exactly one wait point, so work that completes off it
+# - a project rebuild finishing on the build worker - has to arrive here or not
+# at all. A signal carries no payload: it says only that the analysis thread
+# should look at state it already owns.
+pub def SignalFn: fun(ptr);
+
 # one queued message body, owned by the queue
 # ---
 # body: nul-terminated copy of the message body
@@ -61,8 +69,9 @@ rec Job {
 # cap:    ring length
 # head:   index of the next job to pop
 # count:  queued jobs
-# seq:    futex word, advanced on every push and on close
+# seq:    futex word, advanced on every push, signal, and close
 # closed: no further pushes are accepted and the worker should drain and exit
+# woken:  a signal is pending; collapses, since it carries no payload
 # th:     the worker thread handle
 # live:   whether `th` was spawned and still needs joining
 pub rec Queue {
@@ -74,6 +83,7 @@ pub rec Queue {
     count:  usize;
     seq:    i64;
     closed: bool;
+    woken:  bool;
     th:     thread.Thread;
     live:   bool;
 }
@@ -85,10 +95,12 @@ pub rec Queue {
 # ---
 # q:  the queue to drain
 # f:  the callback to run per job
-# fx: opaque context handed to `f`
+# sf: the callback to run per signal
+# fx: opaque context handed to `f` and `sf`
 rec Bound {
     q:  *Queue;
     f:  JobFn;
+    sf: SignalFn;
     fx: ptr;
 }
 
@@ -119,6 +131,7 @@ pub fun init(q: *Queue, alloc: *Allocator) bool {
     q.count  = 0;
     q.seq    = 0;
     q.closed = false;
+    q.woken  = false;
     q.live   = false;
 
     val r: res[*Job, allocator.Error] = allocate[Job](alloc, CAPACITY);
@@ -140,12 +153,14 @@ pub fun init(q: *Queue, alloc: *Allocator) bool {
 # ---
 # q:   the initialized queue
 # f:   per-job callback
-# fx:  opaque context handed to `f`
+# sf:  per-signal callback, run when something off-thread asks for attention
+# fx:  opaque context handed to `f` and `sf`
 # ret: true when the thread started
-pub fun start(q: *Queue, f: JobFn, fx: ptr) bool {
+pub fun start(q: *Queue, f: JobFn, sf: SignalFn, fx: ptr) bool {
     if (q.jobs == nil || q.live) { ret false; }
     BOUND.q  = q;
     BOUND.f  = f;
+    BOUND.sf = sf;
     BOUND.fx = fx;
     thread.spawn_with(worker_main, (?BOUND)::*u8, ?q.th);
     if (q.th.tid < 0) { ret false; }
@@ -186,6 +201,19 @@ pub fun push(q: *Queue, body: str, len: usize) bool {
 
     os.thread_wake(?q.seq);
     ret true;
+}
+
+# ask the worker to run its signal callback once
+#
+# Safe from any thread and from a thread that owns no allocator: a signal takes
+# no memory and collapses with any other still pending, so a producer that
+# finishes twice before the worker looks costs one callback, not two.
+pub fun signal(q: *Queue) {
+    mutex.lock(?q.lock);
+    q.woken = true;
+    atomic.store(?q.seq, atomic.load(?q.seq) + 1);
+    mutex.unlock(?q.lock);
+    os.thread_wake(?q.seq);
 }
 
 # refuse further pushes and wake the worker so it drains and exits
@@ -235,6 +263,11 @@ pub fun depth(q: *Queue) usize {
     ret n;
 }
 
+# what `pop_blocking` handed back
+pub val TAKE_JOB:    u8 = 0;
+pub val TAKE_SIGNAL: u8 = 1;
+pub val TAKE_CLOSED: u8 = 2;
+
 # release one job's owned body
 fun free_job(q: *Queue, j: *Job) {
     if (j.body != nil) { deallocate[u8](q.alloc, j.body::*u8, j.len + 1); }
@@ -247,11 +280,14 @@ fun free_job(q: *Queue, j: *Job) {
 # The futex word is sampled before locking so a push that lands between the
 # empty check and the sleep changes the value the sleep compares against, and
 # the sleep returns immediately instead of missing the wake.
+# Queued client messages are drained ahead of a pending signal: a signal only
+# ever asks the analysis thread to look at state it already owns, and that look
+# happens at every message boundary anyway, so input never waits behind it.
 # ---
 # q:   the queue
-# out: receives the popped job on success
-# ret: true when a job was taken; false once the queue is closed and drained
-fun pop_blocking(q: *Queue, out: *Job) bool {
+# out: receives the popped job when the result is TAKE_JOB
+# ret: TAKE_JOB, TAKE_SIGNAL, or TAKE_CLOSED once closed and drained
+fun pop_blocking(q: *Queue, out: *Job) u8 {
     for (true) {
         val sampled: i64 = atomic.load(?q.seq);
 
@@ -263,15 +299,20 @@ fun pop_blocking(q: *Queue, out: *Job) bool {
             q.head              = (q.head + 1) % q.cap;
             q.count             = q.count - 1;
             mutex.unlock(?q.lock);
-            ret true;
+            ret TAKE_JOB;
+        }
+        if (q.woken) {
+            q.woken = false;
+            mutex.unlock(?q.lock);
+            ret TAKE_SIGNAL;
         }
         val done: bool = q.closed;
         mutex.unlock(?q.lock);
 
-        if (done) { ret false; }
+        if (done) { ret TAKE_CLOSED; }
         os.thread_wait(?q.seq, sampled);
     }
-    ret false;
+    ret TAKE_CLOSED;
 }
 
 # the worker thread entry: drain the queue into the bound callback until close
@@ -282,9 +323,15 @@ fun worker_main(arg: *u8) {
         var j: Job;
         j.body = nil;
         j.len  = 0;
-        if (!pop_blocking(q, ?j)) { brk; }
-        if (j.body != nil)        { b.f(b.fx, j.body, j.len); }
-        free_job(q, ?j);
+        val took: u8 = pop_blocking(q, ?j);
+        if (took == TAKE_CLOSED) { brk; }
+        if (took == TAKE_SIGNAL) {
+            if (b.sf != nil) { b.sf(b.fx); }
+        }
+        or {
+            if (j.body != nil) { b.f(b.fx, j.body, j.len); }
+            free_job(q, ?j);
+        }
     }
 }
 
@@ -298,6 +345,12 @@ use std.allocator;
 var SEEN:     [64]u8;
 var SEEN_LEN: i64 = 0;
 var SEEN_SUM: i64 = 0;
+
+var SIGNALS: i64 = 0;
+
+fun note(ctx: ptr) {
+    SIGNALS = SIGNALS + 1;
+}
 
 fun record(ctx: ptr, body: str, len: usize) {
     if (SEEN_LEN < 64) {
@@ -314,7 +367,7 @@ test "jobs: every pushed body reaches the worker once, in order" {
     if (!init(?q, ?pa)) { ret 1; }
     SEEN_LEN = 0;
     SEEN_SUM = 0;
-    if (!start(?q, record, nil)) {
+    if (!start(?q, record, note, nil)) {
         dnit(?q);
         ret 1;
     }
@@ -354,7 +407,7 @@ test "jobs: an idle worker joins without any job" {
     var q: Queue;
     if (!init(?q, ?pa)) { ret 1; }
     SEEN_LEN = 0;
-    if (!start(?q, record, nil)) {
+    if (!start(?q, record, note, nil)) {
         dnit(?q);
         ret 1;
     }
@@ -385,7 +438,7 @@ test "jobs: a pushed body is copied, not borrowed" {
     }
     scratch[0] = 'z';
 
-    if (!start(?q, record, nil)) {
+    if (!start(?q, record, note, nil)) {
         dnit(?q);
         ret 1;
     }
@@ -431,6 +484,80 @@ test "jobs: a closed queue refuses further pushes" {
     close(?q);
     var fail: bool = false;
     if (push(?q, "late", 4)) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a rebuild finishing off the analysis thread reaches it only through a signal,
+# so the queue must deliver one that arrives while the worker is asleep
+test "jobs: a signal reaches the worker with no message queued" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SIGNALS  = 0;
+    SEEN_LEN = 0;
+    if (!start(?q, record, note, nil)) {
+        dnit(?q);
+        ret 1;
+    }
+    signal(?q);
+    join(?q);
+    var fail: bool = false;
+    if (SIGNALS != 1)  { fail = true; }
+    if (SEEN_LEN != 0) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a signal carries no payload, so two that land before the worker looks are one
+# piece of work, not two
+test "jobs: pending signals collapse" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SIGNALS = 0;
+    signal(?q);
+    signal(?q);
+    signal(?q);
+    if (!start(?q, record, note, nil)) {
+        dnit(?q);
+        ret 1;
+    }
+    join(?q);
+    var fail: bool = false;
+    if (SIGNALS != 1) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# queued input is drained ahead of a signal, so a rebuild landing mid-burst
+# never delays the message already waiting
+test "jobs: a queued message is taken before a pending signal" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SIGNALS  = 0;
+    SEEN_LEN = 0;
+    SEEN_SUM = 0;
+    signal(?q);
+    if (!push(?q, "a1", 2)) {
+        dnit(?q);
+        ret 1;
+    }
+    if (!start(?q, record, note, nil)) {
+        dnit(?q);
+        ret 1;
+    }
+    join(?q);
+    var fail: bool = false;
+    if (SEEN_LEN != 1) { fail = true; }
+    if (SIGNALS != 1)  { fail = true; }
     dnit(?q);
     if (fail) { ret 1; }
     ret 0;
@@ -518,6 +645,20 @@ pub fun cancel_add(c: *Cancels, id_token: str) bool {
     c.count             = c.count + 1;
     mutex.unlock(?c.lock);
     ret true;
+}
+
+# whether `id_token` was cancelled, leaving the record for `cancel_take`
+pub fun cancel_has(c: *Cancels, id_token: str) bool {
+    if (id_token == nil || c.ids == nil) { ret false; }
+    var found: bool = false;
+    mutex.lock(?c.lock);
+    var i: usize = 0;
+    for (i < c.count && !found) {
+        if (c.ids[i].body != nil && str_equals(c.ids[i].body, id_token)) { found = true; }
+        i = i + 1;
+    }
+    mutex.unlock(?c.lock);
+    ret found;
 }
 
 # whether `id_token` was cancelled, removing it if so

@@ -46,6 +46,8 @@ use mls.project;
 # own:      the document's own module id
 # own_fid:  the document's own source file id
 # root:     the project root that governs it, or nil for a standalone buffer
+# stale:    the snapshot predates this document's text; `text` maps between them
+# current:  the root's snapshot covers every buffer it mirrors, or there is no root
 pub rec Analyzed {
     interner: *intern.Interner;
     text:     positions.Text;
@@ -55,13 +57,18 @@ pub rec Analyzed {
     own:      sess.ModuleId;
     own_fid:  src.FileId;
     root:     *project.Root;
+    stale:    bool;
+    current:  bool;
 }
 
 # resolve `uri` to its current analysis
 #
 # Prefers the project snapshot, which is what makes cross-module references
 # resolvable; falls back to the isolated editor analysis only for a document
-# that belongs to no project, never as a way to paper over a failed load.
+# that belongs to no project, never as a way to paper over a failed load. A
+# snapshot behind the document's text is still the answer, read through the
+# mapping `project.document_view` attaches (#251); a caller that cannot answer
+# from earlier semantics uses `locate_current`.
 # ---
 # ws:   the workspace
 # es:   the standalone editor session
@@ -85,6 +92,8 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
         out.root     = v.root;
         out.own      = v.module;
         out.own_fid  = v.file_id;
+        out.stale    = v.stale;
+        out.current  = project.root_current(v.root);
         ret true;
     }
     if (project.has_project(ws, uri)) { ret false; }
@@ -98,6 +107,54 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     out.root     = nil;
     out.own      = doc.file_id::sess.ModuleId;
     out.own_fid  = doc.file_id;
+    out.stale    = false;
+    out.current  = true;
+    ret true;
+}
+
+# resolve `uri` to its current analysis whether or not the document is open
+#
+# Every positional request names a buffer the editor has open, so `analyze` is
+# written against the document store. A call-hierarchy item is not positional: it
+# names a declaration the server itself reported, and that declaration usually
+# lives in a module the editor has never opened. Resolving such an item through
+# the store would stop the hierarchy at the first unopened file - which is the
+# common case one step out from the cursor.
+#
+# An open document still wins, because its buffer carries unsaved edits that the
+# project's module snapshot does not. A uri outside any loaded root has no
+# analysis here; there is no standalone fallback, because an item is only ever
+# minted from a project in the first place.
+# ---
+# ws:   the workspace
+# es:   the standalone editor session
+# docs: the open-document registry
+# uri:  the document to analyze
+# out:  receives the analysis on success
+# ret:  true when the document could be analyzed
+pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
+    if (uri == nil)                       { ret false; }
+    if (documents.find(docs, uri) != nil) { ret analyze(ws, es, docs, uri, out); }
+
+    val root: *project.Root = project.root_for_loaded(ws, uri);
+    if (root == nil) { ret false; }
+    val mo: opt[sess.ModuleId] = project.module_for_uri(ws, root, uri);
+    if (sel mo.none) { ret false; }
+    val mid:  sess.ModuleId           = mo.some;
+    val mv_o: opt[project.ModuleView] = project.module_view(ws, root, mid);
+    if (sel mv_o.none) { ret false; }
+    val mv: project.ModuleView = mv_o.some;
+
+    out.interner = project.interner(ws, root);
+    out.text     = mv.text;
+    out.sr       = mv.sr;
+    out.a        = mv.a;
+    out.rr       = mv.rr;
+    out.own      = mid;
+    out.own_fid  = mv.file_id;
+    out.root     = root;
+    out.stale    = false;
+    out.current  = project.root_current(root);
     ret true;
 }
 
@@ -164,6 +221,18 @@ pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documen
     params: *sj.Value, uri: str, out: *Analyzed) opt[usize] {
     if (!analyze(ws, es, docs, uri, out)) { ret opt[usize].none{}; }
     ret offset_of(params, out.text);
+}
+
+# as `locate`, for a request that must not answer from a root that is behind
+# its buffers: a reference list or a rename is wrong, not merely approximate,
+# when built from earlier text. the server holds such a request while a rebuild
+# is on its way, so reaching here behind means no rebuild will arrive
+pub fun locate_current(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store,
+    params: *sj.Value, uri: str, out: *Analyzed) opt[usize] {
+    val o: opt[usize] = locate(ws, es, docs, params, uri, out);
+    if (sel o.none)   { ret o; }
+    if (!out.current) { ret opt[usize].none{}; }
+    ret o;
 }
 
 # the byte offset denoted by a request's `position`, or none when it is absent

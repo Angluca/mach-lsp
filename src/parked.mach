@@ -1,0 +1,162 @@
+# requests held until the snapshot they need exists
+#
+# A request that must not answer from a snapshot behind its buffers - a rename,
+# a reference list, a code action (#251) - waits here while a rebuild that will
+# catch the snapshot up is on its way. The request is kept as the bytes it
+# arrived as, because the parse arena that produced its tree is released at the
+# end of every message, and re-dispatching the bytes later runs the handler
+# exactly as if the request had just arrived.
+#
+# Arrival order is kept. The queue is owned by the analysis thread alone.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use mem:     std.memory;
+use strutil: std.text.string;
+
+# one held request
+# ---
+# body: the request's JSON text, owned
+# len:  byte length of `body`
+# uri:  the document the request names, owned, or nil
+# id:   the request id token as it appeared on the wire, owned
+pub rec Entry {
+    body: str;
+    len:  usize;
+    uri:  str;
+    id:   str;
+}
+
+# the held requests, oldest first
+pub rec Queue {
+    alloc: *Allocator;
+    items: *Entry;
+    len:   usize;
+    cap:   usize;
+}
+
+pub fun init(alloc: *Allocator) Queue {
+    ret Queue{alloc: alloc, items: nil, len: 0, cap: 0};
+}
+
+pub fun dnit(q: *Queue) {
+    var i: usize = 0;
+    for (i < q.len) {
+        entry_free(q.alloc, ?q.items[i]);
+        i = i + 1;
+    }
+    if (q.items != nil) { deallocate[Entry](q.alloc, q.items, q.cap); }
+    q.items = nil;
+    q.len   = 0;
+    q.cap   = 0;
+}
+
+# hold a request, copying everything it needs
+# ---
+# q:    the queue
+# body: the request's JSON text
+# len:  its byte length
+# uri:  the document it names, or nil
+# id:   its id token
+# ret:  false when the copy could not be made; the caller answers it instead
+pub fun push(q: *Queue, body: str, len: usize, uri: str, id: str) bool {
+    if (body == nil || id == nil) { ret false; }
+    if (q.len == q.cap) {
+        var cap: usize = q.cap * 2;
+        if (cap == 0) { cap = 4; }
+        if (q.items == nil) {
+            val r: res[*Entry, allocator.Error] = allocate[Entry](q.alloc, cap);
+            if (sel r.err) { ret false; }
+            q.items = r.ok;
+        }
+        or {
+            val r: res[*Entry, allocator.Error] = reallocate[Entry](q.alloc, q.items, q.cap, cap);
+            if (sel r.err) { ret false; }
+            q.items = r.ok;
+        }
+        q.cap = cap;
+    }
+    var e: Entry = Entry{body: nil, len: len, uri: nil, id: nil};
+    e.body = copy_bytes(q.alloc, body, len);
+    e.id   = copy_bytes(q.alloc, id, str_len(id));
+    if (uri != nil) { e.uri = copy_bytes(q.alloc, uri, str_len(uri)); }
+    if (e.body == nil || e.id == nil || (uri != nil && e.uri == nil)) {
+        entry_free(q.alloc, ?e);
+        ret false;
+    }
+    q.items[q.len] = e;
+    q.len          = q.len + 1;
+    ret true;
+}
+
+# move every held request out, leaving `q` empty
+pub fun take(q: *Queue) Queue {
+    val out: Queue = @q;
+    q.items = nil;
+    q.len   = 0;
+    q.cap   = 0;
+    ret out;
+}
+
+# release one entry's owned strings
+pub fun entry_free(alloc: *Allocator, e: *Entry) {
+    if (e.body != nil) { deallocate[u8](alloc, e.body::*u8, e.len + 1); }
+    if (e.id != nil)   { strutil.str_free(alloc, e.id); }
+    if (e.uri != nil)  { strutil.str_free(alloc, e.uri); }
+    e.body = nil;
+    e.id   = nil;
+    e.uri  = nil;
+}
+
+# whether `e` names `uri`
+pub fun names(e: *Entry, uri: str) bool {
+    ret e.uri != nil && uri != nil && str_equals(e.uri, uri);
+}
+
+fun copy_bytes(alloc: *Allocator, text: str, len: usize) str {
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
+    if (sel r.err) { ret nil; }
+    val out: *u8 = r.ok;
+    if (len > 0) { mem.raw_copy(out::ptr, text::ptr, len); }
+    out[len] = 0;
+    ret out::str;
+}
+
+use std.allocator;
+use std.allocator.page;
+
+test "parked: requests are held in arrival order and taken together" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q:    Queue = init(?pa);
+    var fail: bool  = false;
+    var i:    usize = 0;
+    for (i < 6) {
+        if (!push(?q, "{\"id\":1}", 8, "file:///a.mach", "1")) { fail = true; }
+        i = i + 1;
+    }
+    if (!push(?q, "{\"id\":\"b\"}", 10, nil, "\"b\"")) { fail = true; }
+    if (q.len != 7)                                    { fail = true; }
+    var batch: Queue = take(?q);
+    if (q.len != 0 || batch.len != 7)              { fail = true; }
+    if (!str_equals(batch.items[6].id, "\"b\""))   { fail = true; }
+    if (batch.items[6].uri != nil)                 { fail = true; }
+    if (!names(?batch.items[0], "file:///a.mach")) { fail = true; }
+    if (names(?batch.items[6], "file:///a.mach"))  { fail = true; }
+    dnit(?batch);
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}

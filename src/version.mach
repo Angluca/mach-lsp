@@ -1,0 +1,7 @@
+# the server's own version, taken from `[project].version` when it is compiled,
+# so a release binary cannot report a version other than the one it was tagged
+# with
+
+use std.types.string.str;
+
+pub val VERSION: str = $project.version;

@@ -101,7 +101,7 @@ pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push(?b, "{\"data\":[");
-    encode(?b, an.text.file, toks, n);
+    encode(?b, an.text, toks, n);
     json.buf_push(?b, "]}");
     render.send(?b, alloc, id_raw);
 
@@ -295,21 +295,36 @@ fun drop_overlaps(toks: *Tok, n: usize) usize {
 # emit the delta-encoded five-integer groups
 #
 # Each token is relative to the previous: line delta, then character delta
-# within a line or absolute character when the line changed.
-fun encode(b: *json.Buf, file: *src.SourceFile, toks: *Tok, n: usize) {
+# within a line or absolute character when the line changed. Positions are the
+# client's: a token of a stale analysis is carried into the current buffer, and
+# one whose text the client has since changed is dropped, since its class
+# describes bytes that are gone. Mapping keeps offsets in order, so the deltas
+# stay non-negative.
+fun encode(b: *json.Buf, t: positions.Text, toks: *Tok, n: usize) {
     var prev_line: usize = 0;
     var prev_char: usize = 0;
+    var written:   usize = 0;
     var i:         usize = 0;
     for (i < n) {
         var span: token.Span;
         span.offset = toks[i].offset;
         span.len    = toks[i].len;
-        val r: positions.LspRange = positions.range_of(file, span);
+        val lo: opt[token.Span] = positions.live_span(t, span, false);
+        if (sel lo.none) {
+            i = i + 1;
+            cnt;
+        }
+        val ro: opt[positions.LspRange] = positions.span_range(t, span);
+        if (sel ro.none) {
+            i = i + 1;
+            cnt;
+        }
+        val r: positions.LspRange = ro.some;
 
         # a token the conversion split across lines cannot be expressed as a
         # single length, so it is dropped rather than encoded wrong
         if (r.end_line == r.start_line) {
-            if (i > 0) { json.buf_push_byte(b, ','); }
+            if (written > 0) { json.buf_push_byte(b, ','); }
             json.buf_push_usize(b, r.start_line - prev_line);
             json.buf_push_byte(b, ',');
             if (r.start_line == prev_line) { json.buf_push_usize(b, r.start_char - prev_char); }
@@ -322,6 +337,7 @@ fun encode(b: *json.Buf, file: *src.SourceFile, toks: *Tok, n: usize) {
             json.buf_push_i64(b, toks[i].mods);
             prev_line = r.start_line;
             prev_char = r.start_char;
+            written   = written + 1;
         }
         i = i + 1;
     }

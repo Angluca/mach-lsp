@@ -11,6 +11,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -198,6 +199,21 @@ fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) res[*D
     d.revision  = st.revision;
     d.version   = version;
     ret res[*Document, str].ok{d};
+}
+
+# the source file holding `d`'s current text, with its line index
+#
+# The editor buffer is updated with every open and change, so this is exactly
+# the text the client's positions index. nil when the buffer is missing.
+# ---
+# st:  the store
+# d:   a tracked document
+# ret: the buffer's source file, or nil
+pub fun live_file(st: *Store, d: *Document) *src.SourceFile {
+    if (st == nil || d == nil) { ret nil; }
+    val fo: opt[*src.SourceFile] = src.get(?st.es.s.sources, d.file_id);
+    if (sel fo.some) { ret fo.some; }
+    ret nil;
 }
 
 # retire a tracked document, freeing its URI. the editor buffer's
