@@ -27,12 +27,35 @@ use std.types.string.str;
 
 use std.allocator.Allocator;
 
+use mach.lang.fe.ast.decl;
 use mach.lang.fe.token;
 use src: mach.lang.source;
 
 use mls.json;
 use mls.positions;
 use mls.transport;
+
+# the LSP SymbolKind a declaration kind is reported as
+#
+# documentSymbol, workspace/symbol and the call hierarchy all name the same
+# declarations, and each had - or was about to have - its own copy of this table.
+# One spelling, so two features cannot disagree about what a `tag` is.
+#
+# A `test` block is SymbolKind.Function: it is a callable body, and the call
+# hierarchy reports calls made from one.
+# ---
+# kind: the declaration kind
+# ret:  the LSP SymbolKind
+pub fun symbol_kind(kind: decl.DeclKind) i64 {
+    if (kind == decl.DECL_KIND_FUN)  { ret 12; }
+    if (kind == decl.DECL_KIND_TEST) { ret 12; }
+    if (kind == decl.DECL_KIND_REC)  { ret 23; }
+    if (kind == decl.DECL_KIND_UNI)  { ret 10; }
+    if (kind == decl.DECL_KIND_TAG)  { ret 10; }
+    if (kind == decl.DECL_KIND_DEF)  { ret 26; }
+    if (kind == decl.DECL_KIND_VAL)  { ret 14; }
+    ret 13;
+}
 
 # append an LSP Range
 # ---

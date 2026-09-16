@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where it is declared, so a call whose declaring module was never loaded keeps
   its function kind instead of claiming its target is unknown.
 
+### Changed
+- refactor(render): the LSP SymbolKind table for a declaration kind now has one
+  spelling, `render.symbol_kind`, which is that module's stated purpose.
+  documentSymbol and the call hierarchy both name declarations and each had its
+  own copy; they disagreed about `tag`. As a result a `uni` and a `tag` are both
+  SymbolKind.Enum and a `test` block is SymbolKind.Function. `tag` declarations
+  still never reach the outline, because `features.decl_name_span` has no arm
+  for them - see #249.
+
 ### Fixed
 - a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,
   so a decl-keyed cross-module identity test reports that no module importing a

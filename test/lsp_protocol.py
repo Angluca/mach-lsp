@@ -1351,6 +1351,67 @@ def run_type_definition(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+KIND_BUFFER = """pub rec R { v: i32; }
+pub uni U { a: i32; b: f32; }
+pub tag T: u8 { one; two: i32; }
+pub def D: fun(i32) i32;
+pub val V: i32 = 1;
+pub var W: i32 = 2;
+
+pub fun f(n: i32) i32 {
+    ret n;
+}
+"""
+
+
+def run_document_symbol_kinds(server: Path, timeout: float) -> None:
+    """One SymbolKind table, shared by every feature that names a declaration.
+
+    documentSymbol and the call hierarchy both report declarations, and each had
+    its own copy of the mapping. They disagreed: a `tag` was SymbolKind.Variable
+    on one side, which is what a copy drifts into. `render.symbol_kind` is the one
+    spelling, and this pins what it says.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-dsymkind-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "kinds.mach"
+        buffer.write_text(KIND_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": KIND_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            symbols = session.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            require(isinstance(symbols, list) and symbols,
+                    f"documentSymbol returned nothing: {symbols!r}")
+            kinds = {entry["name"]: entry["kind"] for entry in symbols}
+            expected = {"R": 23, "U": 10, "D": 26, "V": 14, "W": 13, "f": 12}
+            for name, kind in expected.items():
+                require(kinds.get(name) == kind,
+                        f"{name} is SymbolKind {kinds.get(name)!r}, expected {kind}")
+
+            # `tag` has no arm in `features.decl_name_span`, so it never reaches
+            # the outline at all - #249. Asserted rather than described: fixing
+            # that issue turns this red, which is the prompt to add "T": 10 above.
+            require("T" not in kinds,
+                    "a tag now reaches documentSymbol - #249 is fixed, so assert its kind")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
     """A record's fields and a function's parameters belong in the outline.
 
@@ -3570,6 +3631,7 @@ def main() -> int:
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
+        run_document_symbol_kinds(server, args.timeout)
         run_type_definition(server, args.timeout)
         run_call_hierarchy(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
@@ -3604,6 +3666,7 @@ def main() -> int:
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
+    print("  one SymbolKind table: every feature that names a declaration agrees")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  call hierarchy resolves items across modules, and reports calls through fun values")
     print("  a syntax-only request answers from the buffer without reloading the project")

@@ -83,12 +83,8 @@ use strutil: std.text.string;
 use std.allocator;
 
 # LSP SymbolKind values used for hierarchy items
-val LSP_FUNCTION:   i64 = 12;
-val LSP_VARIABLE:   i64 = 13;
-val LSP_CONSTANT:   i64 = 14;
-val LSP_STRUCT:     i64 = 23;
-val LSP_ENUM:       i64 = 10;
-val LSP_TYPE_PARAM: i64 = 26;
+val LSP_FUNCTION: i64 = 12;
+val LSP_VARIABLE: i64 = 13;
 
 # what an item says about a call whose target is not statically known
 val INDIRECT_DETAIL: str = "fun value: the call target is not statically known";
@@ -691,7 +687,7 @@ fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text:
         val nso: opt[token.Span] = features.decl_name_span(d);
         if (sel nso.some) { name = nso.some; }
     }
-    push_item(b, alloc, uri, text, name, d.span, decl_lsp_kind(d.kind), nil);
+    push_item(b, alloc, uri, text, name, d.span, render.symbol_kind(d.kind), nil);
 }
 
 # append a CallHierarchyItem
@@ -722,18 +718,6 @@ fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     json.buf_push(b, ",\"selectionRange\":");
     render.span_range(b, text.file, name_span);
     json.buf_push_byte(b, '}');
-}
-
-# the LSP SymbolKind for a declaration kind
-fun decl_lsp_kind(kind: decl.DeclKind) i64 {
-    if (kind == decl.DECL_KIND_FUN)  { ret LSP_FUNCTION; }
-    if (kind == decl.DECL_KIND_TEST) { ret LSP_FUNCTION; }
-    if (kind == decl.DECL_KIND_REC)  { ret LSP_STRUCT; }
-    if (kind == decl.DECL_KIND_UNI)  { ret LSP_ENUM; }
-    if (kind == decl.DECL_KIND_TAG)  { ret LSP_ENUM; }
-    if (kind == decl.DECL_KIND_DEF)  { ret LSP_TYPE_PARAM; }
-    if (kind == decl.DECL_KIND_VAL)  { ret LSP_CONSTANT; }
-    ret LSP_VARIABLE;
 }
 
 fun empty_span() token.Span {

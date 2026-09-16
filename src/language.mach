@@ -2372,7 +2372,7 @@ fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: 
     json.buf_push_quoted(b, name);
     json.free_str(name, alloc);
     json.buf_push(b, ",\"kind\":");
-    json.buf_push_i64(b, decl_lsp_kind(d.kind));
+    json.buf_push_i64(b, render.symbol_kind(d.kind));
     json.buf_push(b, ",\"range\":");
     render.span_range(b, an.text.file, d.span);
     json.buf_push(b, ",\"selectionRange\":");
@@ -2495,17 +2495,6 @@ val LSP_SYMBOL_ENUM_MEMBER:    i64 = 22;
 val LSP_SYMBOL_FIELD:          i64 = 8;
 val LSP_SYMBOL_VARIABLE:       i64 = 13;
 val LSP_SYMBOL_TYPE_PARAMETER: i64 = 26;
-
-# the LSP SymbolKind for a decl kind (documentSymbol)
-fun decl_lsp_kind(kind: decl.DeclKind) i64 {
-    if (kind == decl.DECL_KIND_FUN) { ret 12; }
-    if (kind == decl.DECL_KIND_REC) { ret 23; }
-    if (kind == decl.DECL_KIND_UNI) { ret 10; }
-    if (kind == decl.DECL_KIND_DEF) { ret 26; }
-    if (kind == decl.DECL_KIND_VAL) { ret 14; }
-    if (kind == decl.DECL_KIND_VAR) { ret 13; }
-    ret 13;
-}
 
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
