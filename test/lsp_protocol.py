@@ -487,6 +487,42 @@ need = []
     return main, dep, main_text, live_dep_text
 
 
+class BuildLog:
+    """The server's own record of the project builds it ran, read from its trace.
+
+    Every background build logs when it is scheduled and when it finishes, and
+    the inline first load also logs that it was analyzed, so subtracting those
+    leaves the background ones. Counting the server's record is deterministic,
+    where waiting for the diagnostics stream to fall quiet is not: a build that
+    is still running is quiet.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def env(self) -> dict[str, str]:
+        return {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(self.path)}
+
+    def text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return ""
+
+    def scheduled(self) -> int:
+        return self.text().count("off the analysis thread")
+
+    def quiesced(self) -> bool:
+        log = self.text()
+        done = max(0, log.count("project: rebuilt") - log.count("project: analyzed"))
+        return done >= log.count("off the analysis thread")
+
+    def settle(self, at_least: int, description: str, deadline: float = 60.0) -> None:
+        """Wait until at least `at_least` background builds ran and none is running."""
+        eventually(lambda: self.scheduled() >= at_least and self.quiesced(),
+                   lambda done: done, description, deadline)
+
+
 def eventually(
     probe: Callable[[], Any],
     want: Callable[[Any], bool],
@@ -944,6 +980,81 @@ need = []
     return main, text
 
 
+def run_disk_change_during_build(server: Path, timeout: float) -> None:
+    """A file written while a build runs is rebuilt, not mistaken for the snapshot's.
+
+    A build reads a module early and records its disk fingerprint at the end. A
+    write landing in between leaves a snapshot of the old bytes beside a
+    fingerprint of the new ones, and a fingerprint scan then finds nothing to
+    rebuild. Where in a build the write lands is not observable from outside, so
+    it is tried across the build's duration; the window is most of the build,
+    and every attempt must converge on what is on disk.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-midbuild-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "mid", 384)
+        module = main.parent / "m0.mach"
+        module_text = module.read_text(encoding="utf-8")
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if value.lstrip().startswith("ret "))
+            position = {"line": line, "character": lines[line].index("base0") + 2}
+            version = 1
+
+            def rebuild() -> None:
+                nonlocal version
+                version += 1
+                before = builds.scheduled()
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
+                )
+                eventually(builds.scheduled, lambda n: n > before, "the rebuild to start")
+
+            # the spare's first build is cold, so two rebuilds warm both sessions,
+            # and the second says how long a warm one takes on this machine
+            for _ in range(2):
+                rebuild()
+                builds.settle(0, "a timing rebuild")
+            durations = re.findall(r"project: rebuilt .* in (\d+)ms", builds.text())
+            warm = int(durations[-1]) / 1000.0
+
+            for attempt, fraction in enumerate((0.1, 0.3, 0.5, 0.7, 0.9)):
+                value = 1000 + attempt
+                rebuild()
+                time.sleep(warm * fraction)
+                module.write_text(module_text.replace("pub val base0: i32 = 0;",
+                                                      f"pub val base0: i32 = {value};"),
+                                  encoding="utf-8")
+                builds.settle(0, "the interrupted rebuild")
+                time.sleep(FINGERPRINT_WINDOW)
+                settled_result(
+                    session, "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()}, "position": position},
+                    lambda r, want=value: f"base0: i32 = {want}" in json.dumps(r),
+                    f"hover reflecting a write at {int(fraction * 100)}% of a rebuild")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
     """Prove a request is ANSWERED while a project rebuild is still running.
 
@@ -957,30 +1068,10 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="mls-rebuild-") as directory:
         root = Path(directory).resolve()
         main, text = write_wide_project(root, "wide", 48)
-        trace_path = root / "trace.log"
-        session = LspSession(server, root, timeout,
-                             {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
         finished = False
         try:
-            def log() -> str:
-                return trace_path.read_text(encoding="utf-8", errors="replace")
-
-            def scheduled() -> int:
-                return log().count("off the analysis thread")
-
-            def quiesced() -> bool:
-                """True when every scheduled rebuild has finished.
-
-                Every build logs that it finished; the inline first one also logs
-                that it was analyzed, so subtracting those leaves the off-thread
-                ones. Counting the server's own record is deterministic, where
-                waiting for the diagnostics stream to fall quiet is not: a build
-                that is still running is quiet.
-                """
-                text_log = log()
-                finished = max(0, text_log.count("project: rebuilt")
-                                  - text_log.count("project: analyzed"))
-                return finished >= text_log.count("off the analysis thread")
 
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
             session.notify("initialized", {})
@@ -990,7 +1081,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
-            eventually(quiesced, lambda done: done, "the initial load to quiesce", 60.0)
+            builds.settle(0, "the initial load to quiesce")
 
             edited = text + "\n# one edit, one rebuild\n"
             session.notify(
@@ -1015,11 +1106,11 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
 
             # and the rebuild does land, republishing the document it moved
             session.diagnostics(main.as_uri(), 2)
-            eventually(quiesced, lambda done: done, "the rebuild to quiesce", 60.0)
+            builds.settle(0, "the rebuild to quiesce")
 
             # a burst of edits during a build coalesces into ONE follow-up build,
             # not one per edit. counted from the server's own log, not timed.
-            before = scheduled()
+            before = builds.scheduled()
             version = 2
             for _ in range(12):
                 version += 1
@@ -1029,8 +1120,8 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
                 )
             session.diagnostics(main.as_uri(), version)
-            eventually(quiesced, lambda done: done, "the burst's rebuilds to quiesce", 60.0)
-            after = scheduled()
+            builds.settle(0, "the burst's rebuilds to quiesce")
+            after = builds.scheduled()
             require(after - before <= 2,
                     f"a burst of 12 edits started {after - before} rebuilds, not at most 2")
 
@@ -3924,6 +4015,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
+        run_disk_change_during_build(server, args.timeout)
         run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)
