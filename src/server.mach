@@ -70,6 +70,7 @@ val FEATURE_SIGNATURE_HELP:     u8 = 8;
 val FEATURE_INLAY_HINT:         u8 = 9;
 val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
 val FEATURE_CODE_ACTION:        u8 = 11;
+val FEATURE_TYPE_DEFINITION:    u8 = 12;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -412,6 +413,11 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_DEFINITION);
         ret;
     }
+    if (str_equals(method, "textDocument/typeDefinition")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_TYPE_DEFINITION);
+        ret;
+    }
     if (str_equals(method, "textDocument/references")) {
         json.free_str(method, a);
         handle_feature(srv, root, params, FEATURE_REFERENCES);
@@ -498,7 +504,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -671,6 +677,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
 
     if (which == FEATURE_HOVER)              { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
     or (which == FEATURE_DEFINITION)         { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_TYPE_DEFINITION)    { language.type_definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_REFERENCES)         { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_RENAME)             { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_PREPARE_RENAME)     { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }

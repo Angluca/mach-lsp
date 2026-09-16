@@ -944,6 +944,177 @@ def run_import_navigation(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+NAV_MANIFEST = """[project]
+id = "nav"
+version = "0.1.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+"""
+
+NAV_DEFS = """pub rec Inner { w: i32; }
+pub rec Box { v: i32; inner: Inner; }
+pub tag Color: u8 { red; blue: i32; }
+pub fun make() Color { ret Color.red{}; }
+pub fun helper(n: i32) i32 { ret n + 1; }
+"""
+
+NAV_MAIN = """use nav.defs.Box;
+use nav.defs.Color;
+use nav.defs.make;
+use nav.defs.helper;
+
+pub def Handler: fun(i32) i32;
+
+pub rec Table { fn: Handler; }
+
+pub fun local(n: i32) i32 {
+    ret helper(n) + helper(n + 1);
+}
+
+pub fun pick() Color {
+    ret make();
+}
+
+pub fun indirect(f: Handler, t: Table) i32 {
+    ret f(1) + t.fn(2);
+}
+
+pub fun main() i32 {
+    var b: Box;
+    val c: Color = make();
+    val n: i32   = b.v + b.inner.w;
+    ret local(n) + indirect(helper, Table{fn: helper});
+}
+"""
+
+
+def write_nav_project(parent: Path) -> tuple[Path, Path, str]:
+    """A two-module project covering the navigation features' interesting shapes.
+
+    One module declares a record, a nested record, a tag and two functions; the
+    other imports them and calls across the module boundary, directly and through
+    a `fun` value. Cross-module is the point: a single file would let a walk that
+    never leaves the open buffer pass.
+    """
+    root = parent / "nav"
+    (root / "src").mkdir(parents=True)
+    (root / "mach.toml").write_text(NAV_MANIFEST, encoding="utf-8")
+    main = root / "src" / "main.mach"
+    defs = root / "src" / "defs.mach"
+    main.write_text(NAV_MAIN, encoding="utf-8")
+    defs.write_text(NAV_DEFS, encoding="utf-8")
+    return main, defs, NAV_MAIN
+
+
+def nav_position(text: str, within: str, needle: str) -> dict[str, Any]:
+    """A cursor one byte inside `needle`, on the unique line holding `within`."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if within in value)
+    return {"line": line, "character": lines[line].index(needle, lines[line].index(within)) + 1}
+
+
+def nav_range(text: str, needle: str) -> dict[str, Any]:
+    """The LSP range of the first occurrence of `needle` in `text`."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if needle in value)
+    start = lines[line].index(needle)
+    return {"start": {"line": line, "character": start},
+            "end": {"line": line, "character": start + len(needle)}}
+
+
+def run_type_definition(server: Path, timeout: float) -> None:
+    """typeDefinition lands on the declaration of an expression's type.
+
+    Distinct from definition, which lands on the declaration of the name itself.
+    The cases that matter are the ones a record-only back-link would get wrong: a
+    `tag` names the type of every `opt` and `res` in the language, and a callee's
+    own type is a function type, so a pivot that commits to the tightest typed
+    node answers null exactly where a user puts the cursor.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-typedef-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}},
+            )["result"]["capabilities"]
+            require(capabilities.get("typeDefinitionProvider") is True,
+                    f"typeDefinition is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+
+            def type_definition(within: str, needle: str) -> Any:
+                return session.request(
+                    "textDocument/typeDefinition",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": nav_position(text, within, needle)},
+                )["result"]
+
+            def lands_on(within: str, needle: str, name: str) -> None:
+                result = type_definition(within, needle)
+                require(isinstance(result, dict),
+                        f"typeDefinition on {needle!r} is not a Location: {result!r}")
+                require(result.get("uri") == defs.as_uri(),
+                        f"typeDefinition on {needle!r} left the declaring module: {result!r}")
+                require(result.get("range") == nav_range(NAV_DEFS, name),
+                        f"typeDefinition on {needle!r} is not {name!r}: {result!r}")
+
+            # a value lands on its type's declaration, in the other module
+            lands_on("var b: Box;", "b", "Box")
+            # a written type does too, from the annotation itself
+            lands_on("var b: Box;", "Box", "Box")
+            # a field access lands on the record declaring the field's type
+            lands_on("b.v + b.inner.w", "inner", "Inner")
+            # a call reaches its return type, not the callee's function type. in
+            # `ret make();` no enclosing binding can stand in for it, so this is
+            # the position that proves the call itself is consulted
+            lands_on("ret make();", "make", "Color")
+            lands_on("val c: Color = make();", "make", "Color")
+            # and a tag is a type like any other
+            lands_on("val c: Color = make();", "Color", "Color")
+
+            # a type with no nominal site has nowhere to go
+            for within, needle in (("val n: i32   = b.v", "b.v"),
+                                   ("val n: i32   = b.v", "v"),
+                                   ("ret local(n)", "n")):
+                result = type_definition(within, needle)
+                require(result is None,
+                        f"typeDefinition on the primitive {needle!r} answered {result!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
     """A record's fields and a function's parameters belong in the outline.
 
@@ -3163,6 +3334,7 @@ def main() -> int:
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
+        run_type_definition(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
@@ -3195,6 +3367,7 @@ def main() -> int:
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
+    print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  a syntax-only request answers from the buffer without reloading the project")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")

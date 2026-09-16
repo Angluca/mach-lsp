@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(navigation): `textDocument/typeDefinition` goes to the declaring site of
+  an expression's type. `RecordSite` admits `rec` / `uni` only, which is right
+  for the field features but would answer null for a `tag` - the type of every
+  `opt` and `res` in the language - so the nominal back-link generalises to
+  `project.TypeSite`. The cursor tries four candidates and takes the first that
+  resolves to a declaration rather than the first that types, because a callee's
+  own type is a function type and committing to it answers null on `make` in
+  `ret make();`.
+
 ### Fixed
 - perf(analysis): a syntax-only request no longer reloads the project through
   the editor session. `editor.analyze` tore the project down on every call, so
