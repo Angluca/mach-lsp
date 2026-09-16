@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- feat(cd): releases publish a prebuilt release-profile `mls` for
+  `x86_64-linux`, `aarch64-linux`, `x86_64-windows`, `aarch64-darwin` and
+  `x86_64-darwin` (#260).
+  - Assets are `mls-<version>-<platform>.tar.gz` (`.zip` on windows) and
+    `SHA256SUMS`, named for editor extensions (see the README).
+  - Each binary is built and run on its own host, and must report the tag's
+    version.
+  - The release is drafted with every asset, checked, and only then made public.
+  - A dispatch rehearses the whole path and stops at a draft.
+- build: the windows server is `mls.exe` (`out = "bin/mls{artifact.suffix}"`);
+  it was written as `mls`, which a client launching `mls` cannot run.
+- feat(server): `mls --version` prints `mls <version>`, and `initialize`
+  reports it as `serverInfo.version`, both from `[project].version`.
 - feat(navigation): `textDocument/typeDefinition` goes to the declaring site of
   an expression's type. `RecordSite` admits `rec` / `uni` only, which is right
   for the field features but would answer null for a `tag` - the type of every
