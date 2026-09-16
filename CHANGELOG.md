@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- build: the mach pin advances to v5.0.4. v5.0.3 is codegen and register
+  allocation work the server only consumes; v5.0.4 removes the filesystem
+  transaction layer, so no `.mach-txn-lock`, `.machtxn.claims/` or
+  `out/.mach-txn` is created under the server's own build, and fixes a path
+  dependency copy that stopped at project boundaries. The editor session's
+  analysis path is byte-identical to v5.0.2.
+
 ## [0.18.0] - 2026-09-13
 
 Mach 5.0 migration. The server now builds against the mach v5.0.0 compiler and
