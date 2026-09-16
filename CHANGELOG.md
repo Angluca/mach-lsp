@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for them - see #249.
 
 ### Fixed
+- fix(project): a source file written while a build ran is rebuilt rather than
+  recorded as already seen (#254). A build fingerprinted its modules after
+  analyzing them, so a write landing in between left a snapshot of the old
+  bytes beside a fingerprint of the new ones, and no scan would find it. A
+  fingerprint is now kept only when the file still holds the analyzed bytes.
 - a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,
   so a decl-keyed cross-module identity test reports that no module importing a
   function calls it. `features.symbol_denotes` adds the interned canonical name
