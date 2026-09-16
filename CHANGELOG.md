@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   puts the same measurement at 1.00x. std advances to v2.2.0 alongside it.
 
 ### Changed
+- project: a root that already has a snapshot rebuilds on a worker thread
+  instead of on the analysis thread. Each root owns two sessions and ping-pongs
+  between them: one serves every request while the other is built into, and the
+  finished snapshot is swapped in at a message boundary, where no request holds
+  a pointer into the outgoing session. The idle session keeps its query cache,
+  which is what keeps a rebuild a fraction of a cold build - building into a
+  fresh session each time measured ~34s against this repo where the retained
+  one measures ~7s. A root with no snapshot has nothing to serve, so its first
+  build still runs inline, and a failed rebuild leaves the previous snapshot
+  serving rather than dropping it.
+- diagnostics: the interim publish for a document governed by a loaded project
+  runs to parse, not sema. It is an answer a rebuild is already on its way to
+  replace, and running it to sema dragged the whole import closure through the
+  analysis thread - the exact cost moving the rebuild off it was meant to
+  remove. Where no project governs the document, that analysis is still the
+  authority and still runs to sema.
+- jobs: the analysis thread's queue multiplexes client messages with an
+  internal signal, so a rebuild finishing while the client is idle still
+  reaches the editor instead of waiting for the next keystroke.
 - test: the protocol suite asserts the healthy-project latency of every
   syntax-only feature, not just the standalone path. The previous assertion
   broke the manifest before timing `documentSymbol`, so it measured the one

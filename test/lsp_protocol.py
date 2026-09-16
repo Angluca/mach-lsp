@@ -487,6 +487,19 @@ need = []
     return main, dep, main_text, live_dep_text
 
 
+def settle_rebuilds(session: LspSession) -> None:
+    """Wait for any in-flight project rebuild to be swapped in.
+
+    A rebuild runs off the analysis thread, so the edit that triggered it is
+    answered from the PREVIOUS snapshot and the new one arrives a moment later,
+    announced by the republish that follows the swap. An assertion about
+    post-rebuild state has to wait for that republish; it cannot assume the edit
+    rebuilt inline. Waiting for the diagnostics stream to fall quiet is how a
+    client sees it, so it is how the test sees it too.
+    """
+    session.quiet_diagnostics()
+
+
 def assert_definition(session: LspSession, main: Path, definition: Path, text: str) -> None:
     """Check that `answer` resolves into the expected project root."""
     lines = text.splitlines()
@@ -657,27 +670,40 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": shared_left_v2}]},
             )
             session.diagnostics(shared_left[0].as_uri(), 2)
+            settle_rebuilds(session)
             assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
             assert_definition(session, *shared_right)
             assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
 
             # A rejected dynamic registration must leave manifest fingerprint
-            # fallback active: a broken manifest disables the snapshot, and a
-            # restored one is retried without a watcher notification.
+            # fallback active. A broken manifest is a FAILED REBUILD, not a
+            # dropped snapshot: the failure is reported and the previous
+            # snapshot keeps answering, so what is asserted is that the scan
+            # fired and said so - not that cross-module features went dark.
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
             # the fingerprint fallback coalesces to at most one scan per 250 ms
-            # per root, so a request issued inside that window is answered from
-            # the still-live snapshot. wait past it, or this asserts nothing.
+            # per root, so a request issued inside that window never scans at
+            # all. wait past it, or this asserts nothing.
             time.sleep(0.4)
-            broken = session.request(
+            session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": alpha[0].as_uri()},
                  "position": {"line": 3, "character": 9}},
             )
-            require(broken.get("result") is None,
-                    f"watcher rejection disabled manifest fallback: {broken!r}")
+            warning = session.wait_for(
+                lambda item: (item.get("method") == "window/showMessage"
+                              and isinstance(item.get("params"), dict)
+                              and "failed to load project"
+                              in str(item["params"].get("message", ""))),
+                "broken manifest warning",
+            )
+            require(warning["params"].get("type") == 2,
+                    f"load failure was not reported as a warning: {warning!r}")
+            # the rebuild failed, so the snapshot it would have replaced is
+            # still the one serving
+            assert_definition(session, *alpha)
             alpha_manifest.write_text(manifest_text, encoding="utf-8")
             # and again on the way back: a failed root retries on the next
             # fingerprint scan, not on the next request
@@ -743,11 +769,13 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": main_v2}]},
             )
             session.diagnostics(alpha_main.as_uri(), 4)
+            settle_rebuilds(session)
             require(definition(session, alpha_main, main_v2, "live").get("uri") == alpha_def.as_uri(),
                     "failed snapshot did not retry after the next unsaved revision")
 
             session.notify("textDocument/didClose", {"textDocument": {"uri": alpha_def.as_uri()}})
             assert_diagnostics(session.diagnostics(alpha_def.as_uri(), None), False)
+            settle_rebuilds(session)
             after_close = session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": alpha_main.as_uri()},
@@ -761,6 +789,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": alpha_text}]},
             )
             assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 5), False, 5)
+            settle_rebuilds(session)
             assert_definition(session, alpha_main, alpha_def, alpha_text)
 
             # A dependency opened before its ancestor graph is loaded must still
@@ -780,6 +809,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                                   "version": 1, "text": vendor_text}},
             )
             assert_diagnostics(session.diagnostics(vendor_main.as_uri(), 1), False, 1)
+            settle_rebuilds(session)
             vendor_definition = definition(session, vendor_main, vendor_text, "live")
             require(vendor_definition.get("uri") == vendor_dep.as_uri(),
                     f"vendored unsaved export did not resolve: {vendor_definition!r}")
@@ -843,6 +873,138 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             telemetry = session.finish()
             finished = True
             return telemetry, session.timings
+        finally:
+            if not finished:
+                session.abort()
+
+
+def write_wide_project(parent: Path, project_id: str, modules: int) -> tuple[Path, str]:
+    """Create a project whose import closure is big enough to take real time.
+
+    The rebuild has to outlast one request round-trip for the concurrency test
+    to mean anything: against a three-file project, "answered during the
+    rebuild" and "answered after it" are the same millisecond.
+    """
+    root = parent / project_id
+    source = root / "src"
+    source.mkdir(parents=True)
+    (root / "mach.toml").write_text(
+        f"""[project]
+id = "{project_id}"
+version = "0.1.0"
+src = "src"
+out = "out/{{target.name}}/{{profile.name}}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+""",
+        encoding="utf-8",
+    )
+    for index in range(modules):
+        body = [f"pub val base{index}: i32 = {index};"]
+        for k in range(24):
+            body.append(f"pub fun f{index}_{k}(a: i32, b: i32) i32 {{ ret a * {k + 1} + b + base{index}; }}")
+            body.append(f"pub rec R{index}_{k} {{ x: i32; y: i32; }}")
+        (source / f"m{index}.mach").write_text("\n".join(body) + "\n", encoding="utf-8")
+    uses = "\n".join(f"use {project_id}.m{index}.base{index};" for index in range(modules))
+    total = " + ".join(f"base{index}" for index in range(modules))
+    text = f"{uses}\n\npub fun main() i32 {{\n    ret {total};\n}}\n"
+    main = source / "main.mach"
+    main.write_text(text, encoding="utf-8")
+    return main, text
+
+
+def run_rebuild_concurrency(server: Path, timeout: float) -> None:
+    """Prove a request is ANSWERED while a project rebuild is still running.
+
+    This is the contract the off-thread rebuild exists for, so it is asserted by
+    ordering rather than by a clock: the edit's own diagnostics arrive first, the
+    request is answered next, and only then does the republish that follows the
+    swap appear. If the rebuild still owned the analysis thread, the request
+    could not be answered until it finished, and the republish could not arrive
+    after an answer that never came before it.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-rebuild-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "wide", 48)
+        trace_path = root / "trace.log"
+        session = LspSession(server, root, timeout,
+                             {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            settle_rebuilds(session)
+
+            edited = text + "\n# one edit, one rebuild\n"
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            # the edit is answered immediately, from editor analysis of the live
+            # buffer, while the rebuild it scheduled is still running
+            session.diagnostics(main.as_uri(), 2)
+
+            symbols = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(isinstance(symbols.get("result"), list) and symbols["result"],
+                    f"a request during a rebuild was not answered: {symbols!r}")
+            # nothing republished while that request was outstanding, so the
+            # rebuild had not finished when it was answered
+            early = [item for item in session.pending
+                     if item.get("method") == "textDocument/publishDiagnostics"]
+            require(not early,
+                    f"the rebuild finished before the request was answered: {early!r}")
+
+            # and the rebuild does land, republishing the document it moved
+            session.diagnostics(main.as_uri(), 2)
+            settle_rebuilds(session)
+
+            # a burst of edits during a build coalesces into ONE follow-up build,
+            # not one per edit. counted from the server's own log, not timed.
+            before = trace_path.read_text(encoding="utf-8", errors="replace").count(
+                "off the analysis thread")
+            version = 2
+            for _ in range(12):
+                version += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
+                )
+            session.diagnostics(main.as_uri(), version)
+            settle_rebuilds(session)
+            after = trace_path.read_text(encoding="utf-8", errors="replace").count(
+                "off the analysis thread")
+            require(after - before <= 2,
+                    f"a burst of 12 edits started {after - before} rebuilds, not at most 2")
+
+            session.finish()
+            finished = True
         finally:
             if not finished:
                 session.abort()
@@ -928,6 +1090,7 @@ def run_import_navigation(server: Path, timeout: float) -> None:
                                   "version": 1, "text": bridge_text}},
             )
             session.diagnostics(bridge.as_uri(), 1)
+            settle_rebuilds(session)
             blines = bridge_text.splitlines()
             bline = next(i for i, v in enumerate(blines) if v.startswith("fwd "))
             fwd = {"textDocument": {"uri": bridge.as_uri()},
@@ -1322,6 +1485,11 @@ def run_completion_context(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
                 )
                 session.diagnostics(main.as_uri(), version[0])
+                # this case is about what PROJECT-backed completion offers, so it
+                # waits for the off-thread rebuild the edit scheduled. without the
+                # wait it would silently grade the isolated editor result instead,
+                # which `isIncomplete` is then asserted to rule out.
+                settle_rebuilds(session)
                 response = session.request(
                     "textDocument/completion",
                     {"textDocument": {"uri": main.as_uri()},
@@ -1329,6 +1497,8 @@ def run_completion_context(server: Path, timeout: float) -> None:
                 )
                 result = response.get("result")
                 require(isinstance(result, dict), f"completion is not a list: {result!r}")
+                require(result.get("isIncomplete") is False,
+                        f"completion answered from isolated analysis: {result!r}")
                 items = result.get("items")
                 require(isinstance(items, list), f"completion has no items: {result!r}")
                 for item in items:
@@ -1436,6 +1606,7 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
                     f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
 
             session.diagnostics(main.as_uri(), version)
+            settle_rebuilds(session)
             rebuilt = session.request(
                 "textDocument/completion",
                 {"textDocument": {"uri": main.as_uri()},
@@ -1614,6 +1785,7 @@ def run_signature_help(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
                 )
                 session.diagnostics(main.as_uri(), version[0])
+                settle_rebuilds(session)
                 response = session.request(
                     "textDocument/signatureHelp",
                     {"textDocument": {"uri": main.as_uri()},
@@ -2383,18 +2555,36 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
             assert_definition(session, main, defs, text)
 
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
+            character = lines[line].index("watched") + 1
+
+            def poke_and_settle() -> None:
+                """Trigger the fingerprint scan, then wait for the rebuild it schedules.
+
+                The scan runs inside a request, and the rebuild it finds work for
+                runs off the analysis thread, so one request schedules and a later
+                one observes. Sleeping past the 250 ms scan window is what makes
+                the scan happen at all; settling is what makes the result visible.
+                """
+                session.request(
+                    "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": character}},
+                )
+                settle_rebuilds(session)
+
             # the edit must keep the project compiling: mach 5.0 releases a
             # project whose sema phase is rejected (briar-systems/mach#3337)
             changed = defs.read_text(encoding="utf-8").replace(
                 "pub val watched: i32 = 9;", "pub val watched: i32 = 99;")
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
-            lines = text.splitlines()
-            line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
+            poke_and_settle()
             hover = session.request(
                 "textDocument/hover",
                 {"textDocument": {"uri": main.as_uri()},
-                 "position": {"line": line, "character": lines[line].index("watched") + 1}},
+                 "position": {"line": line, "character": character}},
             )
             require("watched: i32 = 99" in json.dumps(hover.get("result")),
                     f"active watcher suppressed source fingerprint fallback: {hover!r}")
@@ -2402,15 +2592,18 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             broken = changed + "use watch.missing.nope;\n"
             defs.write_text(broken, encoding="utf-8")
             time.sleep(0.3)
+            poke_and_settle()
             failed = session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": main.as_uri()},
-                 "position": {"line": line, "character": lines[line].index("watched") + 1}},
+                 "position": {"line": line, "character": character}},
             )
             require(failed.get("result") is None,
                     f"broken on-disk source retained a stale snapshot: {failed!r}")
+
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
+            poke_and_settle()
             repaired = definition(session, main, text, "watched")
             require(repaired.get("uri") == defs.as_uri(),
                     f"failed root did not retry after disk source repair: {repaired!r}")
@@ -2490,6 +2683,7 @@ def run_same_fqn_reverse(server: Path, timeout: float) -> None:
                  "contentChanges": [{"text": right_v2}]},
             )
             session.diagnostics(right[0].as_uri(), 2)
+            settle_rebuilds(session)
             assert_definition(session, right[0], right[1], right_v2)
             assert_definition(session, *left)
             session.finish()
@@ -3159,6 +3353,7 @@ def main() -> int:
         parser.error("--timeout must be positive")
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        run_rebuild_concurrency(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
@@ -3193,6 +3388,8 @@ def main() -> int:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print("  a request is answered while a project rebuild is still running")
+    print("  a burst of edits during a build coalesces into one follow-up build")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  a syntax-only request answers from the buffer without reloading the project")

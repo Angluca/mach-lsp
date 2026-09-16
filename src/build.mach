@@ -1,0 +1,220 @@
+# a single-slot worker for work that must not run on the analysis thread
+#
+# A project rebuild is seconds of compiler work. Run on the analysis thread it
+# stops the server answering anything - a hover, a completion, a cancellation,
+# the next keystroke - for its whole duration, which is the latency the person
+# actually feels. So the rebuild runs here instead, and the analysis thread
+# keeps serving the snapshot it already has until the new one is ready.
+#
+# The ownership rule is the entire safety argument, so it is stated rather than
+# implied: `submit` transfers its input to this worker and the submitter must
+# not touch it again; `run` may read nothing but that input and must return a
+# freshly owned result; `take` transfers that result back. Nothing else is
+# shared, so the worker needs no access to the workspace, the document store,
+# or the transport, and nothing it does can be observed half-finished.
+#
+# One slot, not a queue. A second build of the same root would only be thrown
+# away by the first one's result, so the caller coalesces instead: finish, swap,
+# and schedule again only if the input advanced meanwhile.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
+
+# the work itself, run on the worker thread
+#
+# Takes ownership of the submitted input and returns an owned result, or nil
+# when it could not produce one. It runs with no lock held and must reach no
+# state the analysis thread can also reach.
+pub def RunFn: fun(ptr) ptr;
+
+# how the worker tells the analysis thread a result is waiting
+#
+# Called on the worker thread with no lock held, so it must do nothing but
+# wake: the analysis thread is what actually looks at the result.
+pub def WakeFn: fun(ptr);
+
+# the worker thread and the one input/result slot it serves
+#
+# `lock` guards `pending`, `result`, `busy`, and `closed`. `seq` is the futex
+# word the worker sleeps on, written under the lock and read without it so a
+# waiter can compare against a value sampled before locking.
+# ---
+# lock:     guards the slot
+# pending:  submitted input awaiting the worker, or nil
+# result:   finished result awaiting collection, or nil
+# busy:     input is submitted or running and not yet collected
+# seq:      futex word, advanced on submit and on close
+# closed:   no further submissions; the worker should exit
+# f:        the work
+# wake:     called once per finished result
+# wake_ctx: opaque context handed to `wake`
+# th:       the worker thread handle
+# live:     whether `th` was spawned and still needs joining
+pub rec Builder {
+    lock:     mutex.Mutex;
+    pending:  ptr;
+    result:   ptr;
+    busy:     bool;
+    seq:      i64;
+    closed:   bool;
+    f:        RunFn;
+    wake:     WakeFn;
+    wake_ctx: ptr;
+    th:       thread.Thread;
+    live:     bool;
+}
+
+# the builder a spawned worker serves
+#
+# `thread.spawn_with` hands the entry one opaque pointer and std has no
+# thread-local storage. One server runs one builder.
+var BOUND: *Builder = nil;
+
+# construct an idle builder
+# ---
+# b:    builder to initialize
+# f:    the work to run per submission
+# wake: called on the worker thread once a result is ready
+# ctx:  opaque context handed to `wake`
+pub fun init(b: *Builder, f: RunFn, wake: WakeFn, ctx: ptr) {
+    b.lock     = mutex.make();
+    b.pending  = nil;
+    b.result   = nil;
+    b.busy     = false;
+    b.seq      = 0;
+    b.closed   = false;
+    b.f        = f;
+    b.wake     = wake;
+    b.wake_ctx = ctx;
+    b.live     = false;
+}
+
+# spawn the worker thread
+# ---
+# b:   the initialized builder
+# ret: true when the thread started
+pub fun start(b: *Builder) bool {
+    if (b.live || b.f == nil) { ret false; }
+    BOUND = b;
+    thread.spawn_with(worker_main, (b)::*u8, ?b.th);
+    if (b.th.tid < 0) { ret false; }
+    b.live = true;
+    ret true;
+}
+
+# hand `input` to the worker, transferring ownership
+#
+# Refused while a build is in flight or a finished result is still waiting to be
+# collected: the slot holds one build, and a caller that loses this race has a
+# newer input than the one running, which it re-submits after collecting.
+# ---
+# b:     the builder
+# input: owned input for `f`; untouched by the caller once accepted
+# ret:   true when accepted
+pub fun submit(b: *Builder, input: ptr) bool {
+    if (input == nil || !b.live) { ret false; }
+    mutex.lock(?b.lock);
+    if (b.closed || b.busy) {
+        mutex.unlock(?b.lock);
+        ret false;
+    }
+    b.pending = input;
+    b.busy    = true;
+    atomic.store(?b.seq, atomic.load(?b.seq) + 1);
+    mutex.unlock(?b.lock);
+    os.thread_wake(?b.seq);
+    ret true;
+}
+
+# collect a finished result, transferring ownership back
+#
+# Never blocks. nil means no result is ready, whether or not a build is running.
+pub fun take(b: *Builder) ptr {
+    mutex.lock(?b.lock);
+    val r: ptr = b.result;
+    if (r != nil) {
+        b.result = nil;
+        b.busy   = false;
+    }
+    mutex.unlock(?b.lock);
+    ret r;
+}
+
+# whether a build is submitted, running, or finished but uncollected
+pub fun busy(b: *Builder) bool {
+    mutex.lock(?b.lock);
+    val v: bool = b.busy;
+    mutex.unlock(?b.lock);
+    ret v;
+}
+
+# refuse further submissions and wake the worker so it exits
+pub fun close(b: *Builder) {
+    mutex.lock(?b.lock);
+    b.closed = true;
+    atomic.store(?b.seq, atomic.load(?b.seq) + 1);
+    mutex.unlock(?b.lock);
+    os.thread_wake(?b.seq);
+}
+
+# close the builder and wait for a build already running to finish
+#
+# A running build owns its input and is writing into memory it allocated, so
+# there is nothing to abandon it into: the compiler offers no way to interrupt
+# an analysis, and returning while it still runs would leave a thread writing
+# to storage the caller is about to release. The wait is one build.
+pub fun join(b: *Builder) {
+    close(b);
+    if (b.live) {
+        thread.join(?b.th);
+        b.live = false;
+    }
+}
+
+# join the worker and report any uncollected result so the caller can free it
+#
+# The result is the caller's type, so releasing it is the caller's job; this
+# only guarantees the worker has stopped first.
+pub fun dnit(b: *Builder) ptr {
+    if (b.live) { join(b); }
+    val r: ptr = b.result;
+    b.result  = nil;
+    b.pending = nil;
+    b.busy    = false;
+    ret r;
+}
+
+# the worker thread entry: run each submission to completion until close
+fun worker_main(arg: *u8) {
+    val b: *Builder = arg::*Builder;
+    for (true) {
+        val sampled: i64 = atomic.load(?b.seq);
+
+        mutex.lock(?b.lock);
+        val input: ptr  = b.pending;
+        val done:  bool = b.closed;
+        b.pending = nil;
+        mutex.unlock(?b.lock);
+
+        if (input != nil) {
+            val out: ptr = b.f(input);
+            mutex.lock(?b.lock);
+            b.result = out;
+            # a run that produced nothing still frees the slot, or the caller
+            # would wait forever for a result that is never coming
+            if (out == nil) { b.busy = false; }
+            mutex.unlock(?b.lock);
+            if (b.wake != nil) { b.wake(b.wake_ctx); }
+        }
+        or {
+            if (done) { brk; }
+            os.thread_wait(?b.seq, sampled);
+        }
+    }
+}
