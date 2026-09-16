@@ -84,7 +84,7 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     }
     val sym: *rslv.Symbol = so.some;
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
     if (sel site_o.none) {
         render.reply_null(alloc, id_raw);
         ret;

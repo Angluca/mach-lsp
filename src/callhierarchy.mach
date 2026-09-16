@@ -167,6 +167,11 @@ pub fun prepare(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloc
         ret;
     }
 
+    if (!item_maps(t.site.text, t.name_span, t.decl_span)) {
+        render.reply_null(alloc, id_raw);
+        project.free_site(ws, ?t.site);
+        ret;
+    }
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push_byte(?b, '[');
@@ -351,7 +356,7 @@ fun anchor_at(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, offset: 
     val so: opt[*rslv.Symbol] = features.symbol(an.rr, ro.some.sym_id);
     if (sel so.none) { ret false; }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, so.some);
     if (sel site_o.none) { ret false; }
     var site: project.Site = site_o.some;
     if (site.sym.decl == id.DECL_NIL) {
@@ -394,9 +399,11 @@ fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleVie
     for (di < dn) {
         val did:  id.DeclId = features.top_level_decl(mv.a, di);
         var open: bool      = false;
-        var i:    usize     = 0;
-        for (i < n) {
-            if (hits[i].caller == did) {
+        # a caller whose own item cannot be reported has no group to hold its calls
+        val shown: bool  = decl_item_maps(mv.a, mv.text, did);
+        var i:     usize = 0;
+        for (shown && i < n) {
+            if (hits[i].caller == did && positions.maps(mv.text, hits[i].span)) {
                 if (!open) {
                     if (@groups > 0) { json.buf_push_byte(b, ','); }
                     json.buf_push(b, "{\"from\":");
@@ -405,7 +412,7 @@ fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleVie
                     open = true;
                 }
                 or { json.buf_push_byte(b, ','); }
-                render.span_range(b, mv.text.file, hits[i].span);
+                render.span_range(b, mv.text, hits[i].span);
             }
             i = i + 1;
         }
@@ -561,7 +568,7 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     out.kind     = LSP_VARIABLE;
     if (!out.indirect) { out.kind = LSP_FUNCTION; }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
     if (sel site_o.none) { ret true; }
     var site: project.Site = site_o.some;
 
@@ -609,7 +616,7 @@ fun emit_outgoing(alloc: *Allocator, id_raw: str, callees: *Callee, n: usize) {
     var groups: usize = 0;
     var i:      usize = 0;
     for (i < n) {
-        if (first_of_group(callees, i)) {
+        if (first_of_group(callees, i) && callee_shown(callees, i, n)) {
             if (groups > 0) { json.buf_push_byte(?b, ','); }
             json.buf_push(?b, "{\"to\":");
             var detail: str = nil;
@@ -621,9 +628,9 @@ fun emit_outgoing(alloc: *Allocator, id_raw: str, callees: *Callee, n: usize) {
             var emitted: usize = 0;
             var j:       usize = i;
             for (j < n) {
-                if (same_callee(callees, i, j)) {
+                if (same_callee(callees, i, j) && positions.maps(callees[j].from_text, callees[j].from)) {
                     if (emitted > 0) { json.buf_push_byte(?b, ','); }
-                    render.span_range(?b, callees[j].from_text.file, callees[j].from);
+                    render.span_range(?b, callees[j].from_text, callees[j].from);
                     emitted = emitted + 1;
                 }
                 j = j + 1;
@@ -637,6 +644,39 @@ fun emit_outgoing(alloc: *Allocator, id_raw: str, callees: *Callee, n: usize) {
 
     json.buf_push_byte(?b, ']');
     render.send(?b, alloc, id_raw);
+}
+
+# whether the callee `i` names can be reported: its own item maps, and at least
+# one call to it does
+fun callee_shown(callees: *Callee, i: usize, n: usize) bool {
+    if (!item_maps(callees[i].text, callees[i].name_span, callees[i].decl_span)) { ret false; }
+    var j: usize = i;
+    for (j < n) {
+        if (same_callee(callees, i, j) && positions.maps(callees[j].from_text, callees[j].from)) { ret true; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+# whether an item's two ranges can both be reported
+fun item_maps(text: positions.Text, name_span: token.Span, decl_span: token.Span) bool {
+    ret positions.maps(text, name_span) && positions.maps(text, decl_span);
+}
+
+# whether the item `push_decl_item` would write for `did` can be reported
+fun decl_item_maps(a: *ast.Ast, text: positions.Text, did: id.DeclId) bool {
+    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel d_opt.none) { ret true; }
+    val d: *decl.Decl = d_opt.some;
+    ret item_maps(text, decl_item_name(d), d.span);
+}
+
+# the span `push_decl_item` names a declaration by
+fun decl_item_name(d: *decl.Decl) token.Span {
+    if (d.kind == decl.DECL_KIND_TEST) { ret d.data.test_.label; }
+    val nso: opt[token.Span] = features.decl_name_span(d);
+    if (sel nso.some) { ret nso.some; }
+    ret d.span;
 }
 
 # whether `i` is the first entry naming its callee
@@ -680,21 +720,15 @@ fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text:
         ret;
     }
     val d: *decl.Decl = d_opt.some;
-
-    var name: token.Span = d.span;
-    if (d.kind == decl.DECL_KIND_TEST) { name = d.data.test_.label; }
-    or {
-        val nso: opt[token.Span] = features.decl_name_span(d);
-        if (sel nso.some) { name = nso.some; }
-    }
-    push_item(b, alloc, uri, text, name, d.span, render.symbol_kind(d.kind), nil);
+    push_item(b, alloc, uri, text, decl_item_name(d), d.span, render.symbol_kind(d.kind), nil);
 }
 
 # append a CallHierarchyItem
 #
 # `name` is read out of the source rather than out of the interner: a caller may
 # be a `test` label or an unresolved callee expression, neither of which has an
-# interned name, and the bytes are what the client shows either way.
+# interned name, and the bytes are what the client shows either way. the caller
+# has checked `item_maps`, so both ranges are written.
 fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     name_span: token.Span, decl_span: token.Span, kind: i64, detail: str) {
     json.buf_push(b, "{\"name\":");
@@ -714,9 +748,9 @@ fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     json.buf_push(b, ",\"uri\":");
     json.buf_push_quoted(b, uri);
     json.buf_push(b, ",\"range\":");
-    render.span_range(b, text.file, decl_span);
+    render.span_range(b, text, decl_span);
     json.buf_push(b, ",\"selectionRange\":");
-    render.span_range(b, text.file, name_span);
+    render.span_range(b, text, name_span);
     json.buf_push_byte(b, '}');
 }
 

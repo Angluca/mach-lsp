@@ -22,6 +22,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -73,41 +74,58 @@ pub fun range(b: *json.Buf, r: positions.LspRange) {
     json.buf_push(b, "}}");
 }
 
-# append an LSP Range for a byte span in `file`
+# append an LSP Range for a span of `t`
+#
+# Nothing is written when the span cannot be carried into the client's buffer
+# (#251), and the caller learns so. A caller that frames the range - a comma, an
+# enclosing object - asks `positions.maps` before writing the frame, so an
+# unmapped span never leaves half an element behind.
 # ---
 # b:    output buffer
-# file: source file the span indexes
+# t:    the text the span indexes
 # span: byte span to convert
-pub fun span_range(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
-    range(b, positions.range_of(file, span));
+# ret:  whether a range was written
+pub fun span_range(b: *json.Buf, t: positions.Text, span: token.Span) bool {
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel ro.none) { ret false; }
+    range(b, ro.some);
+    ret true;
 }
 
 # append an LSP Location: a document URI and a range within it
 # ---
 # b:    output buffer
-# file: source file backing the span
-# uri:  document URI of `file`
+# t:    the text backing the span
+# uri:  document URI of `t`
 # span: byte span to report
-pub fun location(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span) {
+# ret:  whether a location was written; nothing is when the span does not map
+pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: token.Span) bool {
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel ro.none) { ret false; }
     json.buf_push(b, "{\"uri\":");
     json.buf_push_quoted(b, uri);
     json.buf_push(b, ",\"range\":");
-    span_range(b, file, span);
+    range(b, ro.some);
     json.buf_push_byte(b, '}');
+    ret true;
 }
 
 # append an LSP TextEdit replacing `span` with `new_text`
 # ---
 # b:        output buffer
-# file:     source file backing the span
+# t:        the text backing the span
 # span:     byte span to replace
 # new_text: replacement text, quoted and escaped here
-pub fun text_edit(b: *json.Buf, file: *src.SourceFile, span: token.Span, new_text: str) {
+# ret:      whether an edit was written; nothing is when the span does not map
+pub fun text_edit(b: *json.Buf, t: positions.Text, span: token.Span, new_text: str) bool {
+    val ro: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel ro.none) { ret false; }
     json.buf_push(b, "{\"range\":");
-    span_range(b, file, span);
+    range(b, ro.some);
     json.buf_push(b, ",\"newText\":");
     json.buf_push_quoted(b, new_text);
     json.buf_push_byte(b, '}');
+    ret true;
 }
 
 # begin a successful JSON-RPC response, leaving `result` open for the caller
@@ -183,6 +201,28 @@ pub fun reply_empty_array(alloc: *Allocator, id_raw: str) {
     reply_literal(alloc, id_raw, "[]");
 }
 
+# LSP ContentModified: the document changed in a way that invalidates the
+# result, and the client should ask again
+pub val CONTENT_MODIFIED: i64 = -32801;
+
+# reply with a JSON-RPC error
+# ---
+# alloc:   request allocator
+# id_raw:  the request id token, consumed
+# code:    the error code
+# message: human-readable text, quoted here
+pub fun reply_error(alloc: *Allocator, id_raw: str, code: i64, message: str) {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"error\":{\"code\":");
+    json.buf_push_i64(?b, code);
+    json.buf_push(?b, ",\"message\":");
+    json.buf_push_quoted(?b, message);
+    json.buf_push_byte(?b, '}');
+    send(?b, alloc, id_raw);
+}
+
 # reply with a WorkspaceEdit that changes nothing
 #
 # An empty `changes` map rather than null: a rename that finds nothing to
@@ -242,7 +282,7 @@ test "render: a location carries an escaped uri" {
     starts[2] = 6;
     var f: src.SourceFile = stub_file("ab\ncd\n", ?starts[0], 3);
     var b: json.Buf       = json.buf_init(?pa);
-    location(?b, ?f, "file:///a b.mach", span_at(3, 2));
+    location(?b, positions.text_of(?f), "file:///a b.mach", span_at(3, 2));
     var fail: bool = false;
     val got:  str  = json.buf_str(?b);
     if (got == nil) { fail = true; }
@@ -264,7 +304,7 @@ test "render: a text edit escapes its replacement" {
     starts[0] = 0;
     var f: src.SourceFile = stub_file("abcd", ?starts[0], 1);
     var b: json.Buf       = json.buf_init(?pa);
-    text_edit(?b, ?f, span_at(0, 2), "x\"y\nz");
+    text_edit(?b, positions.text_of(?f), span_at(0, 2), "x\"y\nz");
     var fail: bool = false;
     val got:  str  = json.buf_str(?b);
     if (got == nil) { fail = true; }
@@ -272,6 +312,31 @@ test "render: a text edit escapes its replacement" {
         if (!str_equals(got,
             "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"x\\\"y\\nz\"}")) { fail = true; }
     }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# an element whose span has no counterpart in the client's buffer writes
+# nothing at all, so the caller's framing never holds half of one
+test "render: an unmapped span writes nothing" {
+    var pa: Allocator;
+    page.make(?pa);
+    var starts: [1]usize;
+    starts[0] = 0;
+    var old:  src.SourceFile = stub_file("abXYcd", ?starts[0], 1);
+    var new:  src.SourceFile = stub_file("abQcd", ?starts[0], 1);
+    val t:    positions.Text = positions.text_against(?old, ?new);
+    var b:    json.Buf       = json.buf_init(?pa);
+    var fail: bool           = false;
+    if (location(?b, t, "file:///x.mach", span_at(2, 1))) { fail = true; }
+    if (text_edit(?b, t, span_at(3, 1), "z"))             { fail = true; }
+    if (span_range(?b, t, span_at(1, 2)))                 { fail = true; }
+    if (json.buf_len(?b) != 0)                            { fail = true; }
+    # "cd" moved one byte left
+    if (!span_range(?b, t, span_at(4, 2))) { fail = true; }
+    val got: str = json.buf_str(?b);
+    if (got == nil || !str_equals(got, "{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":5}}")) { fail = true; }
     json.buf_dnit(?b);
     if (fail) { ret 1; }
     ret 0;

@@ -1656,19 +1656,19 @@ fun fingerprint_matches(path: str, prev: *SourceFingerprint) bool {
 # free (see `free_site`). none when there is no project, or the defining module
 # cannot be located
 # ---
-# w:     the workspace
-# root:  the root the buffer resolved against, or nil
-# own:   the buffer's own module id
-# own_a: the buffer's Ast
-# own_file:the buffer's SourceFile
-# uri: the request document's URI
-# sym: the symbol whose declaration site is wanted
-# ret: some(Site), or none when the defining module cannot be located
-pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_file: *src.SourceFile, uri: str, sym: *rslv.Symbol) opt[Site] {
+# w:        the workspace
+# root:     the root the buffer resolved against, or nil
+# own:      the buffer's own module id
+# own_a:    the buffer's Ast
+# own_text: the buffer's text, as the request reads it
+# uri:      the request document's URI
+# sym:      the symbol whose declaration site is wanted
+# ret:      some(Site), or none when the defining module cannot be located
+pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_text: positions.Text, uri: str, sym: *rslv.Symbol) opt[Site] {
     if (sym.origin == own) {
         var s: Site;
         s.a     = own_a;
-        s.text  = positions.text_of(own_file);
+        s.text  = own_text;
         s.uri   = uri;
         s.sym   = sym;
         s.owned = false;
@@ -1687,7 +1687,7 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
 
     var s: Site;
     s.a     = m.a;
-    s.text  = positions.text_of(fo.some);
+    s.text  = module_text(w, root, sym.origin, fo.some);
     s.uri   = furi;
     s.sym   = local;
     s.owned = true;
@@ -1721,6 +1721,23 @@ fun defining_symbol(rr: *rslv.ResolveResult, sym: *rslv.Symbol) *rslv.Symbol {
 # loaded module `mid`'s entry in `root`, or nil when there is no
 # loaded project or the id is out of range
 # the loaded module whose source is `file`, or none
+# the source of `fid` in `root`'s session, read against the client's buffer
+# when an open document holds it and has moved past the snapshot. a file that is
+# not a loaded module pairs as it is
+# ---
+# w:    the workspace
+# root: the loaded root whose session `fid` belongs to
+# fid:  a file id in that session
+# ret:  the pairing; its file is nil when `fid` is unknown
+pub fun file_text(w: *Workspace, root: *Root, fid: src.FileId) positions.Text {
+    if (root == nil || !root.loaded) { ret positions.text_of(nil); }
+    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, fid);
+    if (sel fo.none) { ret positions.text_of(nil); }
+    val mo: opt[sess.ModuleId] = module_for_file(root, fid);
+    if (sel mo.none) { ret positions.text_of(fo.some); }
+    ret module_text(w, root, mo.some, fo.some);
+}
+
 fun module_for_file(root: *Root, file: src.FileId) opt[sess.ModuleId] {
     if (root == nil || !root.loaded) { ret opt[sess.ModuleId].none{}; }
     var i: u32 = 0;
@@ -1763,6 +1780,10 @@ pub rec ModuleView {
 }
 
 # compiler-owned snapshot of one open document.
+# ---
+# stale:    the snapshot predates the document's current text; `text` then maps
+#           the snapshot's offsets into the client's buffer
+# parse_ok: the snapshot's own parse of this module was accepted
 pub rec DocumentView {
     root:     *Root;
     module:   sess.ModuleId;
@@ -1773,33 +1794,32 @@ pub rec DocumentView {
     interner: *intern.Interner;
     revision: u64;
     file_id:  src.FileId;
+    stale:    bool;
+    parse_ok: bool;
 }
 
 # analyze through the retained project containing `d` and return its exact
-# ModuleEntry. THIS DOCUMENT's revision against the snapshot is the staleness
-# boundary.
+# ModuleEntry, current or not
 #
-# A snapshot built before `d`'s current text describes EARLIER text, so every
-# offset in it is measured against a document the client no longer has. Callers
-# answer that by falling back to editor analysis of the live buffer - current
-# positions, no cross-module reach - the same degradation they already accept
-# before a root's first build finishes.
+# A snapshot built before `d`'s current text describes EARLIER text. It is
+# still returned, marked `stale`, with its `text` read against the client's
+# buffer: every offset it reports is carried through the one window where the
+# two texts differ, and nothing inside that window crosses (#251). A feature that
+# can answer from earlier semantics does so with no further knowledge; one that
+# cannot - a rename, a reference list - refuses a stale view, and the server
+# holds it until the rebuild already scheduled here lands.
 #
 # The test is per document, not per root, and that distinction is load-bearing
 # rather than merely tighter. A root-wide test says "stale" whenever ANY covered
 # buffer has moved, including when the move was a rebuild that FAILED: the
 # attempt is recorded, the snapshot revision is not, and the root is then
-# permanently stale with nothing left to schedule - every cross-module feature
-# dead until some unrelated edit happens to succeed. Keyed on the document, a
+# permanently stale with nothing left to schedule. Keyed on the document, a
 # failed rebuild leaves every buffer the last good snapshot still describes
 # exactly where it was, which is what "a failure keeps serving" has to mean.
 pub fun document_view(w: *Workspace, d: *documents.Document) res[DocumentView, str] {
     val root: *Root = root_for(w, d.uri);
     if (root == nil || !root.loaded) { ret res[DocumentView, str].err{"project: document has no compiler project"}; }
-    if (d.revision > root.snapshot_revision) {
-        ret res[DocumentView, str].err{"project: document snapshot is stale"};
-    }
-    ret view_from_root(root, d);
+    ret view_from_root(w, root, d);
 }
 
 # return a document view only when an already-loaded project captured its latest
@@ -1813,10 +1833,39 @@ pub fun document_view_loaded(w: *Workspace, d: *documents.Document) res[Document
     if (root == nil || !root.loaded || d.revision > root.snapshot_revision) {
         ret res[DocumentView, str].err{"project: no current loaded snapshot"};
     }
-    ret view_from_root(root, d);
+    ret view_from_root(w, root, d);
 }
 
-fun view_from_root(root: *Root, d: *documents.Document) res[DocumentView, str] {
+# whether `root`'s snapshot covers the current text of every buffer it mirrors
+#
+# A request whose answer must be complete or must edit text - a rename, a
+# reference list - needs this rather than the per-document test: an edit to a
+# SIBLING buffer leaves the requesting one current while the snapshot's picture
+# of the sibling, and so of what the answer covers there, is out of date.
+# ---
+# root: a root, or nil
+# ret:  true when the root is loaded and caught up
+pub fun root_current(root: *Root) bool {
+    if (root == nil || !root.loaded) { ret false; }
+    ret root.input_revision == root.snapshot_revision;
+}
+
+# whether a request on `d` that needs a current root can wait for one: the root
+# is behind, and a build that would bring it up to date is scheduled or running.
+# a failed attempt at this input is not pending, and waiting for it would wait
+# forever
+# ---
+# w:   the workspace
+# d:   an open document
+# ret: true when a current snapshot for `d`'s root is on its way
+pub fun current_pending(w: *Workspace, d: *documents.Document) bool {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || root_current(root)) { ret false; }
+    if (snapshot_stale(root))              { ret true; }
+    ret w.building && w.building_root == root_index(w, root);
+}
+
+fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[DocumentView, str] {
     val mo: opt[sess.ModuleId] = module_for_norm(root, d.path);
     if (sel mo.none) { ret res[DocumentView, str].err{"project: document module was not loaded"}; }
     val mid: sess.ModuleId       = mo.some;
@@ -1830,15 +1879,18 @@ fun view_from_root(root: *Root, d: *documents.Document) res[DocumentView, str] {
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
     if (sel fo.none) { ret res[DocumentView, str].err{"project: document source unavailable"}; }
     var v: DocumentView;
-    v.root     = root;
-    v.module   = mid;
-    v.a        = m.a;
-    v.rr       = m.resolve_result;
-    v.sr       = m.sema_result;
-    v.text     = positions.text_of(fo.some);
+    v.root   = root;
+    v.module = mid;
+    v.a      = m.a;
+    v.rr     = m.resolve_result;
+    v.sr     = m.sema_result;
+    v.stale  = d.revision > root.snapshot_revision;
+    v.text   = positions.text_of(fo.some);
+    if (v.stale) { v.text = positions.text_against(fo.some, documents.live_file(w.docs, d)); }
     v.interner = ?root.s.interner;
     v.revision = root.snapshot_revision;
     v.file_id  = m.file_id;
+    v.parse_ok = sel m.parse_status.kind.accepted;
     ret res[DocumentView, str].ok{v};
 }
 
@@ -1870,9 +1922,39 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
     v.a       = m.a;
     v.rr      = m.resolve_result;
     v.sr      = m.sema_result;
-    v.text    = positions.text_of(fo.some);
+    v.text    = module_text(w, root, mid, fo.some);
     v.file_id = m.file_id;
     ret opt[ModuleView].some{v};
+}
+
+# loaded module `mid`'s source read against the client's buffer, when an open
+# document holds that module and has moved past the snapshot
+#
+# Every Text a feature can report through is built here or in `view_from_root`,
+# so a site in a sibling buffer the user is also editing is mapped exactly like
+# one in the buffer the request names.
+# ---
+# w:    the workspace
+# root: the loaded root
+# mid:  the module
+# file: the module's snapshot source
+# ret:  the pairing
+fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile) positions.Text {
+    val plain: positions.Text = positions.text_of(file);
+    if (w.docs == nil || root.mod_paths == nil || mid::u32 >= root.mod_path_count) { ret plain; }
+    val path: str = root.mod_paths[mid::u32];
+    if (path == nil) { ret plain; }
+    val n: usize = documents.slot_count(w.docs);
+    var i: usize = 0;
+    for (i < n) {
+        val d: *documents.Document = documents.at(w.docs, i);
+        if (d != nil && d.in_use && d.path != nil && str_equals(d.path, path)) {
+            if (d.revision <= root.snapshot_revision) { ret plain; }
+            ret positions.text_against(file, documents.live_file(w.docs, d));
+        }
+        i = i + 1;
+    }
+    ret plain;
 }
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
@@ -1962,7 +2044,7 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite
     if (sel fo.none) { ret opt[RecordSite].none{}; }
     val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
     if (sel decl.none) { ret opt[RecordSite].none{}; }
-    ret record_site_from(mid.some, decl.some, m.file_id, n.name, m.a, fo.some);
+    ret record_site_from(mid.some, decl.some, m.file_id, n.name, m.a, module_text(w, root, mid.some, fo.some));
 }
 
 # `record_decl` extended to resolve a record / union declared in
@@ -1970,29 +2052,29 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite
 # module id (`own`), which is not in the loaded module array, so `record_decl`
 # alone would miss a field access on a record the edited buffer itself declares.
 # when the nominal's origin is `own`, the declaration is read from the buffer's
-# live Ast / file (`own_a` / `own_file`); otherwise it defers to a loaded module
+# live Ast / text (`own_a` / `own_text`); otherwise it defers to a loaded module
 # ---
 # w:        the workspace
 # root:     the root the type was resolved under, or nil
 # own:      the buffer's own module id
 # own_a:    the buffer's live Ast
-# own_file: the buffer's SourceFile
+# own_text: the buffer's text, as the request reads it
 # tid:      a TypeId, typically read from a SemaResult via `type_of`
 # ret:      some(RecordSite), or none
-pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) opt[RecordSite] {
+pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[RecordSite] {
     val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
     if (sel no.none) { ret opt[RecordSite].none{}; }
     val n: mtypes.Nominal = no.some;
-    if (own_file != nil && n.file == own_fid) {
-        val decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, positions.text_of(own_file), interner(w, root), n);
+    if (own_text.file != nil && n.file == own_fid) {
+        val decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
         if (sel decl.none) { ret opt[RecordSite].none{}; }
-        ret record_site_from(own, decl.some, own_fid, n.name, own_a, own_file);
+        ret record_site_from(own, decl.some, own_fid, n.name, own_a, own_text);
     }
     ret record_decl(w, root, tid);
 }
 
 # a RecordSite for the rec / uni declaration `decl` in the active
-# buffer (`own` / `own_a` / `own_file`), or none when `decl` is not a rec / uni.
+# buffer (`own` / `own_a` / `own_text`), or none when `decl` is not a rec / uni.
 # the buffer-side entry point for a cursor sitting on a field's own declaration
 # name: the decl is in the buffer being edited, so its Ast / file are the live
 # ones. the resulting site carries the declaring file and the interned record
@@ -2003,12 +2085,12 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: 
 # own:      the buffer's own module id
 # own_fid:  the buffer's own FileId
 # own_a:    the buffer's live Ast
-# own_file: the buffer's SourceFile
+# own_text: the buffer's text, as the request reads it
 # decl:     the rec / uni DeclId in the buffer
 # ret:      some(RecordSite), or none
-pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, decl: id.DeclId) opt[RecordSite] {
+pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, decl: id.DeclId) opt[RecordSite] {
     if (decl == id.DECL_NIL) { ret opt[RecordSite].none{}; }
-    val site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_file);
+    val site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_text);
     if (sel site.none) { ret site; }
     var rs:   RecordSite = site.some;
     val text: str        = positions.span_text(rs.text, rs.name_span, alloc);
@@ -2059,18 +2141,18 @@ pub rec TypeSite {
 # own:      the buffer's own module id
 # own_fid:  the buffer's own FileId
 # own_a:    the buffer's live Ast
-# own_file: the buffer's SourceFile
+# own_text: the buffer's text, as the request reads it
 # tid:      a TypeId, typically read from a SemaResult
 # ret:      some(TypeSite), or none for a type with no nominal declaration
-pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) opt[TypeSite] {
+pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[TypeSite] {
     val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
     if (sel no.none) { ret opt[TypeSite].none{}; }
     val n: mtypes.Nominal = no.some;
 
-    if (own_file != nil && n.file == own_fid) {
-        val own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, positions.text_of(own_file), interner(w, root), n);
+    if (own_text.file != nil && n.file == own_fid) {
+        val own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
         if (sel own_decl.none) { ret opt[TypeSite].none{}; }
-        ret type_site_from(own, own_decl.some, own_fid, own_a, own_file);
+        ret type_site_from(own, own_decl.some, own_fid, own_a, own_text);
     }
 
     val mid: opt[sess.ModuleId] = module_for_file(root, n.file);
@@ -2081,13 +2163,13 @@ pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: sr
     if (sel fo.none) { ret opt[TypeSite].none{}; }
     val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
     if (sel decl.none) { ret opt[TypeSite].none{}; }
-    ret type_site_from(mid.some, decl.some, m.file_id, m.a, fo.some);
+    ret type_site_from(mid.some, decl.some, m.file_id, m.a, module_text(w, root, mid.some, fo.some));
 }
 
 # build a TypeSite for the decl `decl` in `a` (backed by `file`), or
 # none when the decl is absent or declares no type name. the one place a new
 # type-declaring kind is admitted
-fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, file: *src.SourceFile) opt[TypeSite] {
+fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
     val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
     if (sel d_opt.none) { ret opt[TypeSite].none{}; }
     val d: *adecl.Decl = d_opt.some;
@@ -2102,7 +2184,7 @@ fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *
     ts.decl   = decl;
     ts.file   = fid;
     ts.a      = a;
-    ts.text   = positions.text_of(file);
+    ts.text   = text;
     ts.kind   = d.kind;
     ret opt[TypeSite].some{ts};
 }
@@ -2118,7 +2200,7 @@ fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) opt[mtypes.Nomi
 # by `file`), or none when the decl is absent or not a rec / uni. the shared core
 # of `record_decl` / `record_decl_in` - both having chosen which Ast / file the
 # declaration lives in
-fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, file: *src.SourceFile) opt[RecordSite] {
+fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, text: positions.Text) opt[RecordSite] {
     val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
     if (sel d_opt.none) { ret opt[RecordSite].none{}; }
     val d:      *adecl.Decl = d_opt.some;
@@ -2131,7 +2213,7 @@ fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, na
     rs.file   = fid;
     rs.name   = name;
     rs.a      = a;
-    rs.text   = positions.text_of(file);
+    rs.text   = text;
     rs.is_rec = is_rec;
     if (is_rec) {
         rs.name_span    = d.data.rec_.name;

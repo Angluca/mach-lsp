@@ -118,7 +118,7 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
         ret;
     }
 
-    reply_hover(alloc, id_raw, an.text.file, sr.name_span, md, markdown);
+    reply_hover(alloc, id_raw, an.text, sr.name_span, md, markdown);
 }
 
 # hover the type of the expression under the cursor
@@ -163,7 +163,7 @@ fun expression_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
         json.free_str(md, alloc);
         ret false;
     }
-    reply_hover(alloc, id_raw, an.text.file, eo.some.span, md, markdown);
+    reply_hover(alloc, id_raw, an.text, eo.some.span, md, markdown);
     ret true;
 }
 
@@ -219,23 +219,36 @@ fun buf_into_str(b: *json.Buf, alloc: *Allocator) str {
     ret out::str;
 }
 
-# reply with one Location
-fun reply_location(alloc: *Allocator, id_raw: str, file: *src.SourceFile, uri: str, span: token.Span) {
+# reply with one Location, or null when the span cannot be reported
+fun reply_location(alloc: *Allocator, id_raw: str, text: positions.Text, uri: str, span: token.Span) {
+    if (!positions.maps(text, span)) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
-    render.location(?b, file, uri, span);
+    render.location(?b, text, uri, span);
     render.send(?b, alloc, id_raw);
 }
 
-# reply with one Range
-fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: token.Span) {
+# reply with one Range, or null when the span cannot be reported
+fun reply_range(alloc: *Allocator, id_raw: str, text: positions.Text, span: token.Span) {
+    if (!positions.maps(text, span)) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
-    render.span_range(?b, file, span);
+    render.span_range(?b, text, span);
     render.send(?b, alloc, id_raw);
 }
 
-fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span: token.Span, md: str, markdown: bool) {
+# reply with a hover over `name_span`, or null when that span cannot be reported
+fun reply_hover(alloc: *Allocator, id_raw: str, text: positions.Text, name_span: token.Span, md: str, markdown: bool) {
+    if (!positions.maps(text, name_span)) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push(?b, "{\"contents\":{\"kind\":");
@@ -245,7 +258,7 @@ fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span
     if (markdown) { json.buf_push_quoted(?b, md); }
     or            { push_unfenced(?b, md); }
     json.buf_push(?b, "},\"range\":");
-    render.span_range(?b, file, name_span);
+    render.span_range(?b, text, name_span);
     json.buf_push_byte(?b, '}');
     render.send(?b, alloc, id_raw);
 }
@@ -278,14 +291,14 @@ fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyze
     if (sr == nil) { ret false; }
 
     val tid: type.TypeId             = project.type_of(sr, fr.host);
-    val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+    val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
     if (sel rso.none) { ret false; }
     val rs: project.RecordSite = rso.some;
 
     val md: str = field_hover_markdown(rs, an.text.file, fr.name_span, alloc);
     if (md == nil) { ret false; }
 
-    reply_hover(alloc, id_raw, an.text.file, fr.name_span, md, markdown);
+    reply_hover(alloc, id_raw, an.text, fr.name_span, md, markdown);
     ret true;
 }
 
@@ -400,7 +413,7 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *rslv.Sym
         if (fqn != nil) { ret module_hover_markdown(fqn, alloc); }
     }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
     if (sel site_o.some) {
         var site: project.Site = site_o.some;
         if (site.sym.decl != id.DECL_NIL) {
@@ -819,7 +832,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     # file at its start.
     if (module_definition(ws, an, sym, alloc, id_raw)) { ret; }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
     if (sel site_o.none) {
         render.reply_null(alloc, id_raw);
         ret;
@@ -834,7 +847,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     }
     val span: token.Span = spo.some;
 
-    reply_location(alloc, id_raw, site.text.file, site.uri, span);
+    reply_location(alloc, id_raw, site.text, site.uri, span);
     project.free_site(ws, ?site);
 }
 
@@ -878,7 +891,7 @@ pub fun type_definition(ws: *project.Workspace, es: *editor.EditorSession, alloc
         owned = true;
     }
 
-    reply_location(alloc, id_raw, ts.text.file, furi, ts.name_span);
+    reply_location(alloc, id_raw, ts.text, furi, ts.name_span);
     if (owned) { json.free_str(furi, ws.alloc); }
 }
 
@@ -934,7 +947,7 @@ fun type_site_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) 
 # the declaring site of `tid` against the request's buffer and project
 fun site_of_type(ws: *project.Workspace, an: *analysis.Analyzed, tid: type.TypeId) opt[project.TypeSite] {
     if (tid == type.TYPE_NIL) { ret opt[project.TypeSite].none{}; }
-    ret project.type_site_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+    ret project.type_site_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
 }
 
 # the call expression `eid` is the callee of, or EXPR_NIL. a call
@@ -1054,7 +1067,7 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
         if (sr == nil) { ret false; }
 
         val tid: type.TypeId             = project.type_of(sr, fr.host);
-        val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+        val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
         if (sel rso.none) { ret false; }
         val rs: project.RecordSite = rso.some;
 
@@ -1068,7 +1081,7 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
     val self_o: opt[FieldSelf] = field_self_at(an, offset);
     if (sel self_o.some) {
         val fs: FieldSelf = self_o.some;
-        reply_location(alloc, id_raw, an.text.file, uri, fs.name);
+        reply_location(alloc, id_raw, an.text, uri, fs.name);
         ret true;
     }
 
@@ -1131,7 +1144,7 @@ fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *analysis
         owned = true;
     }
 
-    reply_location(alloc, id_raw, rs.text.file, furi, name);
+    reply_location(alloc, id_raw, rs.text, furi, name);
     if (owned) { json.free_str(furi, ws.alloc); }
     ret true;
 }
@@ -1173,7 +1186,7 @@ fun field_target_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usiz
         val fr: features.FieldRef = fo.some;
         if (an.sr == nil) { ret opt[FieldTarget].none{}; }
         val tid: type.TypeId             = project.type_of(an.sr, fr.host);
-        val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+        val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
         if (sel rso.none) { ret opt[FieldTarget].none{}; }
         val rs:  project.RecordSite = rso.some;
         val spo: opt[token.Span]    = features.field_decl_span(rs.a, rs.text.file, rs.fields_start, rs.fields_len, an.text.file, fr.name_span);
@@ -1187,7 +1200,7 @@ fun field_target_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usiz
     if (sel self_o.some) {
         val fs:  FieldSelf               = self_o.some;
         val did: id.DeclId               = ast.offset_to_decl(an.a, offset);
-        val rso: opt[project.RecordSite] = project.record_site_at(project.interner(ws, an.root), ws.alloc, an.own, an.own_fid, an.a, an.text.file, did);
+        val rso: opt[project.RecordSite] = project.record_site_at(project.interner(ws, an.root), ws.alloc, an.own, an.own_fid, an.a, an.text, did);
         if (sel rso.none) { ret opt[FieldTarget].none{}; }
         ret opt[FieldTarget].some{make_field_target(an, rso.some, fs.name)};
     }
@@ -1220,7 +1233,7 @@ fun make_field_target(an: *analysis.Analyzed, rs: project.RecordSite, field_name
 rec FieldXRef {
     a:         *ast.Ast;
     sr:        *sema.SemaResult;
-    file:      *src.SourceFile;
+    text:      positions.Text;
     uri:       str;
     declaring: bool;
     owned:     bool;
@@ -1242,7 +1255,7 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
     if (an.root == nil) {
         out[0].a         = an.a;
         out[0].sr        = an.sr;
-        out[0].file      = an.text.file;
+        out[0].text      = an.text;
         out[0].uri       = uri;
         out[0].declaring = t.decl_in_buffer;
         out[0].owned     = false;
@@ -1273,7 +1286,7 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
         val mv: project.ModuleView = mv_o.some;
         out[n].a         = mv.a;
         out[n].sr        = mv.sr;
-        out[n].file      = mv.text.file;
+        out[n].text      = mv.text;
         out[n].uri       = muri;
         out[n].declaring = cur == t.key.origin;
         out[n].owned     = cur != an.own;
@@ -1313,10 +1326,10 @@ fun walk_field_sites(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, want
     if (sel ra.err) { ret; }
     val spans: *token.Span = ra.ok;
 
-    val n: usize = features.collect_field_sites(s.a, s.sr, ti, s.file, t.key, s.declaring, want_doc, t.rs.text.file.text, doc, spans, cap);
+    val n: usize = features.collect_field_sites(s.a, s.sr, ti, s.text.file, t.key, s.declaring, want_doc, t.rs.text.file.text, doc, spans, cap);
     var i: usize = 0;
     for (i < n) {
-        sink_emit(k, s.file, s.uri, spans[i]);
+        sink_emit(k, s.text, s.uri, spans[i]);
         i = i + 1;
     }
     deallocate[token.Span](k.alloc, spans, cap);
@@ -1447,16 +1460,28 @@ fun emit_field_rename(ws: *project.Workspace, root: *project.Root, alloc: *Alloc
     json.buf_push(?b, "{\"changes\":{");
 
     var emitted: usize = 0;
+    var hole:    bool  = false;
     var i:       usize = 0;
     for (i < nref) {
-        if (push_field_rename_group(?b, ?refs[i], ti, t, new_name, emitted > 0, alloc)) {
+        if (push_field_rename_group(?b, ?refs[i], ti, t, new_name, emitted > 0, alloc, ?hole)) {
             emitted = emitted + 1;
         }
         i = i + 1;
     }
+    finish_rename(?b, alloc, id_raw, hole);
+}
 
-    json.buf_push(?b, "}}");
-    render.send(?b, alloc, id_raw);
+# send a built WorkspaceEdit, unless some occurrence could not be carried into
+# the client's buffer: an edit set with a hole in it renames half a symbol, so
+# the client is told to ask again instead
+fun finish_rename(b: *json.Buf, alloc: *Allocator, id_raw: str, hole: bool) {
+    if (hole) {
+        json.buf_dnit(b);
+        render.reply_error(alloc, id_raw, render.CONTENT_MODIFIED, "the document changed while the rename was computed");
+        ret;
+    }
+    json.buf_push(b, "}}");
+    render.send(b, alloc, id_raw);
 }
 
 # append the `changes`-map entry `"<uri>":[<edits>]` for module `s`
@@ -1466,7 +1491,7 @@ fun emit_field_rename(ws: *project.Workspace, root: *project.Root, alloc: *Alloc
 # rolled back when the module contributes no edit, so one walk decides and
 # writes.
 fun push_field_rename_group(b: *json.Buf, s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget,
-    new_name: str, comma: bool, alloc: *Allocator) bool {
+    new_name: str, comma: bool, alloc: *Allocator, hole: *bool) bool {
     val mark: usize = json.buf_len(b);
     if (comma) { json.buf_push_byte(b, ','); }
     json.buf_push_quoted(b, s.uri);
@@ -1474,6 +1499,7 @@ fun push_field_rename_group(b: *json.Buf, s: *FieldXRef, ti: *type.TypeInterner,
 
     var k: WalkSink = sink_init(b, alloc, new_name, nil);
     walk_field_sites(s, ti, t, true, ?k);
+    if (k.unmapped) { @hole = true; }
     if (k.count == 0) {
         json.buf_rewind(b, mark);
         ret false;
@@ -1492,7 +1518,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (id_raw == nil) { ret; }
 
     var an:    analysis.Analyzed;
-    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    val off_o: opt[usize] = analysis.locate_current(ws, es, docs, params, uri, ?an);
     if (sel off_o.none) {
         render.reply_empty_array(alloc, id_raw);
         ret;
@@ -1577,21 +1603,18 @@ fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: rslv.Sym
 
     var bind: token.Span;
     if (binding_span(an, target, ?bind)) {
-        push_highlight(b, an.text.file, bind, HIGHLIGHT_TEXT, emitted > 0);
-        emitted = emitted + 1;
+        if (push_highlight(b, an.text, bind, HIGHLIGHT_TEXT, emitted > 0)) { emitted = emitted + 1; }
     }
 
     var di: usize = 0;
     for (di < an.a.decl_len) {
         val dso: opt[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
         if (sel dso.some) {
-            push_highlight(b, an.text.file, dso.some, HIGHLIGHT_WRITE, emitted > 0);
-            emitted = emitted + 1;
+            if (push_highlight(b, an.text, dso.some, HIGHLIGHT_WRITE, emitted > 0)) { emitted = emitted + 1; }
         }
         val iso: opt[token.Span] = features.import_ref_span(an.a, an.rr, di::id.DeclId, target, an.text.file);
         if (sel iso.some) {
-            push_highlight(b, an.text.file, iso.some, HIGHLIGHT_TEXT, emitted > 0);
-            emitted = emitted + 1;
+            if (push_highlight(b, an.text, iso.some, HIGHLIGHT_TEXT, emitted > 0)) { emitted = emitted + 1; }
         }
         di = di + 1;
     }
@@ -1601,9 +1624,8 @@ fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: rslv.Sym
         val so: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, target);
         if (sel so.some) {
             var kind: i64 = HIGHLIGHT_READ;
-            if (is_assign_target(an.a, ei::id.ExprId)) { kind = HIGHLIGHT_WRITE; }
-            push_highlight(b, an.text.file, so.some, kind, emitted > 0);
-            emitted = emitted + 1;
+            if (is_assign_target(an.a, ei::id.ExprId))                  { kind = HIGHLIGHT_WRITE; }
+            if (push_highlight(b, an.text, so.some, kind, emitted > 0)) { emitted = emitted + 1; }
         }
         ei = ei + 1;
     }
@@ -1612,8 +1634,7 @@ fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: rslv.Sym
     for (ti < an.a.type_len) {
         val so: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, target);
         if (sel so.some) {
-            push_highlight(b, an.text.file, so.some, HIGHLIGHT_READ, emitted > 0);
-            emitted = emitted + 1;
+            if (push_highlight(b, an.text, so.some, HIGHLIGHT_READ, emitted > 0)) { emitted = emitted + 1; }
         }
         ti = ti + 1;
     }
@@ -1631,7 +1652,7 @@ fun field_highlights(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
     var s: FieldXRef;
     s.a         = an.a;
     s.sr        = an.sr;
-    s.file      = an.text.file;
+    s.text      = an.text;
     s.uri       = uri;
     s.declaring = an.own == t.rs.origin;
     s.owned     = false;
@@ -1662,16 +1683,19 @@ fun is_assign_target(a: *ast.Ast, eid: id.ExprId) bool {
     ret false;
 }
 
-# append one DocumentHighlight
-fun push_highlight(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64, comma: bool) {
-    if (comma) { json.buf_push_byte(b, ','); }
-    push_highlight_body(b, file, span, kind);
+# append one DocumentHighlight, or nothing when the span cannot be reported
+fun push_highlight(b: *json.Buf, text: positions.Text, span: token.Span, kind: i64, comma: bool) bool {
+    if (!positions.maps(text, span)) { ret false; }
+    if (comma)                       { json.buf_push_byte(b, ','); }
+    push_highlight_body(b, text, span, kind);
+    ret true;
 }
 
-# one DocumentHighlight object, without the separating comma
-fun push_highlight_body(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64) {
+# one DocumentHighlight object, without the separating comma, for a span the
+# caller has checked maps
+fun push_highlight_body(b: *json.Buf, text: positions.Text, span: token.Span, kind: i64) {
     json.buf_push(b, "{\"range\":");
-    render.span_range(b, file, span);
+    render.span_range(b, text, span);
     json.buf_push(b, ",\"kind\":");
     json.buf_push_i64(b, kind);
     json.buf_push_byte(b, '}');
@@ -1696,7 +1720,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     }
 
     var an:    analysis.Analyzed;
-    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    val off_o: opt[usize] = analysis.locate_current(ws, es, docs, params, uri, ?an);
     if (sel off_o.none) {
         render.reply_empty_edit(alloc, id_raw);
         json.free_str(new_name, alloc);
@@ -1802,7 +1826,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     if (id_raw == nil) { ret; }
 
     var an:    analysis.Analyzed;
-    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    val off_o: opt[usize] = analysis.locate_current(ws, es, docs, params, uri, ?an);
     if (sel off_o.none) {
         render.reply_null(alloc, id_raw);
         ret;
@@ -1815,7 +1839,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
         # to a field of a project-owned record (the same gate field rename uses)
         var name_span: token.Span;
         if (field_prepare_span(ws, ?an, uri, offset, ?name_span)) {
-            reply_range(alloc, id_raw, an.text.file, name_span);
+            reply_range(alloc, id_raw, an.text, name_span);
             ret;
         }
         render.reply_null(alloc, id_raw);
@@ -1833,7 +1857,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
         ret;
     }
 
-    reply_range(alloc, id_raw, an.text.file, sr.name_span);
+    reply_range(alloc, id_raw, an.text, sr.name_span);
 }
 
 # answer textDocument/documentSymbol with a flat list of the
@@ -1859,8 +1883,10 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
         ret;
     }
     var an: analysis.Analyzed;
-    an.a    = tree;
-    an.text = positions.text_of(fo.some);
+    an.a       = tree;
+    an.text    = positions.text_of(fo.some);
+    an.stale   = false;
+    an.current = true;
 
     emit_document_symbols(an, alloc, id_raw);
 }
@@ -1979,6 +2005,8 @@ fun editor_completion_analysis(es: *editor.EditorSession, doc: *documents.Docume
     out.own      = doc.file_id::sess.ModuleId;
     out.own_fid  = doc.file_id;
     out.root     = nil;
+    out.stale    = false;
+    out.current  = true;
     ret true;
 }
 
@@ -2055,7 +2083,7 @@ fun renameable(ws: *project.Workspace, root: *project.Root, sym: *rslv.Symbol) b
 rec XRef {
     a:      *ast.Ast;
     rr:     *rslv.ResolveResult;
-    file:   *src.SourceFile;
+    text:   positions.Text;
     uri:    str;
     target: rslv.SymbolId;
     owned:  bool;
@@ -2070,7 +2098,7 @@ fun build_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, sym: *rs
         || (sym.flags & rslv.SYM_FLAG_PUB) == 0))) {
         out[0].a      = an.a;
         out[0].rr     = an.rr;
-        out[0].file   = an.text.file;
+        out[0].text   = an.text;
         out[0].uri    = uri;
         out[0].target = self_target;
         out[0].owned  = false;
@@ -2105,7 +2133,7 @@ fun build_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, sym: *rs
         }
         out[n].a      = mv.a;
         out[n].rr     = mv.rr;
-        out[n].file   = mv.text.file;
+        out[n].text   = mv.text;
         out[n].uri    = muri;
         out[n].target = tgt;
         out[n].owned  = cur != an.own;
@@ -2140,6 +2168,7 @@ rec WalkSink {
     mode:     u8;
     new_text: str;
     guard:    str;
+    unmapped: bool;
 }
 
 # what shape one walked span is emitted as
@@ -2169,6 +2198,7 @@ fun sink_init_mode(b: *json.Buf, alloc: *Allocator, mode: u8, new_text: str, gua
     k.mode     = mode;
     k.new_text = new_text;
     k.guard    = guard;
+    k.unmapped = false;
     ret k;
 }
 
@@ -2179,15 +2209,21 @@ fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSi
     ret sink_init_mode(b, alloc, mode, new_text, guard);
 }
 
-# append one Location or TextEdit for `span` in `file` (located at `uri`)
+# append one Location or TextEdit for `span` in `text` (located at `uri`)
 #
-# Taking `file` / `uri` rather than a source record lets the symbol walk (XRef)
-# and the field walk (FieldXRef) share it.
-fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
+# Taking `text` / `uri` rather than a source record lets the symbol walk (XRef)
+# and the field walk (FieldXRef) share it. A span that cannot be carried into
+# the client's buffer is not written; the sink records it, because an edit set
+# with a hole in it must not be offered at all.
+fun sink_emit(k: *WalkSink, text: positions.Text, uri: str, span: token.Span) {
+    if (!positions.maps(text, span)) {
+        k.unmapped = true;
+        ret;
+    }
     if (k.count > 0)              { json.buf_push_byte(k.b, ','); }
-    if (k.mode == SINK_TEXT_EDIT) { render.text_edit(k.b, file, span, k.new_text); }
-    or (k.mode == SINK_HIGHLIGHT) { push_highlight_body(k.b, file, span, HIGHLIGHT_READ); }
-    or                            { render.location(k.b, file, uri, span); }
+    if (k.mode == SINK_TEXT_EDIT) { render.text_edit(k.b, text, span, k.new_text); }
+    or (k.mode == SINK_HIGHLIGHT) { push_highlight_body(k.b, text, span, HIGHLIGHT_READ); }
+    or                            { render.location(k.b, text, uri, span); }
     k.count = k.count + 1;
 }
 
@@ -2199,21 +2235,21 @@ fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
 # binding, and doc-component spans always carry the declared name and are exempt
 fun walk_refs(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool, doc: token.Span, k: *WalkSink) {
     if (s.target == rslv.SYMBOL_NIL) { ret; }
-    if (include_bind)                { sink_emit(k, s.file, s.uri, bind); }
-    if (include_doc)                 { sink_emit(k, s.file, s.uri, doc); }
+    if (include_bind)                { sink_emit(k, s.text, s.uri, bind); }
+    if (include_doc)                 { sink_emit(k, s.text, s.uri, doc); }
     var di: usize = 0;
     for (di < s.a.decl_len) {
         val dso: opt[token.Span] = features.decl_ref_span(s.a, s.rr, di::id.DeclId, s.target);
-        if (sel dso.some) { sink_emit(k, s.file, s.uri, dso.some); }
-        val iso: opt[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.file);
-        if (sel iso.some) { sink_emit(k, s.file, s.uri, iso.some); }
+        if (sel dso.some) { sink_emit(k, s.text, s.uri, dso.some); }
+        val iso: opt[token.Span] = features.import_ref_span(s.a, s.rr, di::id.DeclId, s.target, s.text.file);
+        if (sel iso.some) { sink_emit(k, s.text, s.uri, iso.some); }
         di = di + 1;
     }
     var ei: usize = 0;
     for (ei < s.a.expr_len) {
         val so: opt[token.Span] = features.expr_ref_span(s.a, s.rr, ei::id.ExprId, s.target);
         if (sel so.some) {
-            if (guard_admits(s, k, so.some)) { sink_emit(k, s.file, s.uri, so.some); }
+            if (guard_admits(s, k, so.some)) { sink_emit(k, s.text, s.uri, so.some); }
         }
         ei = ei + 1;
     }
@@ -2221,7 +2257,7 @@ fun walk_refs(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool,
     for (ti < s.a.type_len) {
         val so: opt[token.Span] = features.type_ref_span(s.a, s.rr, ti::id.TypeId, s.target);
         if (sel so.some) {
-            if (guard_admits(s, k, so.some)) { sink_emit(k, s.file, s.uri, so.some); }
+            if (guard_admits(s, k, so.some)) { sink_emit(k, s.text, s.uri, so.some); }
         }
         ti = ti + 1;
     }
@@ -2230,7 +2266,7 @@ fun walk_refs(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool,
 # whether a body span passes the sink's spelling guard
 fun guard_admits(s: *XRef, k: *WalkSink, span: token.Span) bool {
     if (k.guard == nil) { ret true; }
-    ret features.span_text_equals(s.file, span, k.guard);
+    ret features.span_text_equals(s.text.file, span, k.guard);
 }
 
 # send a Location[] of every reference to the symbol across the
@@ -2268,17 +2304,16 @@ fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_na
     json.buf_push(?b, "{\"changes\":{");
 
     var emitted: usize = 0;
+    var hole:    bool  = false;
     var i:       usize = 0;
     for (i < nref) {
         if (push_rename_group(?b, ?refs[i], i == 0 && has_bind, bind, i == 0 && has_doc, doc,
-            name, new_name, emitted > 0, alloc)) {
+            name, new_name, emitted > 0, alloc, ?hole)) {
             emitted = emitted + 1;
         }
         i = i + 1;
     }
-
-    json.buf_push(?b, "}}");
-    render.send(?b, alloc, id_raw);
+    finish_rename(?b, alloc, id_raw, hole);
 }
 
 # the `changes`-map entry `"<uri>":[<edits>]` for source `s`,
@@ -2289,7 +2324,7 @@ fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_na
 # `include_doc`
 fun push_rename_group(b: *json.Buf, s: *XRef, include_bind: bool, bind: token.Span,
     include_doc: bool, doc: token.Span, name: str, new_name: str,
-    comma: bool, alloc: *Allocator) bool {
+    comma: bool, alloc: *Allocator, hole: *bool) bool {
     if (s.target == rslv.SYMBOL_NIL) { ret false; }
 
     # a file's edits are only known to be empty once walked, so open the entry
@@ -2301,6 +2336,7 @@ fun push_rename_group(b: *json.Buf, s: *XRef, include_bind: bool, bind: token.Sp
 
     var k: WalkSink = sink_init(b, alloc, new_name, name);
     walk_refs(s, include_bind, bind, include_doc, doc, ?k);
+    if (k.unmapped) { @hole = true; }
     if (k.count == 0) {
         json.buf_rewind(b, mark);
         ret false;
@@ -2377,9 +2413,9 @@ fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: 
     json.buf_push(b, ",\"kind\":");
     json.buf_push_i64(b, render.symbol_kind(d.kind));
     json.buf_push(b, ",\"range\":");
-    render.span_range(b, an.text.file, d.span);
+    render.span_range(b, an.text, d.span);
     json.buf_push(b, ",\"selectionRange\":");
-    render.span_range(b, an.text.file, name_span);
+    render.span_range(b, an.text, name_span);
     push_doc_symbol_children(b, an, d, alloc);
     json.buf_push_byte(b, '}');
     ret true;
@@ -2478,9 +2514,9 @@ fun push_member_symbol(b: *json.Buf, an: analysis.Analyzed, name_span: token.Spa
     json.buf_push(b, ",\"kind\":");
     json.buf_push_i64(b, kind);
     json.buf_push(b, ",\"range\":");
-    render.span_range(b, an.text.file, name_span);
+    render.span_range(b, an.text, name_span);
     json.buf_push(b, ",\"selectionRange\":");
-    render.span_range(b, an.text.file, name_span);
+    render.span_range(b, an.text, name_span);
     json.buf_push_byte(b, '}');
     ret true;
 }
@@ -2607,7 +2643,7 @@ fun emit_editor_member_completions(es: *editor.EditorSession, an: analysis.Analy
     val decl: opt[id.DeclId] = mtypes.nominal_decl(an.a, an.text, ?es.s.interner, nominal);
     if (sel decl.none) { ret false; }
     val rso: opt[project.RecordSite] =
-        project.record_site_at(?es.s.interner, alloc, an.own, an.own_fid, an.a, an.text.file, decl.some);
+        project.record_site_at(?es.s.interner, alloc, an.own, an.own_fid, an.a, an.text, decl.some);
     if (sel rso.none) { ret false; }
     ret emit_record_fields(an, alloc, id_raw, prefix, rso.some, true);
 }
@@ -2618,7 +2654,7 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
     if (an.root == nil || an.sr == nil) { ret false; }
     val tid: type.TypeId             = project.type_of(an.sr, eid);
     val rso: opt[project.RecordSite] =
-        project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+        project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
     if (sel rso.none) { ret false; }
     ret emit_record_fields(an, alloc, id_raw, prefix, rso.some, false);
 }
