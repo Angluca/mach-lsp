@@ -185,9 +185,16 @@ pub fun dnit(srv: *Server) {
 pub fun run(srv: *Server) i64 {
     trace.log("=== mach-lsp started ===\n");
 
-    if (!jobs.start(?srv.q, handle_job, (srv)::ptr)) {
+    if (!jobs.start(?srv.q, handle_job, handle_signal, (srv)::ptr)) {
         trace.log("server: could not start the analysis thread\n");
         ret 1;
+    }
+    # a project rebuild is seconds of compiler work, and run on the analysis
+    # thread it stops the server answering anything for its whole duration.
+    # without the worker every build runs inline, which is correct but slow, so
+    # a failure to spawn is reported and not fatal.
+    if (!project.start_builder(?srv.ws, wake_analysis, (srv)::ptr)) {
+        trace.log("server: could not start the build thread; rebuilds will block analysis\n");
     }
 
     var last_read: transport.ReadStatus = transport.READ_OK;
@@ -273,6 +280,12 @@ fun trace_method(srv: *Server, root: *sj.Value) {
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
 
+    # a message boundary is the only place a rebuilt snapshot may be swapped in,
+    # because it is the only place no request holds a pointer into the outgoing
+    # session. doing it before dispatch also means this message is answered from
+    # the freshest snapshot that has actually finished building.
+    collect_rebuilds(srv);
+
     trace.frame("recv:", body, len);
 
     val started_ns: i64          = trace.now_ns();
@@ -296,6 +309,34 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     if (srv.status == STATUS_EXITED || transport.write_failed()) {
         atomic.store(?srv.stop, 1);
     }
+}
+
+# swap in any finished rebuild and republish what it moved
+#
+# Runs on the analysis thread only.
+fun collect_rebuilds(srv: *Server) {
+    if (project.pump(?srv.ws) != project.PUMP_SWAPPED) { ret; }
+    if (srv.status != STATUS_RUNNING)                  { ret; }
+    republish_all(srv);
+}
+
+# the build worker telling the analysis thread a rebuild is ready
+#
+# Runs ON THE BUILD WORKER, so it does exactly one thing: wake. Everything that
+# touches compiler state, the document store, or the transport happens in
+# `handle_signal`, back on the thread that owns them.
+fun wake_analysis(ctx: ptr) {
+    val srv: *Server = ctx::*Server;
+    jobs.signal(?srv.q);
+}
+
+# the analysis thread answering that wake
+#
+# A rebuild that finishes while the client is idle still has to reach the
+# editor, so the swap and its republish cannot wait for the next keystroke.
+fun handle_signal(ctx: ptr) {
+    val srv: *Server = ctx::*Server;
+    collect_rebuilds(srv);
 }
 
 # a response has an id, no method, and exactly one of `result` or `error`.
