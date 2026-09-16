@@ -1850,6 +1850,21 @@ pub fun root_current(root: *Root) bool {
     ret root.input_revision == root.snapshot_revision;
 }
 
+# whether `d`'s text has moved past the snapshot that analyzes it
+pub fun document_behind(w: *Workspace, d: *documents.Document) bool {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded) { ret false; }
+    ret d.revision > root.snapshot_revision;
+}
+
+# start the build that will bring `d`'s root up to date, when the slot is free.
+# never swaps a snapshot in, so it is safe while a request's tree is live
+pub fun catch_up(w: *Workspace, d: *documents.Document) {
+    val root: *Root = root_for_loaded(w, d.uri);
+    if (root == nil || !root.loaded || !snapshot_stale(root)) { ret; }
+    schedule_build(w, root, root_index(w, root));
+}
+
 # whether a request on `d` that needs a current root can wait for one: the root
 # is behind, and a build that would bring it up to date is scheduled or running.
 # a failed attempt at this input is not pending, and waiting for it would wait
