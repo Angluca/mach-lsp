@@ -1321,13 +1321,17 @@ pub fun free_site(w: *Workspace, site: *Site) {
 # a borrowed view of one loaded module for the workspace-wide
 # use-site walk - its parsed Ast, resolve side tables, and backing source file
 # ---
-# a:    the module's parsed Ast (decl / expr / type ids index into it)
-# rr:   the module's ResolveResult side tables
-# text: the SourceFile backing `a`, paired with its length (positions, span text)
+# a:       the module's parsed Ast (decl / expr / type ids index into it)
+# rr:      the module's ResolveResult side tables
+# sr:      the module's SemaResult, or nil when its sema did not run
+# text:    the SourceFile backing `a`, paired with its length (positions, span text)
+# file_id: FileId of that source file, the identity a nominal type names
 pub rec ModuleView {
-    a:    *ast.Ast;
-    rr:   *rslv.ResolveResult;
-    text: positions.Text;
+    a:       *ast.Ast;
+    rr:      *rslv.ResolveResult;
+    sr:      *sema.SemaResult;
+    text:    positions.Text;
+    file_id: src.FileId;
 }
 
 # compiler-owned snapshot of one open document.
@@ -1420,22 +1424,12 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
     if (sel fo.none) { ret opt[ModuleView].none{}; }
     var v: ModuleView;
-    v.a    = m.a;
-    v.rr   = m.resolve_result;
-    v.text = positions.text_of(fo.some);
+    v.a       = m.a;
+    v.rr      = m.resolve_result;
+    v.sr      = m.sema_result;
+    v.text    = positions.text_of(fo.some);
+    v.file_id = m.file_id;
     ret opt[ModuleView].some{v};
-}
-
-# loaded module `mid`'s compiler-owned SemaResult
-# ---
-# w:    the workspace
-# root: the root governing the request, or nil
-# mid:  a loaded module id in [0, module_count)
-# ret:  some(*SemaResult), or none
-pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[*sema.SemaResult] {
-    val m: *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil || m.sema_result == nil) { ret opt[*sema.SemaResult].none{}; }
-    ret opt[*sema.SemaResult].some{m.sema_result};
 }
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL

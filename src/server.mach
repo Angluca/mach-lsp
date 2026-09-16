@@ -31,6 +31,7 @@ use sess: mach.lang.session;
 use src:  mach.lang.source;
 
 use mls.actions;
+use mls.callhierarchy;
 use mls.diagnostics;
 use mls.documents;
 use mls.hints;
@@ -71,6 +72,9 @@ val FEATURE_INLAY_HINT:         u8 = 9;
 val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
 val FEATURE_CODE_ACTION:        u8 = 11;
 val FEATURE_TYPE_DEFINITION:    u8 = 12;
+val FEATURE_CALL_PREPARE:       u8 = 13;
+val FEATURE_CALL_INCOMING:      u8 = 14;
+val FEATURE_CALL_OUTGOING:      u8 = 15;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -468,6 +472,21 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_CODE_ACTION);
         ret;
     }
+    if (str_equals(method, "textDocument/prepareCallHierarchy")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_PREPARE);
+        ret;
+    }
+    if (str_equals(method, "callHierarchy/incomingCalls")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_INCOMING);
+        ret;
+    }
+    if (str_equals(method, "callHierarchy/outgoingCalls")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_CALL_OUTGOING);
+        ret;
+    }
     if (str_equals(method, "workspace/symbol")) {
         json.free_str(method, a);
         handle_workspace_symbol(srv, root, params);
@@ -504,7 +523,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -688,6 +707,9 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_INLAY_HINT)         { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_SEMANTIC_TOKENS)    { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_CODE_ACTION)        { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CALL_PREPARE)       { callhierarchy.prepare(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CALL_INCOMING)      { callhierarchy.incoming(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params); }
+    or (which == FEATURE_CALL_OUTGOING)      { callhierarchy.outgoing(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 

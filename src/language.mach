@@ -1252,12 +1252,11 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
     for (mid < mc && n < cap) {
         val cur:  sess.ModuleId           = mid::sess.ModuleId;
         val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
-        val ms_o: opt[*sema.SemaResult]   = project.module_sema(ws, an.root, cur);
         if (sel mv_o.none) {
             mid = mid + 1;
             cnt;
         }
-        if (sel ms_o.none) {
+        if (mv_o.some.sr == nil) {
             mid = mid + 1;
             cnt;
         }
@@ -1270,7 +1269,7 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
         }
         val mv: project.ModuleView = mv_o.some;
         out[n].a         = mv.a;
-        out[n].sr        = ms_o.some;
+        out[n].sr        = mv.sr;
         out[n].file      = mv.text.file;
         out[n].uri       = muri;
         out[n].declaring = cur == t.key.origin;

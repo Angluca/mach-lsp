@@ -16,8 +16,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves to a declaration rather than the first that types, because a callee's
   own type is a function type and committing to it answers null on `make` in
   `ret make();`.
+- feat(navigation): call hierarchy - `textDocument/prepareCallHierarchy`,
+  `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. An item is
+  addressed by `uri` plus `selectionRange.start` and re-derived on every
+  request rather than held in a server-side handle table, so nothing is
+  retained between requests and no lifetime rules are owed. Item resolution
+  reaches the project's module snapshot through the new
+  `analysis.analyze_uri`, because an item's file is usually one the editor
+  never opened. A call through a `fun` value is reported rather than omitted,
+  as SymbolKind.Variable carrying a `detail` that says the target is not
+  statically known; a callee that resolves to no symbol at all is anchored on
+  the call site itself.
 
 ### Fixed
+- a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,
+  so a decl-keyed cross-module identity test reports that no module importing a
+  function calls it. `features.symbol_denotes` adds the interned canonical name
+  and the declaring kind, which those bindings do carry, and the call hierarchy
+  walk uses it. `references` and `rename` still identify by `DeclId` alone and
+  still have the gap; see #246, kept separate because it widens what `rename`
+  rewrites.
 - perf(analysis): a syntax-only request no longer reloads the project through
   the editor session. `editor.analyze` tore the project down on every call, so
   `documentSymbol` against a healthy project paid a full reload: against this

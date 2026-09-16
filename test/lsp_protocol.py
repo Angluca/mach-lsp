@@ -978,7 +978,15 @@ pub fun make() Color { ret Color.red{}; }
 pub fun helper(n: i32) i32 { ret n + 1; }
 """
 
-NAV_MAIN = """use nav.defs.Box;
+NAV_OTHER = """use nav.defs.helper;
+
+pub fun elsewhere(n: i32) i32 {
+    ret helper(n);
+}
+"""
+
+NAV_MAIN = """use nav.other;
+use nav.defs.Box;
 use nav.defs.Color;
 use nav.defs.make;
 use nav.defs.helper;
@@ -1011,10 +1019,12 @@ pub fun main() i32 {
 def write_nav_project(parent: Path) -> tuple[Path, Path, str]:
     """A two-module project covering the navigation features' interesting shapes.
 
-    One module declares a record, a nested record, a tag and two functions; the
-    other imports them and calls across the module boundary, directly and through
-    a `fun` value. Cross-module is the point: a single file would let a walk that
-    never leaves the open buffer pass.
+    One module declares a record, a nested record, a tag and two functions; a
+    second imports them and calls across the module boundary, directly and through
+    a `fun` value; a third calls the same function without being the open buffer or
+    the declaring file. Cross-module is the point: a single file would let a walk
+    that never leaves the open buffer pass, and the third module is the one that
+    neither end of the request names.
     """
     root = parent / "nav"
     (root / "src").mkdir(parents=True)
@@ -1023,14 +1033,21 @@ def write_nav_project(parent: Path) -> tuple[Path, Path, str]:
     defs = root / "src" / "defs.mach"
     main.write_text(NAV_MAIN, encoding="utf-8")
     defs.write_text(NAV_DEFS, encoding="utf-8")
+    (root / "src" / "other.mach").write_text(NAV_OTHER, encoding="utf-8")
     return main, defs, NAV_MAIN
 
 
 def nav_position(text: str, within: str, needle: str) -> dict[str, Any]:
-    """A cursor one byte inside `needle`, on the unique line holding `within`."""
+    """A cursor in the middle of `needle`, on the unique line holding `within`.
+
+    The middle, not one past the start: a one-character name is a real cursor
+    target - `var b: Box;` - and start + 1 lands on the colon after it, where
+    every positional request answers null for the wrong reason.
+    """
     lines = text.splitlines()
     line = next(i for i, value in enumerate(lines) if within in value)
-    return {"line": line, "character": lines[line].index(needle, lines[line].index(within)) + 1}
+    start = lines[line].index(needle, lines[line].index(within))
+    return {"line": line, "character": start + len(needle) // 2}
 
 
 def nav_range(text: str, needle: str) -> dict[str, Any]:
@@ -1040,6 +1057,167 @@ def nav_range(text: str, needle: str) -> dict[str, Any]:
     start = lines[line].index(needle)
     return {"start": {"line": line, "character": start},
             "end": {"line": line, "character": start + len(needle)}}
+
+
+def nav_ranges(text: str, within: str, needle: str) -> list[dict[str, Any]]:
+    """Every range of `needle` on the single line holding `within`."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if within in value)
+    found: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        at = lines[line].find(needle, start)
+        if at < 0:
+            return found
+        found.append({"start": {"line": line, "character": at},
+                      "end": {"line": line, "character": at + len(needle)}})
+        start = at + len(needle)
+
+
+def run_call_hierarchy(server: Path, timeout: float) -> None:
+    """Call hierarchy resolves items by position, across modules, including
+    calls whose target is not statically known.
+
+    Three things here can only fail against a real project. An item's uri is the
+    declaring module's, which for a cross-module callee is a file the editor never
+    opened, so item resolution has to reach the project snapshot rather than the
+    open-document store - `defs.mach` is never opened in this session. A caller
+    that imported the function binds it without a DeclId of its own, so a
+    decl-keyed identity test reports that nothing outside the declaring file calls
+    it. And a fromRange is a span in the caller's file, which has a different line
+    index from the callee's.
+
+    Calls through a `fun` value are reported rather than omitted: the call exists
+    and the target does not, and the item says which by its kind and its detail.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-callhier-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}},
+            )["result"]["capabilities"]
+            require(capabilities.get("callHierarchyProvider") is True,
+                    f"call hierarchy is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+
+            def prepare(within: str, needle: str) -> Any:
+                return session.request(
+                    "textDocument/prepareCallHierarchy",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": nav_position(text, within, needle)},
+                )["result"]
+
+            def one_item(within: str, needle: str) -> dict[str, Any]:
+                result = prepare(within, needle)
+                require(isinstance(result, list) and len(result) == 1,
+                        f"prepare on {needle!r} is not a single item: {result!r}")
+                return result[0]
+
+            def calls(item: dict[str, Any], which: str) -> list[dict[str, Any]]:
+                result = session.request(
+                    f"callHierarchy/{which}Calls", {"item": item},
+                )["result"]
+                require(isinstance(result, list),
+                        f"{which}Calls is not a list: {result!r}")
+                return result
+
+            # prepare answers with the declaration, which is in the other module
+            helper = one_item("ret helper(n) + helper(n + 1);", "helper")
+            require(helper["name"] == "helper" and helper["kind"] == 12,
+                    f"prepare named the wrong thing: {helper!r}")
+            require(helper["uri"] == defs.as_uri(),
+                    f"prepare did not land in the declaring module: {helper!r}")
+            require(helper["selectionRange"] == nav_range(NAV_DEFS, "helper"),
+                    f"prepare selected the wrong span: {helper!r}")
+
+            # incoming finds the caller in the other module - the item names
+            # `defs.mach`, which this session never opened
+            incoming = calls(helper, "incoming")
+            callers = sorted((entry["from"]["name"], entry["from"]["uri"].rsplit("/", 1)[-1],
+                              len(entry["fromRanges"])) for entry in incoming)
+            require(callers == [("elsewhere", "other.mach", 1), ("local", "main.mach", 2)],
+                    f"incoming did not find both callers: {incoming!r}")
+            local_call = next(e for e in incoming if e["from"]["name"] == "local")
+            require(local_call["from"]["uri"] == main.as_uri(),
+                    f"incoming named the wrong file: {local_call!r}")
+            require(local_call["fromRanges"]
+                    == nav_ranges(text, "ret helper(n) + helper(n + 1);", "helper"),
+                    f"incoming ranges are not the two call sites: {local_call!r}")
+            other_call = next(e for e in incoming if e["from"]["name"] == "elsewhere")
+            require(other_call["fromRanges"] == nav_ranges(NAV_OTHER, "ret helper(n);", "helper"),
+                    f"a caller in a third module indexed the wrong file: {other_call!r}")
+
+            # outgoing is the mirror, and its ranges index the caller's file
+            local = one_item("pub fun local(n: i32) i32 {", "local")
+            outgoing = calls(local, "outgoing")
+            require(len(outgoing) == 1,
+                    f"outgoing did not find exactly one callee: {outgoing!r}")
+            require(outgoing[0]["to"]["uri"] == defs.as_uri()
+                    and outgoing[0]["to"]["selectionRange"] == nav_range(NAV_DEFS, "helper"),
+                    f"outgoing named the wrong callee: {outgoing[0]!r}")
+            require(outgoing[0]["fromRanges"]
+                    == nav_ranges(text, "ret helper(n) + helper(n + 1);", "helper"),
+                    f"outgoing ranges do not index the caller's file: {outgoing[0]!r}")
+
+            # two calls to the same function are one entry with two ranges, and
+            # distinct callees are distinct entries
+            entries = calls(one_item("pub fun main() i32 {", "main"), "outgoing")
+            require([e["to"]["name"] for e in entries] == ["make", "local", "indirect"],
+                    f"outgoing did not list every callee once: {entries!r}")
+
+            # a call through a `fun` value is reported, and says what it is: a
+            # parameter of function type, and a function held in a record field,
+            # which resolves to no symbol at all
+            through = calls(one_item("pub fun indirect(f: Handler, t: Table) i32 {",
+                                     "indirect"), "outgoing")
+            require([e["to"]["name"] for e in through] == ["f", "fn"],
+                    f"a call through a fun value was dropped: {through!r}")
+            for entry in through:
+                require(entry["to"]["kind"] == 13,
+                        f"an indirect call is not reported as a value: {entry!r}")
+                require("not statically known" in entry["to"].get("detail", ""),
+                        f"an indirect call does not say its target is unknown: {entry!r}")
+            require(through[1]["to"]["uri"] == main.as_uri()
+                    and through[1]["to"]["selectionRange"]
+                    == nav_ranges(text, "ret f(1) + t.fn(2);", "fn")[0],
+                    f"an unresolved callee is not anchored on its call: {through[1]!r}")
+            require(through[0]["fromRanges"] == nav_ranges(text, "ret f(1) + t.fn(2);", "f")[:1],
+                    f"an indirect fromRange is not the call site: {through[0]!r}")
+            require(through[1]["fromRanges"] == nav_ranges(text, "ret f(1) + t.fn(2);", "fn"),
+                    f"an unresolved fromRange is not the call site: {through[1]!r}")
+
+            # only a function anchors a hierarchy: a value that holds one is not
+            # one, and its incoming calls would be a runtime fact
+            for within, needle in (("var b: Box;", "b"),
+                                   ("var b: Box;", "Box"),
+                                   ("pub def Handler: fun(i32) i32;", "Handler")):
+                require(prepare(within, needle) is None,
+                        f"prepare minted an item for {needle!r}, which is not a function")
+
+            # an item this server did not mint is answered, not left hanging
+            bogus = {"name": "nowhere", "kind": 12, "uri": main.as_uri(),
+                     "range": nav_range(text, "pub fun main() i32 {"),
+                     "selectionRange": {"start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 0}}}
+            require(calls(bogus, "incoming") == [],
+                    "an unresolvable item did not answer empty")
+            require(calls(bogus, "outgoing") == [],
+                    "an unresolvable item did not answer empty")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_type_definition(server: Path, timeout: float) -> None:
@@ -3335,6 +3513,7 @@ def main() -> int:
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_type_definition(server, args.timeout)
+        run_call_hierarchy(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
@@ -3368,6 +3547,7 @@ def main() -> int:
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
+    print("  call hierarchy resolves items across modules, and reports calls through fun values")
     print("  a syntax-only request answers from the buffer without reloading the project")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")

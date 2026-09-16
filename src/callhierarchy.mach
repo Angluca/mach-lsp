@@ -1,0 +1,719 @@
+# call hierarchy: who calls this function, and what does it call
+#
+# The three requests share one contract, and the whole feature turns on it: how a
+# CallHierarchyItem is addressed. `prepareCallHierarchy` is positional, but the
+# two follow-ups are not - they hand back an item the server itself minted, and
+# the server has to recover what it stood for. Two designs are available. One
+# keeps a server-side handle table keyed by an opaque `data` token, which then has
+# to be invalidated on every rebuild and leaks if a client abandons a tree. The
+# other re-derives the item from what the protocol already carries: `uri` plus
+# `selectionRange.start` is a position, and a position is exactly what the
+# ordinary cursor pivot consumes. This module takes the second. Nothing is
+# retained between requests, a moved declaration simply stops resolving, and the
+# hierarchy costs no lifetime rules.
+#
+# That only works because an item's uri is usually a module the editor never
+# opened - one step out from the cursor is already someone else's file - so item
+# resolution goes through `analysis.analyze_uri`, which reaches the project's
+# module snapshot rather than the open-document store.
+#
+# Calls through a `fun` value are the part worth stating plainly, because the
+# target is not statically known and the honest answers are not "omit". Outgoing
+# calls report every call expression in the body, in one of three shapes:
+#
+#   - the callee resolves to a `fun` declaration: an item for that function.
+#   - the callee resolves to a binding of function type - a `val` / `var` / a
+#     parameter, possibly imported: an item for that binding's declaration,
+#     SymbolKind.Variable, carrying `detail` that says the target is not
+#     statically known. The call is reported; what it reaches is not claimed.
+#   - the callee resolves to no symbol at all - a `fun` held in a record field, an
+#     entry in a table of handlers, an immediately-called expression: an item
+#     anchored on the callee expression itself, in the caller's own file, with the
+#     same `detail`. Navigating it lands on the call, which is the only site that
+#     exists; drilling further finds nothing, which is the true answer.
+#
+# Incoming calls are the mirror and are deliberately narrower: they report call
+# sites whose callee resolves to this exact declaration. A call made through a
+# `fun` value that happens to hold this function is not attributed to it, because
+# which function a value holds is a runtime fact. Taking a function's address
+# (`indirect(helper, ...)`) is a reference, not a call, and `references` already
+# answers that question.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use aexpr: mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use rslv: mach.lang.fe.resolve;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use sess: mach.lang.session;
+use src:  mach.lang.source;
+
+use mls.analysis;
+use mls.documents;
+use mls.features;
+use mls.json;
+use mls.positions;
+use mls.project;
+use mls.render;
+
+use sj:      std.data.json;
+use strutil: std.text.string;
+
+use std.allocator;
+
+# LSP SymbolKind values used for hierarchy items
+val LSP_FUNCTION:   i64 = 12;
+val LSP_VARIABLE:   i64 = 13;
+val LSP_CONSTANT:   i64 = 14;
+val LSP_STRUCT:     i64 = 23;
+val LSP_ENUM:       i64 = 10;
+val LSP_TYPE_PARAM: i64 = 26;
+
+# what an item says about a call whose target is not statically known
+val INDIRECT_DETAIL: str = "fun value: the call target is not statically known";
+
+# the function a hierarchy request is anchored on
+#
+# `site` owns its uri when the declaration is in another module, so every exit
+# releases it through `project.free_site`.
+# ---
+# site:      the declaring module's Ast, source, uri and symbol
+# origin:    ModuleId declaring the function
+# decl:      DeclId of the `fun` declaration in `origin`'s Ast
+# canon:     the function's interned canonical name
+# name_span: the declared name, the item's selectionRange
+# decl_span: the whole declaration, the item's range and the body's bounds
+rec Anchor {
+    site:      project.Site;
+    origin:    sess.ModuleId;
+    decl:      id.DeclId;
+    canon:     intern.StrId;
+    name_span: token.Span;
+    decl_span: token.Span;
+}
+
+# one call site naming the anchored function, with the declaration it was made
+# from
+# ---
+# caller: the module-scope declaration whose span covers the call, or DECL_NIL
+# span:   the callee name span, which is the LSP fromRange
+rec Hit {
+    caller: id.DeclId;
+    span:   token.Span;
+}
+
+# one call made by the anchored function, resolved to what it names
+# ---
+# uri:       document holding the callee's declaration, owned when `owned`
+# owned:     whether `uri` must be freed
+# text:      source backing `name_span` / `decl_span`
+# name_span: the callee's declared name, the item's selectionRange
+# decl_span: the callee's declaration, the item's range
+# kind:      LSP SymbolKind for the item
+# indirect:  whether the call goes through a value rather than to a function
+# from:      the call site, the LSP fromRange
+# from_text: the caller's source, which is what `from` indexes - a callee in
+#            another module has a different line index, and rendering the range
+#            against it puts the call on an unrelated line
+rec Callee {
+    uri:       str;
+    owned:     bool;
+    text:      positions.Text;
+    name_span: token.Span;
+    decl_span: token.Span;
+    kind:      i64;
+    indirect:  bool;
+    from:      token.Span;
+    from_text: positions.Text;
+}
+
+# answer textDocument/prepareCallHierarchy with the function under the cursor
+#
+# Only a `fun` declaration anchors a hierarchy. A cursor on a binding that holds a
+# function is not a function: its incoming calls would be calls to whatever it
+# currently holds, which is not a static fact, so it answers null rather than
+# minting an item that cannot be honoured.
+pub fun prepare(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, req: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an:    analysis.Analyzed;
+    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (sel off_o.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+
+    var t: Anchor;
+    if (!anchor_at(ws, ?an, uri, off_o.some, ?t)) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    push_item(?b, alloc, t.site.uri, t.site.text, t.name_span, t.decl_span, LSP_FUNCTION, nil);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+    project.free_site(ws, ?t.site);
+}
+
+# answer callHierarchy/incomingCalls with every call site naming the item's
+# function, across every loaded module
+#
+# The module walk is the one `references` makes, for the same reason: a caller in
+# another module resolves the callee to its own SymbolId, and only the canonical
+# (origin, decl) pair is shared across modules.
+pub fun incoming(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, req: *sj.Value, params: *sj.Value) {
+    val id_raw: str = json.id_text(req, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an:       analysis.Analyzed;
+    var t:        Anchor;
+    var item_uri: str = nil;
+    if (!anchor_of_item(ws, es, docs, alloc, params, ?an, ?item_uri, ?t)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+
+    var groups: usize = 0;
+    val mc:     u32   = project.module_count(an.root);
+    var mid:    u32   = 0;
+    for (mid < mc) {
+        val cur:  sess.ModuleId           = mid::sess.ModuleId;
+        val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
+        if (sel mv_o.none) {
+            mid = mid + 1;
+            cnt;
+        }
+        val mv:   project.ModuleView = mv_o.some;
+        var muri: str                = nil;
+        if (cur == an.own) { muri = item_uri; }
+        or                 { muri = project.module_uri(ws, an.root, cur); }
+        if (muri == nil) {
+            mid = mid + 1;
+            cnt;
+        }
+        emit_module_incoming(?b, alloc, ?mv, muri, ?t, ?groups);
+        if (cur != an.own) { strutil.str_free(ws.alloc, muri); }
+        mid = mid + 1;
+    }
+
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+    project.free_site(ws, ?t.site);
+    json.free_str(item_uri, alloc);
+}
+
+# answer callHierarchy/outgoingCalls with every call the item's function makes
+#
+# One module only: the body is where the calls are. Each call is reported whether
+# or not its target is statically known - see the module header for what the three
+# shapes mean.
+pub fun outgoing(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, req: *sj.Value, params: *sj.Value) {
+    val id_raw: str = json.id_text(req, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an:       analysis.Analyzed;
+    var t:        Anchor;
+    var item_uri: str = nil;
+    if (!anchor_of_item(ws, es, docs, alloc, params, ?an, ?item_uri, ?t)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+
+    # the item's uri is the declaring module's, so the anchor's spans index the
+    # analysis just built from it; anything else is an item this server did not
+    # mint and its spans would be read against the wrong Ast
+    if (t.origin != an.own) {
+        render.reply_empty_array(alloc, id_raw);
+        project.free_site(ws, ?t.site);
+        json.free_str(item_uri, alloc);
+        ret;
+    }
+
+    val n: usize = count_body_calls(?an, t.decl_span);
+    if (n == 0) {
+        render.reply_empty_array(alloc, id_raw);
+        project.free_site(ws, ?t.site);
+        json.free_str(item_uri, alloc);
+        ret;
+    }
+    val ra: res[*Callee, allocator.Error] = allocate[Callee](alloc, n);
+    if (sel ra.err) {
+        render.reply_empty_array(alloc, id_raw);
+        project.free_site(ws, ?t.site);
+        json.free_str(item_uri, alloc);
+        ret;
+    }
+    val callees: *Callee = ra.ok;
+    val found:   usize   = collect_body_calls(ws, ?an, item_uri, t.decl_span, callees, n);
+
+    emit_outgoing(alloc, id_raw, callees, found);
+
+    free_callees(ws, callees, found);
+    deallocate[Callee](alloc, callees, n);
+    project.free_site(ws, ?t.site);
+    json.free_str(item_uri, alloc);
+}
+
+# resolve the `item` a follow-up request carries to its function
+#
+# The item is re-derived from `uri` + `selectionRange.start` rather than from a
+# retained handle; see the module header. On success `uri_out` owns a string the
+# caller frees and `out.site` owns whatever `project.free_site` releases.
+# ---
+# ws:      the workspace
+# es:      the standalone editor session
+# docs:    the open-document registry
+# alloc:   request allocator
+# params:  the request params, holding `item`
+# an_out:  receives the item module's analysis
+# uri_out: receives the item's owned uri
+# out:     receives the anchor
+# ret:     true when the item resolved to a function declaration
+fun anchor_of_item(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, alloc: *Allocator,
+    params: *sj.Value, an_out: *analysis.Analyzed, uri_out: *str, out: *Anchor) bool {
+    val item: *sj.Value = json.member(params, "item");
+    if (item == nil) { ret false; }
+    val iuri: str = json.text(json.member(item, "uri"), alloc);
+    if (iuri == nil) { ret false; }
+    if (!analysis.analyze_uri(ws, es, docs, iuri, an_out)) {
+        json.free_str(iuri, alloc);
+        ret false;
+    }
+
+    val pos:  *sj.Value = json.member2(item, "selectionRange", "start");
+    val line: i64       = json.number(json.member(pos, "line"), -1);
+    val ch:   i64       = json.number(json.member(pos, "character"), -1);
+    if (line < 0 || ch < 0) {
+        json.free_str(iuri, alloc);
+        ret false;
+    }
+    val oo: opt[usize] = positions.offset_at(an_out.text, line::usize, ch::usize);
+    if (sel oo.none) {
+        json.free_str(iuri, alloc);
+        ret false;
+    }
+    if (!anchor_at(ws, an_out, iuri, oo.some, out)) {
+        json.free_str(iuri, alloc);
+        ret false;
+    }
+    @uri_out = iuri;
+    ret true;
+}
+
+# the function declaration `offset` names, or false
+#
+# The pivot is the ordinary one, so a cursor on a call, on an import path, or on
+# the declaration's own name all reach the same function. The declaring site is
+# recovered through `project.site_of`, which is what makes a cross-module callee
+# addressable at all.
+fun anchor_at(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, offset: usize, out: *Anchor) bool {
+    val ro: opt[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.text.file, offset);
+    if (sel ro.none) { ret false; }
+    val so: opt[*rslv.Symbol] = features.symbol(an.rr, ro.some.sym_id);
+    if (sel so.none) { ret false; }
+
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, so.some);
+    if (sel site_o.none) { ret false; }
+    var site: project.Site = site_o.some;
+    if (site.sym.decl == id.DECL_NIL) {
+        project.free_site(ws, ?site);
+        ret false;
+    }
+    val d_opt: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
+    if (sel d_opt.none) {
+        project.free_site(ws, ?site);
+        ret false;
+    }
+    val d: *decl.Decl = d_opt.some;
+    if (d.kind != decl.DECL_KIND_FUN) {
+        project.free_site(ws, ?site);
+        ret false;
+    }
+
+    out.site      = site;
+    out.origin    = site.sym.origin;
+    out.decl      = site.sym.decl;
+    out.canon     = site.sym.canon;
+    out.name_span = d.data.fun_.name;
+    out.decl_span = d.span;
+    ret true;
+}
+
+# append every caller in one module, grouped by the declaration the call was made
+# from and ordered by that declaration
+fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleView, muri: str,
+    t: *Anchor, groups: *usize) {
+    val n: usize = count_calls_to(mv.a, mv.rr, t);
+    if (n == 0) { ret; }
+    val ra: res[*Hit, allocator.Error] = allocate[Hit](alloc, n);
+    if (sel ra.err) { ret; }
+    val hits: *Hit = ra.ok;
+    collect_calls_to(mv.a, mv.rr, t, hits, n);
+
+    val dn: u32 = features.top_level_count(mv.a);
+    var di: u32 = 0;
+    for (di < dn) {
+        val did:  id.DeclId = features.top_level_decl(mv.a, di);
+        var open: bool      = false;
+        var i:    usize     = 0;
+        for (i < n) {
+            if (hits[i].caller == did) {
+                if (!open) {
+                    if (@groups > 0) { json.buf_push_byte(b, ','); }
+                    json.buf_push(b, "{\"from\":");
+                    push_decl_item(b, alloc, mv.a, muri, mv.text, did);
+                    json.buf_push(b, ",\"fromRanges\":[");
+                    open = true;
+                }
+                or { json.buf_push_byte(b, ','); }
+                render.span_range(b, mv.text.file, hits[i].span);
+            }
+            i = i + 1;
+        }
+        if (open) {
+            json.buf_push(b, "]}");
+            @groups = @groups + 1;
+        }
+        di = di + 1;
+    }
+
+    deallocate[Hit](alloc, hits, n);
+}
+
+# how many call expressions in `a` name the anchored function
+fun count_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < a.expr_len) {
+        var span: token.Span;
+        if (call_to(a, rr, i::id.ExprId, t, ?span)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# fill `out` with each call to the anchored function and the declaration it was
+# made from
+fun collect_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor, out: *Hit, cap: usize) {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < a.expr_len && n < cap) {
+        var span: token.Span;
+        if (call_to(a, rr, i::id.ExprId, t, ?span)) {
+            out[n].span   = span;
+            out[n].caller = enclosing_decl(a, span.offset);
+            n             = n + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# whether expr `eid` is a call naming the anchored function, and where its name is
+# written
+#
+# The test is on the identity rather than on one precomputed SymbolId, because a
+# module can bind the same declaration more than once - `use nav.defs.helper;`
+# beside `use h: nav.defs.helper;` - and a call through either is a call.
+#
+# The callee of a qualified call (`mod.fn()`) is a member expression, and the span
+# a client should highlight is the member name rather than the whole `mod.fn`.
+fun call_to(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, t: *Anchor, span_out: *token.Span) bool {
+    val eo: opt[*aexpr.Expr] = ast.get_expr(a, eid);
+    if (sel eo.none) { ret false; }
+    val e: *aexpr.Expr = eo.some;
+    if (e.kind != aexpr.EXPR_KIND_CALL) { ret false; }
+
+    val callee: id.ExprId     = e.data.call.callee;
+    val sid:    rslv.SymbolId = resolved_symbol(rr, callee);
+    if (!features.symbol_denotes(rr, sid, t.origin, t.decl, t.canon, rslv.SYM_FUN)) { ret false; }
+    val co: opt[*aexpr.Expr] = ast.get_expr(a, callee);
+    if (sel co.none) { ret false; }
+    @span_out = features.name_span_of_expr(co.some);
+    ret true;
+}
+
+# the module-scope declaration whose span covers `offset`, or DECL_NIL
+#
+# Functions do not nest, so a module-scope span is the whole answer; the flat
+# decl array is not, since a `val` inside a body would win the containment test.
+fun enclosing_decl(a: *ast.Ast, offset: usize) id.DeclId {
+    val n: u32 = features.top_level_count(a);
+    var i: u32 = 0;
+    for (i < n) {
+        val did:   id.DeclId       = features.top_level_decl(a, i);
+        val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
+        if (sel d_opt.some) {
+            if (ast.span_contains(d_opt.some.span, offset)) { ret did; }
+        }
+        i = i + 1;
+    }
+    ret id.DECL_NIL;
+}
+
+# how many call expressions `body` contains
+fun count_body_calls(an: *analysis.Analyzed, body: token.Span) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < an.a.expr_len) {
+        if (is_body_call(an.a, i::id.ExprId, body)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# whether expr `eid` is a call written inside `body`
+fun is_body_call(a: *ast.Ast, eid: id.ExprId, body: token.Span) bool {
+    val eo: opt[*aexpr.Expr] = ast.get_expr(a, eid);
+    if (sel eo.none) { ret false; }
+    val e: *aexpr.Expr = eo.some;
+    if (e.kind != aexpr.EXPR_KIND_CALL) { ret false; }
+    ret ast.span_contains(body, e.span.offset);
+}
+
+# resolve every call in `body` to what it names
+fun collect_body_calls(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, body: token.Span,
+    out: *Callee, cap: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < an.a.expr_len && n < cap) {
+        if (is_body_call(an.a, i::id.ExprId, body)) {
+            val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, i::id.ExprId);
+            if (sel eo.some) {
+                if (resolve_callee(ws, an, uri, eo.some.data.call.callee, ?out[n])) { n = n + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# resolve one callee expression to the item it should be reported as
+#
+# See the module header for the three shapes. The discriminator for "is this a
+# function" is the symbol's kind rather than its declaration's: a parameter of
+# function type has no declaration of its own and carries its owning function's
+# DeclId, so reading the decl would report the enclosing function as the callee.
+fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, callee: id.ExprId, out: *Callee) bool {
+    val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, callee);
+    if (sel eo.none) { ret false; }
+    val here: token.Span = features.name_span_of_expr(eo.some);
+
+    out.uri       = uri;
+    out.owned     = false;
+    out.text      = an.text;
+    out.name_span = here;
+    out.decl_span = here;
+    out.kind      = LSP_VARIABLE;
+    out.indirect  = true;
+    out.from      = here;
+    out.from_text = an.text;
+
+    val sid: rslv.SymbolId = resolved_symbol(an.rr, callee);
+    if (sid == rslv.SYMBOL_NIL) { ret true; }
+    val so: opt[*rslv.Symbol] = features.symbol(an.rr, sid);
+    if (sel so.none) { ret true; }
+    val sym: *rslv.Symbol = so.some;
+
+    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
+    if (sel site_o.none) { ret true; }
+    var site: project.Site = site_o.some;
+
+    val nso: opt[token.Span] = features.definition_name_span(site.a, site.sym);
+    if (sel nso.none) {
+        project.free_site(ws, ?site);
+        ret true;
+    }
+
+    out.uri       = site.uri;
+    out.owned     = site.owned;
+    out.text      = site.text;
+    out.name_span = nso.some;
+    out.decl_span = nso.some;
+    out.indirect  = features.definition_kind_of(sym) != rslv.SYM_FUN;
+    out.kind      = LSP_VARIABLE;
+    if (!out.indirect) { out.kind = LSP_FUNCTION; }
+
+    # a parameter or generic binding has no declaration node of its own, so its
+    # binding name is the whole item; everything else has a declaration to span
+    if (site.sym.kind != rslv.SYM_PARAM && site.sym.kind != rslv.SYM_GENERIC) {
+        val dso: opt[token.Span] = features.decl_span_of(site.a, site.sym);
+        if (sel dso.some) { out.decl_span = dso.some; }
+    }
+
+    # the site's uri is now owned by the Callee; do not release it here
+    site.owned = false;
+    project.free_site(ws, ?site);
+    ret true;
+}
+
+# the symbol expr `eid` resolves to, or SYMBOL_NIL
+fun resolved_symbol(rr: *rslv.ResolveResult, eid: id.ExprId) rslv.SymbolId {
+    if (rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret rslv.SYMBOL_NIL; }
+    ret rr.expr_resolved[eid];
+}
+
+# send the CallHierarchyOutgoingCall[], one entry per distinct callee
+#
+# Distinctness is the pair (uri, name span offset), which is the item's own
+# identity under this module's addressing scheme: two calls to the same function
+# are one entry with two fromRanges.
+fun emit_outgoing(alloc: *Allocator, id_raw: str, callees: *Callee, n: usize) {
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+
+    var groups: usize = 0;
+    var i:      usize = 0;
+    for (i < n) {
+        if (first_of_group(callees, i)) {
+            if (groups > 0) { json.buf_push_byte(?b, ','); }
+            json.buf_push(?b, "{\"to\":");
+            var detail: str = nil;
+            if (callees[i].indirect) { detail = INDIRECT_DETAIL; }
+            push_item(?b, alloc, callees[i].uri, callees[i].text, callees[i].name_span,
+                callees[i].decl_span, callees[i].kind, detail);
+            json.buf_push(?b, ",\"fromRanges\":[");
+
+            var emitted: usize = 0;
+            var j:       usize = i;
+            for (j < n) {
+                if (same_callee(callees, i, j)) {
+                    if (emitted > 0) { json.buf_push_byte(?b, ','); }
+                    render.span_range(?b, callees[j].from_text.file, callees[j].from);
+                    emitted = emitted + 1;
+                }
+                j = j + 1;
+            }
+
+            json.buf_push(?b, "]}");
+            groups = groups + 1;
+        }
+        i = i + 1;
+    }
+
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# whether `i` is the first entry naming its callee
+fun first_of_group(callees: *Callee, i: usize) bool {
+    var j: usize = 0;
+    for (j < i) {
+        if (same_callee(callees, i, j)) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# whether two collected calls name the same item
+fun same_callee(callees: *Callee, i: usize, j: usize) bool {
+    if (callees[i].name_span.offset != callees[j].name_span.offset) { ret false; }
+    if (callees[i].uri == nil || callees[j].uri == nil)             { ret false; }
+    ret str_equals(callees[i].uri, callees[j].uri);
+}
+
+# release the generated module uris the collected callees own
+#
+# The caller's own uri is borrowed from the request and is never owned, so an
+# unresolved callee - which reports the caller's file - frees nothing.
+fun free_callees(ws: *project.Workspace, callees: *Callee, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        if (callees[i].owned && callees[i].uri != nil) { strutil.str_free(ws.alloc, callees[i].uri); }
+        callees[i].owned = false;
+        i                = i + 1;
+    }
+}
+
+# append a CallHierarchyItem for the module-scope declaration `did`
+#
+# A `test` block is a callable body with no declared name, so its label stands in;
+# every other module-scope declaration has one.
+fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text: positions.Text, did: id.DeclId) {
+    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel d_opt.none) {
+        push_item(b, alloc, uri, text, empty_span(), empty_span(), LSP_VARIABLE, nil);
+        ret;
+    }
+    val d: *decl.Decl = d_opt.some;
+
+    var name: token.Span = d.span;
+    if (d.kind == decl.DECL_KIND_TEST) { name = d.data.test_.label; }
+    or {
+        val nso: opt[token.Span] = features.decl_name_span(d);
+        if (sel nso.some) { name = nso.some; }
+    }
+    push_item(b, alloc, uri, text, name, d.span, decl_lsp_kind(d.kind), nil);
+}
+
+# append a CallHierarchyItem
+#
+# `name` is read out of the source rather than out of the interner: a caller may
+# be a `test` label or an unresolved callee expression, neither of which has an
+# interned name, and the bytes are what the client shows either way.
+fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
+    name_span: token.Span, decl_span: token.Span, kind: i64, detail: str) {
+    json.buf_push(b, "{\"name\":");
+    val name: str = positions.span_text(text, name_span, alloc);
+    if (name != nil) {
+        json.buf_push_quoted(b, name);
+        strutil.str_free(alloc, name);
+    }
+    or { json.buf_push(b, "\"\""); }
+
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    if (detail != nil) {
+        json.buf_push(b, ",\"detail\":");
+        json.buf_push_quoted(b, detail);
+    }
+    json.buf_push(b, ",\"uri\":");
+    json.buf_push_quoted(b, uri);
+    json.buf_push(b, ",\"range\":");
+    render.span_range(b, text.file, decl_span);
+    json.buf_push(b, ",\"selectionRange\":");
+    render.span_range(b, text.file, name_span);
+    json.buf_push_byte(b, '}');
+}
+
+# the LSP SymbolKind for a declaration kind
+fun decl_lsp_kind(kind: decl.DeclKind) i64 {
+    if (kind == decl.DECL_KIND_FUN)  { ret LSP_FUNCTION; }
+    if (kind == decl.DECL_KIND_TEST) { ret LSP_FUNCTION; }
+    if (kind == decl.DECL_KIND_REC)  { ret LSP_STRUCT; }
+    if (kind == decl.DECL_KIND_UNI)  { ret LSP_ENUM; }
+    if (kind == decl.DECL_KIND_TAG)  { ret LSP_ENUM; }
+    if (kind == decl.DECL_KIND_DEF)  { ret LSP_TYPE_PARAM; }
+    if (kind == decl.DECL_KIND_VAL)  { ret LSP_CONSTANT; }
+    ret LSP_VARIABLE;
+}
+
+fun empty_span() token.Span {
+    var s: token.Span;
+    s.offset = 0;
+    s.len    = 0;
+    ret s;
+}
