@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its function kind instead of claiming its target is unknown.
 
 ### Changed
+- ci: the workflow follows the family CI contract (briar-systems/mach#3447). It
+  runs on pull requests and dispatch only, calls the shared `mach-lib.yml`
+  pipeline with windows as a second light leg (#157), runs the protocol suite
+  per host from `.github/ci/verify.sh` against the verified seed compiler, and
+  ends in a `gate` job. The release workflow calls it with `heavy: all`.
+- build: the mach pin advances to v5.2.0 and std to v3.2.0, the family seed.
+  The server builds and passes its suites against std 3.2.0 unchanged.
 - refactor(render): the LSP SymbolKind table for a declaration kind now has one
   spelling, `render.symbol_kind`, which is that module's stated purpose.
   documentSymbol and the call hierarchy both name declarations and each had its
