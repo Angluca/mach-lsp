@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one measures ~7s. A root with no snapshot has nothing to serve, so its first
   build still runs inline, and a failed rebuild leaves the previous snapshot
   serving rather than dropping it.
+- project: a document's project root is resolved from the normalized path, the
+  same spelling documents themselves carry. `project_root_for` keeps whatever
+  spelling it is handed, so deriving the root from the raw URI path gave the
+  same directory two names on windows - `C:/x/alpha` against `C:\x\alpha` -
+  and every comparison between a root and a document's own root silently said
+  no. That decides whether a buffer is mirrored into a root at all, so a root's
+  first build captured no open buffer and its snapshot revision never left zero.
 - project: snapshot staleness is tested per document rather than per root. A
   root-wide test called the root stale whenever any covered buffer had moved,
   including when the move was a rebuild that FAILED - the attempt is recorded,

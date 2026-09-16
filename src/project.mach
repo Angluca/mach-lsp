@@ -2190,8 +2190,18 @@ pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
 # the project root governing `uri` - the nearest ancestor of its
 # decoded filesystem path holding a `mach.toml` - as an owned string, or nil
 # for a non-file URI or a document outside any project
+# the project root governing `uri`, in the SAME spelling a document path uses
+#
+# `project_root_for` keeps whatever spelling it is handed, so feeding it the raw
+# URI path while documents carry the normalized one gives the same directory two
+# names - `C:/x/alpha` against `C:\x\alpha` on windows - and every later
+# `str_equals` between a root and a document's own root silently says no. That
+# is what decides whether a buffer is mirrored into a root at all, so on windows
+# a root's first build captured no open buffer and its snapshot revision never
+# left zero. One canonical spelling, produced here, is what keeps those
+# comparisons meaning what they read as.
 fun document_root(w: *Workspace, uri: str) str {
-    val path: str = uri_to_path(w.alloc, uri);
+    val path: str = uri_to_norm(w.alloc, uri);
     if (path == nil) { ret nil; }
     val root: str = project_root_for(w.alloc, path);
     strutil.str_free(w.alloc, path);
