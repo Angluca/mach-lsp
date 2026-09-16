@@ -32,6 +32,12 @@
 #     same `detail`. Navigating it lands on the call, which is the only site that
 #     exists; drilling further finds nothing, which is the true answer.
 #
+# What the callee is and where it is declared are decided separately. A buffer
+# analyzed outside a project resolves an imported name to a symbol whose module
+# was never loaded: the kind is known, the site is not, so the item keeps the
+# function kind and falls back to the call-site anchor rather than claiming the
+# target is unknown.
+#
 # Incoming calls are the mirror and are deliberately narrower: they report call
 # sites whose callee resolves to this exact declaration. A call made through a
 # `fun` value that happens to hold this function is not attributed to it, because
@@ -197,8 +203,22 @@ pub fun incoming(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allo
     json.buf_push_byte(?b, '[');
 
     var groups: usize = 0;
-    val mc:     u32   = project.module_count(an.root);
-    var mid:    u32   = 0;
+
+    # a buffer outside any project has no module array to walk, and its own
+    # callers are the only ones that exist; the single-buffer shape `build_refs`
+    # falls back to, rather than an empty answer
+    if (an.root == nil) {
+        var own: project.ModuleView;
+        own.a       = an.a;
+        own.rr      = an.rr;
+        own.sr      = an.sr;
+        own.text    = an.text;
+        own.file_id = an.own_fid;
+        emit_module_incoming(?b, alloc, ?own, item_uri, ?t, ?groups);
+    }
+
+    val mc:  u32 = project.module_count(an.root);
+    var mid: u32 = 0;
     for (mid < mc) {
         val cur:  sess.ModuleId           = mid::sess.ModuleId;
         val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
@@ -537,6 +557,14 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     if (sel so.none) { ret true; }
     val sym: *rslv.Symbol = so.some;
 
+    # what the callee is, decided before where it lives: a buffer analyzed
+    # outside a project resolves an imported name to a symbol whose declaring
+    # module was never loaded, and reporting that as a target that is not
+    # statically known would be a false claim about an ordinary call
+    out.indirect = features.definition_kind_of(sym) != rslv.SYM_FUN;
+    out.kind     = LSP_VARIABLE;
+    if (!out.indirect) { out.kind = LSP_FUNCTION; }
+
     val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
     if (sel site_o.none) { ret true; }
     var site: project.Site = site_o.some;
@@ -552,9 +580,6 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     out.text      = site.text;
     out.name_span = nso.some;
     out.decl_span = nso.some;
-    out.indirect  = features.definition_kind_of(sym) != rslv.SYM_FUN;
-    out.kind      = LSP_VARIABLE;
-    if (!out.indirect) { out.kind = LSP_FUNCTION; }
 
     # a parameter or generic binding has no declaration node of its own, so its
     # binding name is the whole item; everything else has a declaration to span

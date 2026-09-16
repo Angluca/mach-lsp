@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never opened. A call through a `fun` value is reported rather than omitted,
   as SymbolKind.Variable carrying a `detail` that says the target is not
   statically known; a callee that resolves to no symbol at all is anchored on
-  the call site itself.
+  the call site itself. A buffer belonging to no project reports its own
+  callers rather than none, and what a callee is is decided separately from
+  where it is declared, so a call whose declaring module was never loaded keeps
+  its function kind instead of claiming its target is unknown.
 
 ### Fixed
 - a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,

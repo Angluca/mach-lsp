@@ -978,6 +978,15 @@ pub fun make() Color { ret Color.red{}; }
 pub fun helper(n: i32) i32 { ret n + 1; }
 """
 
+LONE_BUFFER = """pub fun leaf(n: i32) i32 {
+    ret n + 1;
+}
+
+pub fun trunk(n: i32) i32 {
+    ret leaf(n) + leaf(n + 1);
+}
+"""
+
 NAV_OTHER = """use nav.defs.helper;
 
 pub fun elsewhere(n: i32) i32 {
@@ -1212,6 +1221,55 @@ def run_call_hierarchy(server: Path, timeout: float) -> None:
                     "an unresolvable item did not answer empty")
             require(calls(bogus, "outgoing") == [],
                     "an unresolvable item did not answer empty")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+    run_call_hierarchy_standalone(server, timeout)
+
+
+def run_call_hierarchy_standalone(server: Path, timeout: float) -> None:
+    """A buffer belonging to no project still has callers: its own.
+
+    There is no module array to walk here, and answering nothing would be the
+    easy reading of "no project". The buffer is the whole world, so it is the
+    whole walk - the same fallback `build_refs` makes for references.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-callhier-lone-") as directory:
+        root = Path(directory).resolve()
+        lone = root / "lone.mach"
+        lone.write_text(LONE_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": lone.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": LONE_BUFFER}},
+            )
+            session.diagnostics(lone.as_uri(), 1)
+
+            item = session.request(
+                "textDocument/prepareCallHierarchy",
+                {"textDocument": {"uri": lone.as_uri()},
+                 "position": nav_position(LONE_BUFFER, "pub fun leaf(n: i32) i32 {", "leaf")},
+            )["result"]
+            require(isinstance(item, list) and len(item) == 1,
+                    f"prepare failed on a project-less buffer: {item!r}")
+
+            incoming = session.request(
+                "callHierarchy/incomingCalls", {"item": item[0]},
+            )["result"]
+            require(len(incoming) == 1 and incoming[0]["from"]["name"] == "trunk",
+                    f"a project-less buffer reported no callers: {incoming!r}")
+            require(incoming[0]["fromRanges"]
+                    == nav_ranges(LONE_BUFFER, "ret leaf(n) + leaf(n + 1);", "leaf"),
+                    f"the caller's ranges are wrong: {incoming[0]!r}")
 
             session.finish()
             finished = True
