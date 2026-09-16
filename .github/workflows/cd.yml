@@ -28,10 +28,13 @@ jobs:
             exit 1
           fi
 
+  # a tag push has no base branch, so the release asks for every tier
   ci:
     name: CI
     needs: verify
     uses: ./.github/workflows/ci.yml
+    with:
+      heavy: all
 
   release:
     name: publish release
