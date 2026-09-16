@@ -77,7 +77,16 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         own     = v.file_id;
     }
     or {
-        var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, editor.PHASE_SEMA);
+        # Fidelity is chosen by who the AUTHORITY is, not by what is available.
+        # With no project, this analysis IS the answer, so it runs to sema. With
+        # a loaded project it is an interim answer that a rebuild is already on
+        # its way to replace, and running to sema would drag the whole import
+        # closure through the analysis thread - the very cost moving the rebuild
+        # off it was meant to remove. Parse is what the buffer can say about
+        # itself instantly; the post-swap republish carries the rest.
+        var phase: editor.AnalysisPhase = editor.PHASE_SEMA;
+        if (project.root_for_loaded(w, d.uri) != nil) { phase = editor.PHASE_PARSE; }
+        var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, phase);
         val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
         if (sel ar.err) {
             var f: outcome.Fail = ar.err;
