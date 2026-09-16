@@ -1217,8 +1217,8 @@ def run_stale_strict_requests(server: Path, timeout: float) -> None:
     """A rename or reference list waits for the snapshot that covers its edit.
 
     Answered from the stale snapshot, a rename would miss an occurrence the
-    client just typed. Held, it is answered once the rebuild lands, can be
-    withdrawn while it waits, and is abandoned when its document closes.
+    client just typed. Held, it is answered once the rebuild lands; withdrawing
+    or closing while held is `run_stale_held_release`.
     """
     with tempfile.TemporaryDirectory(prefix="mls-stale-strict-") as directory:
         root = Path(directory).resolve()
@@ -1247,43 +1247,94 @@ def run_stale_strict_requests(server: Path, timeout: float) -> None:
                     f"the rename missed the occurrence typed with it: {lines!r}")
             builds.settle(1, "the rename's rebuild")
 
-            # withdrawn while held: answered at once, not when the rebuild lands
-            request_id = session.next_id
-            session.next_id += 1
-            before = rebuilt(builds)
-            session.send_all([
-                change(uri, 3, edited + "# edit three\n"),
-                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/references",
-                 "params": {**at(uri, ret_line + 1, column + 2), "context": {"includeDeclaration": True}}},
-            ])
-            eventually(holds, lambda n: n == 2, "the references request to be held")
-            session.notify("$/cancelRequest", {"id": request_id})
-            cancelled = session.wait_for(lambda item: item.get("id") == request_id, "cancelled request")
-            require(cancelled.get("error", {}).get("code") == -32800,
-                    f"a withdrawn held request was not cancelled: {cancelled!r}")
-            require(rebuilt(builds) == before,
-                    "the cancellation was only answered after the rebuild landed")
-            builds.settle(2, "the cancelled request's rebuild")
-
-            # abandoned when its document closes
-            request_id = session.next_id
-            session.next_id += 1
-            session.send_all([
-                change(uri, 4, edited + "# edit four\n"),
-                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/prepareRename",
-                 "params": at(uri, ret_line + 1, column + 2)},
-            ])
-            eventually(holds, lambda n: n == 3, "the prepareRename request to be held")
-            session.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
-            closed = session.wait_for(lambda item: item.get("id") == request_id, "abandoned request")
-            require(closed.get("error", {}).get("code") == -32801,
-                    f"a held request outlived its document: {closed!r}")
-
             session.finish()
             finished = True
         finally:
             if not finished:
                 session.abort()
+
+
+def held_behind_busy_root(server: Path, timeout: float, prefix: str,
+                          release: Callable[[LspSession, str, int], None],
+                          check: Callable[[dict[str, Any]], None]) -> None:
+    """Hold a request for as long as the build slot is taken, then act on it.
+
+    How long a rebuild takes belongs to the machine, so a request held only by
+    its own root's rebuild can be answered before anything is done to it. Here
+    the slot is first given to a much larger root's cold rebuild, and the held
+    root cannot even start its own until that one finishes.
+    """
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        root = Path(directory).resolve()
+        held, held_text = write_wide_project(root, "heldroot", 64)
+        busy, busy_text = write_wide_project(root, "busyroot", 768)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            for doc, text in ((busy, busy_text), (held, held_text)):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": doc.as_uri(), "languageId": "mach", "version": 1, "text": text}},
+                )
+                session.diagnostics(doc.as_uri(), 1)
+
+            def rebuilds(name: str) -> int:
+                return sum(1 for line in builds.text().splitlines()
+                           if "project: rebuilt" in line and name in line)
+
+            loaded = rebuilds("busyroot")
+            session.send_all([change(busy.as_uri(), 2, busy_text + "# takes the build slot\n")])
+            session.diagnostics(busy.as_uri(), 2)
+            eventually(builds.scheduled, lambda n: n >= 1, "the busy root's rebuild to start")
+
+            lines = held_text.splitlines()
+            ret_line = next(i for i, value in enumerate(lines) if value.startswith("    ret "))
+            request_id = session.next_id
+            session.next_id += 1
+            before = builds.text().count("holding a request")
+            session.send_all([
+                change(held.as_uri(), 2, held_text + "# held behind the busy root\n"),
+                {"jsonrpc": "2.0", "id": request_id, "method": "textDocument/references",
+                 "params": {**at(held.as_uri(), ret_line, lines[ret_line].index("base1") + 2),
+                            "context": {"includeDeclaration": True}}},
+            ])
+            eventually(lambda: builds.text().count("holding a request"), lambda n: n > before,
+                       "the request to be held")
+            release(session, held.as_uri(), request_id)
+            answer = session.wait_for(lambda item: item.get("id") == request_id, "the held request's answer")
+            # answered while the busy root still holds the slot: nothing but the
+            # release itself can have produced the answer
+            require(rebuilds("busyroot") == loaded,
+                    "the answer only came once the build slot freed up")
+            check(answer)
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def cancel_request(session: LspSession, uri: str, request_id: int) -> None:
+    session.notify("$/cancelRequest", {"id": request_id})
+
+
+def close_document(session: LspSession, uri: str, request_id: int) -> None:
+    session.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+
+def run_stale_held_release(server: Path, timeout: float) -> None:
+    """A held request is answered at once when withdrawn or when its document closes."""
+    held_behind_busy_root(
+        server, timeout, "mls-held-cancel-", cancel_request,
+        lambda answer: require(answer.get("error", {}).get("code") == -32800,
+                               f"a withdrawn held request was not cancelled: {answer!r}"))
+    held_behind_busy_root(
+        server, timeout, "mls-held-close-", close_document,
+        lambda answer: require(answer.get("error", {}).get("code") == -32801,
+                               f"a held request outlived its document: {answer!r}"))
 
 
 def run_stale_refresh(server: Path, timeout: float) -> None:
@@ -4336,6 +4387,7 @@ def main() -> int:
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)
+        run_stale_held_release(server, args.timeout)
         run_stale_refresh(server, args.timeout)
         run_stale_diagnostics(server, args.timeout)
         run_disk_change_during_build(server, args.timeout)
