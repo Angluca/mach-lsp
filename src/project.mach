@@ -1749,13 +1749,17 @@ pub fun free_site(w: *Workspace, site: *Site) {
 # a borrowed view of one loaded module for the workspace-wide
 # use-site walk - its parsed Ast, resolve side tables, and backing source file
 # ---
-# a:    the module's parsed Ast (decl / expr / type ids index into it)
-# rr:   the module's ResolveResult side tables
-# text: the SourceFile backing `a`, paired with its length (positions, span text)
+# a:       the module's parsed Ast (decl / expr / type ids index into it)
+# rr:      the module's ResolveResult side tables
+# sr:      the module's SemaResult, or nil when its sema did not run
+# text:    the SourceFile backing `a`, paired with its length (positions, span text)
+# file_id: FileId of that source file, the identity a nominal type names
 pub rec ModuleView {
-    a:    *ast.Ast;
-    rr:   *rslv.ResolveResult;
-    text: positions.Text;
+    a:       *ast.Ast;
+    rr:      *rslv.ResolveResult;
+    sr:      *sema.SemaResult;
+    text:    positions.Text;
+    file_id: src.FileId;
 }
 
 # compiler-owned snapshot of one open document.
@@ -1863,22 +1867,12 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
     val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
     if (sel fo.none) { ret opt[ModuleView].none{}; }
     var v: ModuleView;
-    v.a    = m.a;
-    v.rr   = m.resolve_result;
-    v.text = positions.text_of(fo.some);
+    v.a       = m.a;
+    v.rr      = m.resolve_result;
+    v.sr      = m.sema_result;
+    v.text    = positions.text_of(fo.some);
+    v.file_id = m.file_id;
     ret opt[ModuleView].some{v};
-}
-
-# loaded module `mid`'s compiler-owned SemaResult
-# ---
-# w:    the workspace
-# root: the root governing the request, or nil
-# mid:  a loaded module id in [0, module_count)
-# ret:  some(*SemaResult), or none
-pub fun module_sema(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[*sema.SemaResult] {
-    val m: *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil || m.sema_result == nil) { ret opt[*sema.SemaResult].none{}; }
-    ret opt[*sema.SemaResult].some{m.sema_result};
 }
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
@@ -1902,6 +1896,17 @@ pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
 # ret: the declaration's TypeId, or TYPE_NIL
 pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
     ret mtypes.decl_type_of(sr, did);
+}
+
+# the semantic type a written Ast type node denotes, or TYPE_NIL when
+# unavailable. the type-position twin of `type_of`, for a cursor sitting on a
+# type annotation rather than on a value
+# ---
+# sr:  a buffer's / module's SemaResult, or nil
+# tid: the Ast type id to resolve
+# ret: the written type's TypeId, or TYPE_NIL
+pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
+    ret mtypes.type_ref_of(sr, tid);
 }
 
 # the nominal back-link from a record / union TypeId to its declaring
@@ -2013,6 +2018,93 @@ pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.Modul
     if (sel ir.err) { ret opt[RecordSite].none{}; }
     rs.name = ir.ok;
     ret opt[RecordSite].some{rs};
+}
+
+# the declaring site of a nominal type, whatever kind declares it
+# ---
+# origin:    ModuleId of the declaring module
+# decl:      DeclId of the rec / uni / tag declaration in `origin`'s Ast
+# file:      FileId of the declaring source file
+# name_span: byte span of the declared type name in `text`
+# a:         the declaring module's parsed Ast
+# text:      SourceFile backing `a`, paired with its length
+# kind:      the declaration kind that named the type
+pub rec TypeSite {
+    origin:    sess.ModuleId;
+    decl:      id.DeclId;
+    file:      src.FileId;
+    name_span: token.Span;
+    a:         *ast.Ast;
+    text:      positions.Text;
+    kind:      adecl.DeclKind;
+}
+
+# the declaring site of a nominal TypeId, whatever its declaration
+# kind - the back-link `textDocument/typeDefinition` follows from a value to the
+# declaration that names its type
+#
+# `RecordSite` answers the narrower question a field feature asks (where are this
+# type's fields), so it admits rec / uni only. A type reference carries no such
+# restriction, and a `tag` is the type of every `opt` and `res` a cursor can land
+# on, so reusing RecordSite here would answer null for the most common types in
+# the language. A pointer is peeled and a generic instance maps to its template,
+# both through `nominal_of`.
+#
+# A type declared in the active buffer is interned under the buffer's synthetic
+# module id, which is not in the loaded module array, so the buffer's live Ast is
+# consulted first - the same split `record_decl_in` makes.
+# ---
+# w:        the workspace
+# root:     the root the type was resolved under, or nil
+# own:      the buffer's own module id
+# own_fid:  the buffer's own FileId
+# own_a:    the buffer's live Ast
+# own_file: the buffer's SourceFile
+# tid:      a TypeId, typically read from a SemaResult
+# ret:      some(TypeSite), or none for a type with no nominal declaration
+pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_file: *src.SourceFile, tid: type.TypeId) opt[TypeSite] {
+    val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (sel no.none) { ret opt[TypeSite].none{}; }
+    val n: mtypes.Nominal = no.some;
+
+    if (own_file != nil && n.file == own_fid) {
+        val own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, positions.text_of(own_file), interner(w, root), n);
+        if (sel own_decl.none) { ret opt[TypeSite].none{}; }
+        ret type_site_from(own, own_decl.some, own_fid, own_a, own_file);
+    }
+
+    val mid: opt[sess.ModuleId] = module_for_file(root, n.file);
+    if (sel mid.none) { ret opt[TypeSite].none{}; }
+    val m: *driver.ModuleEntry = module_entry(root, mid.some);
+    if (m == nil) { ret opt[TypeSite].none{}; }
+    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
+    if (sel fo.none) { ret opt[TypeSite].none{}; }
+    val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
+    if (sel decl.none) { ret opt[TypeSite].none{}; }
+    ret type_site_from(mid.some, decl.some, m.file_id, m.a, fo.some);
+}
+
+# build a TypeSite for the decl `decl` in `a` (backed by `file`), or
+# none when the decl is absent or declares no type name. the one place a new
+# type-declaring kind is admitted
+fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, file: *src.SourceFile) opt[TypeSite] {
+    val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
+    if (sel d_opt.none) { ret opt[TypeSite].none{}; }
+    val d: *adecl.Decl = d_opt.some;
+
+    var ts: TypeSite;
+    if (d.kind == adecl.DECL_KIND_REC) { ts.name_span = d.data.rec_.name; }
+    or (d.kind == adecl.DECL_KIND_UNI) { ts.name_span = d.data.uni_.name; }
+    or (d.kind == adecl.DECL_KIND_TAG) { ts.name_span = d.data.tag_.name; }
+    or                                 { ret opt[TypeSite].none{}; }
+
+    ts.origin = origin;
+    ts.decl   = decl;
+    ts.file   = fid;
+    ts.a      = a;
+    ts.text   = positions.text_of(file);
+    ts.kind   = d.kind;
+    ret opt[TypeSite].some{ts};
 }
 
 # the nominal back-link of `tid` against the session type interner,

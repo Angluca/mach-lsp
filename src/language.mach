@@ -838,6 +838,120 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     project.free_site(ws, ?site);
 }
 
+# answer textDocument/typeDefinition with the declaring site of the *type* of the
+# thing under the cursor
+#
+# Go-to-definition answers where a name was declared; this answers where its type
+# was declared. The pivot is `type_site_at`, which maps the cursor to the rec /
+# uni / tag that names its type.
+#
+# A type with no nominal declaration - a primitive, an array, a function type -
+# answers null, the protocol's "nothing to go to". So does a document outside any
+# project: the nominal back-link is a read against the session's type interner,
+# which only a loaded root owns, and the single-buffer editor session has none.
+pub fun type_definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, req: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an:    analysis.Analyzed;
+    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (sel off_o.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+
+    val so: opt[project.TypeSite] = type_site_at(ws, ?an, off_o.some);
+    if (sel so.none) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+    val ts: project.TypeSite = so.some;
+
+    var furi:  str  = uri;
+    var owned: bool = false;
+    if (ts.origin != an.own) {
+        furi = project.module_uri(ws, an.root, ts.origin);
+        if (furi == nil) {
+            render.reply_null(alloc, id_raw);
+            ret;
+        }
+        owned = true;
+    }
+
+    reply_location(alloc, id_raw, ts.text.file, furi, ts.name_span);
+    if (owned) { json.free_str(furi, ws.alloc); }
+}
+
+# the declaring site of the type the cursor names, or none
+#
+# Four candidates are tried in order, and the first one that resolves to a
+# declaration wins. Resolving - not merely typing - is the test, because the
+# tightest node often has a type that names no declaration: the callee of a call
+# has a function type, so committing to it would answer null on the cursor
+# position users reach for most.
+#
+#   1. the tightest expression - a value, a member access, a call result;
+#   2. the call whose callee that expression is, so a cursor on `make` in
+#      `make()` reaches the return type rather than the function type;
+#   3. a written type, which is neither expression nor declaration: `Box` in
+#      `var b: Box[i32];`, a field's declared type, a return type;
+#   4. the binding under the cursor: a function parameter's written type, which
+#      is not a decl of its own, else the enclosing declaration's type.
+# ---
+# ws:     the workspace
+# an:     the analyzed request document
+# offset: cursor byte offset into the buffer
+# ret:    some(TypeSite), or none
+fun type_site_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) opt[project.TypeSite] {
+    if (an.sr == nil) { ret opt[project.TypeSite].none{}; }
+
+    val eid: id.ExprId = ast.offset_to_expr(an.a, offset);
+    if (eid != id.EXPR_NIL) {
+        val so: opt[project.TypeSite] = site_of_type(ws, an, project.type_of(an.sr, eid));
+        if (sel so.some) { ret so; }
+
+        val call: id.ExprId = enclosing_call(an.a, eid);
+        if (call != id.EXPR_NIL) {
+            val co: opt[project.TypeSite] = site_of_type(ws, an, project.type_of(an.sr, call));
+            if (sel co.some) { ret co; }
+        }
+    }
+
+    val atid: id.TypeId = ast.offset_to_type(an.a, offset);
+    if (atid != id.TYPE_NIL) {
+        val to: opt[project.TypeSite] = site_of_type(ws, an, project.type_ref_of(an.sr, atid));
+        if (sel to.some) { ret to; }
+    }
+
+    val did: id.DeclId = ast.offset_to_decl(an.a, offset);
+    if (did == id.DECL_NIL) { ret opt[project.TypeSite].none{}; }
+
+    val ptid: id.TypeId = features.param_type_at(an.a, did, offset);
+    if (ptid != id.TYPE_NIL) { ret site_of_type(ws, an, project.type_ref_of(an.sr, ptid)); }
+    ret site_of_type(ws, an, project.decl_type_of(an.sr, did));
+}
+
+# the declaring site of `tid` against the request's buffer and project
+fun site_of_type(ws: *project.Workspace, an: *analysis.Analyzed, tid: type.TypeId) opt[project.TypeSite] {
+    if (tid == type.TYPE_NIL) { ret opt[project.TypeSite].none{}; }
+    ret project.type_site_in(ws, an.root, an.own, an.own_fid, an.a, an.text.file, tid);
+}
+
+# the call expression `eid` is the callee of, or EXPR_NIL. a call
+# records its callee, never the reverse, so the only way back up is a scan
+fun enclosing_call(a: *ast.Ast, eid: id.ExprId) id.ExprId {
+    var i: usize = 0;
+    for (i < a.expr_len) {
+        val eo: opt[*aexpr.Expr] = ast.get_expr(a, i::id.ExprId);
+        if (sel eo.some) {
+            val e: *aexpr.Expr = eo.some;
+            if (e.kind == aexpr.EXPR_KIND_CALL && e.data.call.callee == eid) { ret i::id.ExprId; }
+        }
+        i = i + 1;
+    }
+    ret id.EXPR_NIL;
+}
+
 # `module <fqn>` as a fenced hover body
 fun module_hover_markdown(fqn: str, alloc: *Allocator) str {
     var b: json.Buf = json.buf_init(alloc);
@@ -1141,12 +1255,11 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
     for (mid < mc && n < cap) {
         val cur:  sess.ModuleId           = mid::sess.ModuleId;
         val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
-        val ms_o: opt[*sema.SemaResult]   = project.module_sema(ws, an.root, cur);
         if (sel mv_o.none) {
             mid = mid + 1;
             cnt;
         }
-        if (sel ms_o.none) {
+        if (mv_o.some.sr == nil) {
             mid = mid + 1;
             cnt;
         }
@@ -1159,7 +1272,7 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
         }
         val mv: project.ModuleView = mv_o.some;
         out[n].a         = mv.a;
-        out[n].sr        = ms_o.some;
+        out[n].sr        = mv.sr;
         out[n].file      = mv.text.file;
         out[n].uri       = muri;
         out[n].declaring = cur == t.key.origin;
@@ -2262,7 +2375,7 @@ fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: 
     json.buf_push_quoted(b, name);
     json.free_str(name, alloc);
     json.buf_push(b, ",\"kind\":");
-    json.buf_push_i64(b, decl_lsp_kind(d.kind));
+    json.buf_push_i64(b, render.symbol_kind(d.kind));
     json.buf_push(b, ",\"range\":");
     render.span_range(b, an.text.file, d.span);
     json.buf_push(b, ",\"selectionRange\":");
@@ -2385,17 +2498,6 @@ val LSP_SYMBOL_ENUM_MEMBER:    i64 = 22;
 val LSP_SYMBOL_FIELD:          i64 = 8;
 val LSP_SYMBOL_VARIABLE:       i64 = 13;
 val LSP_SYMBOL_TYPE_PARAMETER: i64 = 26;
-
-# the LSP SymbolKind for a decl kind (documentSymbol)
-fun decl_lsp_kind(kind: decl.DeclKind) i64 {
-    if (kind == decl.DECL_KIND_FUN) { ret 12; }
-    if (kind == decl.DECL_KIND_REC) { ret 23; }
-    if (kind == decl.DECL_KIND_UNI) { ret 10; }
-    if (kind == decl.DECL_KIND_DEF) { ret 26; }
-    if (kind == decl.DECL_KIND_VAL) { ret 14; }
-    if (kind == decl.DECL_KIND_VAR) { ret 13; }
-    ret 13;
-}
 
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of

@@ -101,6 +101,50 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     ret true;
 }
 
+# resolve `uri` to its current analysis whether or not the document is open
+#
+# Every positional request names a buffer the editor has open, so `analyze` is
+# written against the document store. A call-hierarchy item is not positional: it
+# names a declaration the server itself reported, and that declaration usually
+# lives in a module the editor has never opened. Resolving such an item through
+# the store would stop the hierarchy at the first unopened file - which is the
+# common case one step out from the cursor.
+#
+# An open document still wins, because its buffer carries unsaved edits that the
+# project's module snapshot does not. A uri outside any loaded root has no
+# analysis here; there is no standalone fallback, because an item is only ever
+# minted from a project in the first place.
+# ---
+# ws:   the workspace
+# es:   the standalone editor session
+# docs: the open-document registry
+# uri:  the document to analyze
+# out:  receives the analysis on success
+# ret:  true when the document could be analyzed
+pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
+    if (uri == nil)                       { ret false; }
+    if (documents.find(docs, uri) != nil) { ret analyze(ws, es, docs, uri, out); }
+
+    val root: *project.Root = project.root_for_loaded(ws, uri);
+    if (root == nil) { ret false; }
+    val mo: opt[sess.ModuleId] = project.module_for_uri(ws, root, uri);
+    if (sel mo.none) { ret false; }
+    val mid:  sess.ModuleId           = mo.some;
+    val mv_o: opt[project.ModuleView] = project.module_view(ws, root, mid);
+    if (sel mv_o.none) { ret false; }
+    val mv: project.ModuleView = mv_o.some;
+
+    out.interner = project.interner(ws, root);
+    out.text     = mv.text;
+    out.sr       = mv.sr;
+    out.a        = mv.a;
+    out.rr       = mv.rr;
+    out.own      = mid;
+    out.own_fid  = mv.file_id;
+    out.root     = root;
+    ret true;
+}
+
 # run the standalone frontend on one open buffer up to `phase`
 #
 # The envelope `editor.analyze` returns owns copies of the diagnostics and

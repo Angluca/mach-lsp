@@ -78,6 +78,21 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
     ret sr.decl_type[did];
 }
 
+# the semantic type an Ast type node denotes, or TYPE_NIL when `sr`
+# is nil or `tid` is out of range. the type-position twin of `type_of`: a cursor
+# on a written type (`var b: Box[i32];`, a field's declared type, a return type)
+# is neither an expression nor a declaration, and this is the only table that
+# carries what it resolved to
+# ---
+# sr:  the module's / buffer's SemaResult, or nil
+# tid: the Ast type id to resolve
+# ret: the written type's TypeId, or TYPE_NIL when unavailable
+pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
+    if (sr == nil || sr.type_resolved_ty == nil) { ret type.TYPE_NIL; }
+    if (tid::u32 >= sr.type_count)               { ret type.TYPE_NIL; }
+    ret sr.type_resolved_ty[tid];
+}
+
 # the declaration site a record / union TypeId nominally refers to,
 # or none when `tid` is not a nominal type (a primitive, pointer, array, function,
 # generic parameter, or a sentinel). a pointer to a record is peeled to the record
@@ -155,7 +170,7 @@ pub fun nominal_decl(a: *ast.Ast, text: positions.Text, itn: *intern.Interner, n
 # parallel-array lengths, every slot prefilled to TYPE_NIL. the test helper that
 # stands in for sema's own allocation so the pure accessors can be exercised
 # without running a whole analysis. released with `free_sema_result`
-fun make_sema_result(pa: *Allocator, expr_n: u32, decl_n: u32) sema.SemaResult {
+fun make_sema_result(pa: *Allocator, expr_n: u32, type_n: u32, decl_n: u32) sema.SemaResult {
     var sr: sema.SemaResult;
     sr.alloc            = pa;
     sr.expr_type        = nil;
@@ -173,6 +188,18 @@ fun make_sema_result(pa: *Allocator, expr_n: u32, decl_n: u32) sema.SemaResult {
             for (i < expr_n) {
                 sr.expr_type[i] = type.TYPE_NIL;
                 i               = i + 1;
+            }
+        }
+    }
+    if (type_n > 0) {
+        val r: res[*type.TypeId, allocator.Error] = allocate[type.TypeId](pa, type_n::usize);
+        if (sel r.ok) {
+            sr.type_resolved_ty = r.ok;
+            sr.type_count       = type_n;
+            var i: u32 = 0;
+            for (i < type_n) {
+                sr.type_resolved_ty[i] = type.TYPE_NIL;
+                i                      = i + 1;
             }
         }
     }
@@ -196,6 +223,9 @@ fun free_sema_result(pa: *Allocator, sr: *sema.SemaResult) {
     if (sr.expr_type != nil && sr.expr_count > 0) {
         deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);
     }
+    if (sr.type_resolved_ty != nil && sr.type_count > 0) {
+        deallocate[type.TypeId](pa, sr.type_resolved_ty, sr.type_count::usize);
+    }
     if (sr.decl_type != nil && sr.decl_count > 0) {
         deallocate[type.TypeId](pa, sr.decl_type, sr.decl_count::usize);
     }
@@ -209,7 +239,7 @@ test "types: type_of returns TYPE_NIL for a nil SemaResult" {
 test "types: type_of returns TYPE_NIL for an out-of-range expr id" {
     var pa: Allocator;
     page.make(?pa);
-    var sr: sema.SemaResult = make_sema_result(?pa, 2, 0);
+    var sr: sema.SemaResult = make_sema_result(?pa, 2, 0, 0);
     if (type_of(?sr, 5) != type.TYPE_NIL) {
         free_sema_result(?pa, ?sr);
         ret 1;
@@ -230,7 +260,7 @@ test "types: type_of reads the stored expression type" {
     }
     val i32t: type.TypeId = i32o.some;
 
-    var sr: sema.SemaResult = make_sema_result(?pa, 3, 0);
+    var sr: sema.SemaResult = make_sema_result(?pa, 3, 0, 0);
     sr.expr_type[1] = i32t;
     var fail: bool = false;
     if (type_of(?sr, 1) != i32t)          { fail = true; }
@@ -254,12 +284,38 @@ test "types: decl_type_of reads the stored declaration type" {
     }
     val u8t: type.TypeId = u8o.some;
 
-    var sr: sema.SemaResult = make_sema_result(?pa, 0, 2);
+    var sr: sema.SemaResult = make_sema_result(?pa, 0, 0, 2);
     sr.decl_type[0] = u8t;
     var fail: bool = false;
     if (decl_type_of(?sr, 0) != u8t)           { fail = true; }
     if (decl_type_of(?sr, 9) != type.TYPE_NIL) { fail = true; }
     if (decl_type_of(nil, 0) != type.TYPE_NIL) { fail = true; }
+
+    free_sema_result(?pa, ?sr);
+    type.dnit(?ti);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "types: type_ref_of reads the resolved type of a written type node" {
+    var pa: Allocator;
+    page.make(?pa);
+    var ti: type.TypeInterner;
+    if (!type_init_ok(?ti, ?pa)) { ret 1; }
+    val u8o: opt[type.TypeId] = type.prim(?ti, type.TYPE_U8);
+    if (sel u8o.none) {
+        type.dnit(?ti);
+        ret 1;
+    }
+    val u8t: type.TypeId = u8o.some;
+
+    var sr: sema.SemaResult = make_sema_result(?pa, 0, 3, 0);
+    sr.type_resolved_ty[2] = u8t;
+    var fail: bool = false;
+    if (type_ref_of(?sr, 2) != u8t)           { fail = true; }
+    if (type_ref_of(?sr, 0) != type.TYPE_NIL) { fail = true; }
+    if (type_ref_of(?sr, 9) != type.TYPE_NIL) { fail = true; }
+    if (type_ref_of(nil, 0) != type.TYPE_NIL) { fail = true; }
 
     free_sema_result(?pa, ?sr);
     type.dnit(?ti);

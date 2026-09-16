@@ -217,6 +217,24 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId
     ret opt[SymbolRef].none{};
 }
 
+# the written type of the function parameter whose binding name holds `offset`
+# in decl `did`, or TYPE_NIL. a parameter carries no Decl node, so neither the
+# decl nor the expr side tables can answer for a cursor on its name
+pub fun param_type_at(a: *ast.Ast, did: id.DeclId, offset: usize) id.TypeId {
+    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel d_opt.none) { ret id.TYPE_NIL; }
+    val d: *decl.Decl = d_opt.some;
+    if (d.kind != decl.DECL_KIND_FUN) { ret id.TYPE_NIL; }
+
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+        if (ast.span_contains(tn.name, offset)) { ret tn.ty; }
+        pi = pi + 1;
+    }
+    ret id.TYPE_NIL;
+}
+
 # generics_start_of / generics_len_of: the generic-name pool slice of a decl
 # that may declare generics (fun / rec / uni), or 0 otherwise
 fun generics_start_of(d: *decl.Decl) u32 {
@@ -313,6 +331,49 @@ pub fun symbol_by_decl(rr: *rslv.ResolveResult, origin: sess.ModuleId, decl: id.
         i = i + 1;
     }
     ret rslv.SYMBOL_NIL;
+}
+
+# the kind a symbol was declared as
+#
+# A `use` binding's own kind is only SYM_IMPORTED; what it was imported as rides
+# `definition_kind`. Every discriminator on "what is this really" has to ask here.
+# ---
+# sym: the symbol
+# ret: the declaring kind
+pub fun definition_kind_of(sym: *rslv.Symbol) rslv.SymKind {
+    if (sym.kind == rslv.SYM_IMPORTED) { ret sym.definition_kind; }
+    ret sym.kind;
+}
+
+# whether symbol `sid` in `rr` names the declaration (`origin`,
+# `decl`) declared as `canon` / `kind`
+#
+# `symbol_by_decl` answers the same question by DeclId alone, which is enough only
+# for a module that can see the declaration. A `use`d symbol carries its referent's
+# origin but no DeclId of its own, so a decl-keyed test reports that no module
+# importing a function calls it - which is every caller outside its own file. The
+# interned canonical name is the identity those bindings do carry, and it is
+# comparable across a project because every module in a root shares one interner.
+#
+# Kind is part of the test because a canonical name is not unique on its own: a
+# record and a function can share one.
+# ---
+# rr:     the module's resolve side tables
+# sid:    the symbol to test
+# origin: ModuleId declaring the target
+# decl:   DeclId of the target in `origin`'s Ast
+# canon:  the target's interned canonical name
+# kind:   the kind the target was declared as
+# ret:    true when `sid` names that declaration
+pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: sess.ModuleId,
+    decl: id.DeclId, canon: intern.StrId, kind: rslv.SymKind) bool {
+    if (sid == rslv.SYMBOL_NIL || sid >= rr.symbol_count) { ret false; }
+    val sym: *rslv.Symbol = ?rr.symbols[sid];
+    if (sym.origin != origin)                                       { ret false; }
+    if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret false; }
+    if (sym.decl != id.DECL_NIL)                                    { ret sym.decl == decl; }
+    if (canon == intern.STR_NIL)                                    { ret false; }
+    ret sym.canon == canon && definition_kind_of(sym) == kind;
 }
 
 # the number of declarations at the buffer's module scope -
@@ -851,7 +912,13 @@ pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) boo
 # the span identifying an expression's referenced name. for
 # an IDENT the whole expr span is the name; for a member access the name is the
 # leaf after the dot. other expressions fall back to their own span
-fun name_span_of_expr(e: *expr.Expr) token.Span {
+# the span of the name an expression writes - the member name for a
+# member access, the whole expression otherwise. what a client should highlight
+# for a reference, and the only name an unresolved expression has
+# ---
+# e:   the expression
+# ret: its name span
+pub fun name_span_of_expr(e: *expr.Expr) token.Span {
     if (e.kind == expr.EXPR_KIND_MEMBER) { ret e.data.member.name; }
     ret e.span;
 }
@@ -2004,4 +2071,69 @@ fun t_owner(file: u32) type.TypeOwner {
     o.module = file;
     o.file   = file::src.FileId;
     ret o;
+}
+
+test "features: symbol_denotes matches a use-imported binding by canonical name" {
+    var syms: [4]rslv.Symbol;
+    # the declaration itself, in the module that declares it
+    syms[0].kind   = rslv.SYM_FUN;
+    syms[0].origin = 3::sess.ModuleId;
+    syms[0].decl   = 7::id.DeclId;
+    syms[0].canon  = 11::intern.StrId;
+    # a `use` binding of it: the referent's origin, no decl of its own
+    syms[1].kind            = rslv.SYM_IMPORTED;
+    syms[1].definition_kind = rslv.SYM_FUN;
+    syms[1].origin          = 3::sess.ModuleId;
+    syms[1].decl            = id.DECL_NIL;
+    syms[1].canon           = 11::intern.StrId;
+    # a record sharing the canonical name, which the kind has to separate
+    syms[2].kind            = rslv.SYM_IMPORTED;
+    syms[2].definition_kind = rslv.SYM_REC;
+    syms[2].origin          = 3::sess.ModuleId;
+    syms[2].decl            = id.DECL_NIL;
+    syms[2].canon           = 11::intern.StrId;
+    # that name imported from a different module
+    syms[3].kind            = rslv.SYM_IMPORTED;
+    syms[3].definition_kind = rslv.SYM_FUN;
+    syms[3].origin          = 4::sess.ModuleId;
+    syms[3].decl            = id.DECL_NIL;
+    syms[3].canon           = 11::intern.StrId;
+
+    var rr: rslv.ResolveResult;
+    rr.symbols      = ?syms[0];
+    rr.symbol_count = 4;
+
+    val org:  sess.ModuleId = 3::sess.ModuleId;
+    val dcl:  id.DeclId     = 7::id.DeclId;
+    val cnon: intern.StrId  = 11::intern.StrId;
+
+    var fail: bool = false;
+    if (!symbol_denotes(?rr, 0, org, dcl, cnon, rslv.SYM_FUN))              { fail = true; }
+    if (!symbol_denotes(?rr, 1, org, dcl, cnon, rslv.SYM_FUN))              { fail = true; }
+    if (symbol_denotes(?rr, 2, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
+    if (symbol_denotes(?rr, 3, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
+    if (symbol_denotes(?rr, rslv.SYMBOL_NIL, org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }
+    if (symbol_denotes(?rr, 9, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
+    if (fail)                                                               { ret 1; }
+    ret 0;
+}
+
+test "features: symbol_denotes rejects a declaration-bearing symbol for another decl" {
+    var syms: [1]rslv.Symbol;
+    syms[0].kind   = rslv.SYM_FUN;
+    syms[0].origin = 2::sess.ModuleId;
+    syms[0].decl   = 5::id.DeclId;
+    syms[0].canon  = 8::intern.StrId;
+
+    var rr: rslv.ResolveResult;
+    rr.symbols      = ?syms[0];
+    rr.symbol_count = 1;
+
+    var fail: bool = false;
+    # the canonical name must not rescue a symbol that carries the wrong decl
+    if (symbol_denotes(?rr, 0, 2::sess.ModuleId, 6::id.DeclId, 8::intern.StrId, rslv.SYM_FUN))  { fail = true; }
+    if (symbol_denotes(?rr, 0, 1::sess.ModuleId, 5::id.DeclId, 8::intern.StrId, rslv.SYM_FUN))  { fail = true; }
+    if (!symbol_denotes(?rr, 0, 2::sess.ModuleId, 5::id.DeclId, 8::intern.StrId, rslv.SYM_FUN)) { fail = true; }
+    if (fail)                                                                                   { ret 1; }
+    ret 0;
 }

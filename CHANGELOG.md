@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(navigation): `textDocument/typeDefinition` goes to the declaring site of
+  an expression's type. `RecordSite` admits `rec` / `uni` only, which is right
+  for the field features but would answer null for a `tag` - the type of every
+  `opt` and `res` in the language - so the nominal back-link generalises to
+  `project.TypeSite`. The cursor tries four candidates and takes the first that
+  resolves to a declaration rather than the first that types, because a callee's
+  own type is a function type and committing to it answers null on `make` in
+  `ret make();`. A cursor on a function parameter's name reads the parameter's
+  written type, since a parameter binds no declaration of its own.
+- feat(navigation): call hierarchy - `textDocument/prepareCallHierarchy`,
+  `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. An item is
+  addressed by `uri` plus `selectionRange.start` and re-derived on every
+  request rather than held in a server-side handle table, so nothing is
+  retained between requests and no lifetime rules are owed. Item resolution
+  reaches the project's module snapshot through the new
+  `analysis.analyze_uri`, because an item's file is usually one the editor
+  never opened. A call through a `fun` value is reported rather than omitted,
+  as SymbolKind.Variable carrying a `detail` that says the target is not
+  statically known; a callee that resolves to no symbol at all is anchored on
+  the call site itself. A buffer belonging to no project reports its own
+  callers rather than none, and what a callee is is decided separately from
+  where it is declared, so a call whose declaring module was never loaded keeps
+  its function kind instead of claiming its target is unknown.
+
+### Changed
+- refactor(render): the LSP SymbolKind table for a declaration kind now has one
+  spelling, `render.symbol_kind`, which is that module's stated purpose.
+  documentSymbol and the call hierarchy both name declarations and each had its
+  own copy; they disagreed about `tag`. As a result a `uni` and a `tag` are both
+  SymbolKind.Enum and a `test` block is SymbolKind.Function. `tag` declarations
+  still never reach the outline, because `features.decl_name_span` has no arm
+  for them - see #249.
+
 ### Fixed
+- a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,
+  so a decl-keyed cross-module identity test reports that no module importing a
+  function calls it. `features.symbol_denotes` adds the interned canonical name
+  and the declaring kind, which those bindings do carry, and the call hierarchy
+  walk uses it. `references` and `rename` still identify by `DeclId` alone and
+  still have the gap; see #246, kept separate because it widens what `rename`
+  rewrites.
 - perf(analysis): a syntax-only request no longer reloads the project through
   the editor session. `editor.analyze` tore the project down on every call, so
   `documentSymbol` against a healthy project paid a full reload: against this
