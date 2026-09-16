@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-16
+
+Navigation, answers while the project rebuilds, off-thread rebuilds, and the
+first release with prebuilt binaries. Built against mach v5.2.1 and std v3.2.0.
+
 ### Added
 - feat(cd): releases publish a prebuilt release-profile `mls` for
   `x86_64-linux`, `aarch64-linux`, `x86_64-windows`, `aarch64-darwin` and
@@ -60,6 +65,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SymbolKind.Enum and a `test` block is SymbolKind.Function. `tag` declarations
   still never reach the outline, because `features.decl_name_span` has no arm
   for them - see #249.
+- project: a root that already has a snapshot rebuilds on a worker thread
+  instead of on the analysis thread. Each root owns two sessions and ping-pongs
+  between them: one serves every request while the other is built into, and the
+  finished snapshot is swapped in at a message boundary, where no request holds
+  a pointer into the outgoing session. The idle session keeps its query cache,
+  which is what keeps a rebuild a fraction of a cold build - building into a
+  fresh session each time measured ~34s against this repo where the retained
+  one measures ~7s. A root with no snapshot has nothing to serve, so its first
+  build still runs inline, and a failed rebuild leaves the previous snapshot
+  serving rather than dropping it.
+- project: a document's project root is resolved from the normalized path, the
+  same spelling documents themselves carry. `project_root_for` keeps whatever
+  spelling it is handed, so deriving the root from the raw URI path gave the
+  same directory two names on windows - `C:/x/alpha` against `C:\x\alpha` -
+  and every comparison between a root and a document's own root silently said
+  no. That decides whether a buffer is mirrored into a root at all, so a root's
+  first build captured no open buffer and its snapshot revision never left zero.
+- project: snapshot staleness is tested per document rather than per root. A
+  root-wide test called the root stale whenever any covered buffer had moved,
+  including when the move was a rebuild that FAILED - the attempt is recorded,
+  the snapshot revision is not - leaving the root permanently stale with nothing
+  left to schedule and every cross-module feature dead until an unrelated edit
+  happened to succeed. Keyed on the document, a failed rebuild leaves every
+  buffer the last good snapshot still describes exactly where it was.
+- diagnostics: the interim publish for a document governed by a loaded project
+  runs to parse, not sema. It is an answer a rebuild is already on its way to
+  replace, and running it to sema dragged the whole import closure through the
+  analysis thread - the exact cost moving the rebuild off it was meant to
+  remove. Where no project governs the document, that analysis is still the
+  authority and still runs to sema.
+- jobs: the analysis thread's queue multiplexes client messages with an
+  internal signal, so a rebuild finishing while the client is idle still
+  reaches the editor instead of waiting for the next keystroke.
+- test: the protocol suite asserts the healthy-project latency of every
+  syntax-only feature, not just the standalone path. The previous assertion
+  broke the manifest before timing `documentSymbol`, so it measured the one
+  path that was never slow and a 40x regression shipped in 0.18.0 unnoticed.
+  The new bound is a ratio between the two paths measured in the same run, so
+  machine load cancels, and the fixture carries a real dependency because a
+  reload costs what its dependencies cost and a dependency-free project cannot
+  show one.
 
 ### Fixed
 - fix(supervisor): the server starts on aarch64-linux (#259). The worker was
@@ -107,55 +153,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repo, a 1586.9ms median versus 34.8ms under a manifest that cannot load. The
   cause was mach#3431, and the pin advances to v5.1.0 to carry the fix, which
   puts the same measurement at 1.00x. std advances to v2.2.0 alongside it.
-
-### Changed
-- project: a root that already has a snapshot rebuilds on a worker thread
-  instead of on the analysis thread. Each root owns two sessions and ping-pongs
-  between them: one serves every request while the other is built into, and the
-  finished snapshot is swapped in at a message boundary, where no request holds
-  a pointer into the outgoing session. The idle session keeps its query cache,
-  which is what keeps a rebuild a fraction of a cold build - building into a
-  fresh session each time measured ~34s against this repo where the retained
-  one measures ~7s. A root with no snapshot has nothing to serve, so its first
-  build still runs inline, and a failed rebuild leaves the previous snapshot
-  serving rather than dropping it.
-- project: a document's project root is resolved from the normalized path, the
-  same spelling documents themselves carry. `project_root_for` keeps whatever
-  spelling it is handed, so deriving the root from the raw URI path gave the
-  same directory two names on windows - `C:/x/alpha` against `C:\x\alpha` -
-  and every comparison between a root and a document's own root silently said
-  no. That decides whether a buffer is mirrored into a root at all, so a root's
-  first build captured no open buffer and its snapshot revision never left zero.
-- project: snapshot staleness is tested per document rather than per root. A
-  root-wide test called the root stale whenever any covered buffer had moved,
-  including when the move was a rebuild that FAILED - the attempt is recorded,
-  the snapshot revision is not - leaving the root permanently stale with nothing
-  left to schedule and every cross-module feature dead until an unrelated edit
-  happened to succeed. Keyed on the document, a failed rebuild leaves every
-  buffer the last good snapshot still describes exactly where it was.
-- diagnostics: the interim publish for a document governed by a loaded project
-  runs to parse, not sema. It is an answer a rebuild is already on its way to
-  replace, and running it to sema dragged the whole import closure through the
-  analysis thread - the exact cost moving the rebuild off it was meant to
-  remove. Where no project governs the document, that analysis is still the
-  authority and still runs to sema.
-- jobs: the analysis thread's queue multiplexes client messages with an
-  internal signal, so a rebuild finishing while the client is idle still
-  reaches the editor instead of waiting for the next keystroke.
-- test: the protocol suite asserts the healthy-project latency of every
-  syntax-only feature, not just the standalone path. The previous assertion
-  broke the manifest before timing `documentSymbol`, so it measured the one
-  path that was never slow and a 40x regression shipped in 0.18.0 unnoticed.
-  The new bound is a ratio between the two paths measured in the same run, so
-  machine load cancels, and the fixture carries a real dependency because a
-  reload costs what its dependencies cost and a dependency-free project cannot
-  show one.
-- build: the mach pin advances to v5.0.4. v5.0.3 is codegen and register
-  allocation work the server only consumes; v5.0.4 removes the filesystem
-  transaction layer, so no `.mach-txn-lock`, `.machtxn.claims/` or
-  `out/.mach-txn` is created under the server's own build, and fixes a path
-  dependency copy that stopped at project boundaries. The editor session's
-  analysis path is byte-identical to v5.0.2.
 
 ## [0.18.0] - 2026-09-13
 
