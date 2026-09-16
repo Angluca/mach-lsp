@@ -1772,19 +1772,27 @@ pub rec DocumentView {
 }
 
 # analyze through the retained project containing `d` and return its exact
-# ModuleEntry. the input/snapshot revision equality is the staleness boundary.
+# ModuleEntry. THIS DOCUMENT's revision against the snapshot is the staleness
+# boundary.
 #
-# A snapshot the rebuild has not caught up to describes EARLIER text, so every
+# A snapshot built before `d`'s current text describes EARLIER text, so every
 # offset in it is measured against a document the client no longer has. Callers
-# answer a stale view by falling back to editor analysis of the live buffer -
-# current positions, no cross-module reach - which is the same degradation they
-# already accept before a root's first build finishes. What changed with the
-# off-thread rebuild is only how often this boundary is crossed, not what is on
-# either side of it.
+# answer that by falling back to editor analysis of the live buffer - current
+# positions, no cross-module reach - the same degradation they already accept
+# before a root's first build finishes.
+#
+# The test is per document, not per root, and that distinction is load-bearing
+# rather than merely tighter. A root-wide test says "stale" whenever ANY covered
+# buffer has moved, including when the move was a rebuild that FAILED: the
+# attempt is recorded, the snapshot revision is not, and the root is then
+# permanently stale with nothing left to schedule - every cross-module feature
+# dead until some unrelated edit happens to succeed. Keyed on the document, a
+# failed rebuild leaves every buffer the last good snapshot still describes
+# exactly where it was, which is what "a failure keeps serving" has to mean.
 pub fun document_view(w: *Workspace, d: *documents.Document) res[DocumentView, str] {
     val root: *Root = root_for(w, d.uri);
     if (root == nil || !root.loaded) { ret res[DocumentView, str].err{"project: document has no compiler project"}; }
-    if (root.input_revision != root.snapshot_revision) {
+    if (d.revision > root.snapshot_revision) {
         ret res[DocumentView, str].err{"project: document snapshot is stale"};
     }
     ret view_from_root(root, d);
@@ -1798,8 +1806,7 @@ pub fun document_view(w: *Workspace, d: *documents.Document) res[DocumentView, s
 # ret: current compiler view, or an error requiring fallback diagnostics
 pub fun document_view_loaded(w: *Workspace, d: *documents.Document) res[DocumentView, str] {
     val root: *Root = root_for_loaded(w, d.uri);
-    if (root == nil || !root.loaded || root.input_revision != root.snapshot_revision
-        || d.revision > root.snapshot_revision) {
+    if (root == nil || !root.loaded || d.revision > root.snapshot_revision) {
         ret res[DocumentView, str].err{"project: no current loaded snapshot"};
     }
     ret view_from_root(root, d);

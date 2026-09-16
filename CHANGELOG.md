@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one measures ~7s. A root with no snapshot has nothing to serve, so its first
   build still runs inline, and a failed rebuild leaves the previous snapshot
   serving rather than dropping it.
+- project: snapshot staleness is tested per document rather than per root. A
+  root-wide test called the root stale whenever any covered buffer had moved,
+  including when the move was a rebuild that FAILED - the attempt is recorded,
+  the snapshot revision is not - leaving the root permanently stale with nothing
+  left to schedule and every cross-module feature dead until an unrelated edit
+  happened to succeed. Keyed on the document, a failed rebuild leaves every
+  buffer the last good snapshot still describes exactly where it was.
 - diagnostics: the interim publish for a document governed by a loaded project
   runs to parse, not sema. It is an answer a rebuild is already on its way to
   replace, and running it to sema dragged the whole import closure through the

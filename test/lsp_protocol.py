@@ -2555,6 +2555,70 @@ def run_hover_presentation(server: Path, timeout: float) -> None:
                 s.abort()
 
 
+def run_failed_rebuild_keeps_serving(server: Path, timeout: float) -> None:
+    """A rebuild that fails must leave the previous snapshot answering.
+
+    The case that matters is a SIBLING buffer moving. The failed attempt is
+    recorded against the root while the snapshot revision is not, so a root-wide
+    staleness test would call the root stale forever with nothing left to
+    schedule - every cross-module feature dead until some unrelated edit
+    happened to succeed. The buffer being asked about never moved, and the last
+    good snapshot still describes it exactly.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-failed-rebuild-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "keep", 13)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            defs_text = defs.read_text(encoding="utf-8")
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": defs_text}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            assert_definition(session, main, defs, text)
+
+            manifest = main.parents[1] / "mach.toml"
+            original = manifest.read_text(encoding="utf-8")
+            manifest.write_text(original + "\n[broken\n", encoding="utf-8")
+            # past the 250 ms fingerprint-scan window, or nothing rescans
+            time.sleep(0.4)
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": defs.as_uri(), "version": 2},
+                 "contentChanges": [{"text": defs_text + "\npub val extra: i32 = 1;\n"}]},
+            )
+            session.diagnostics(defs.as_uri(), 2)
+            warning = session.wait_for(
+                lambda item: (item.get("method") == "window/showMessage"
+                              and isinstance(item.get("params"), dict)
+                              and "failed to load project"
+                              in str(item["params"].get("message", ""))),
+                "failed rebuild warning",
+            )
+            require(warning["params"].get("type") == 2,
+                    f"load failure was not reported as a warning: {warning!r}")
+
+            assert_definition(session, main, defs, text)
+
+            manifest.write_text(original, encoding="utf-8")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -3384,6 +3448,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
+        run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
@@ -3420,6 +3485,7 @@ def main() -> int:
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  a request is answered while a project rebuild is still running")
     print("  a burst of edits during a build coalesces into one follow-up build")
+    print("  a failed rebuild leaves the previous snapshot answering")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  a syntax-only request answers from the buffer without reloading the project")
