@@ -487,31 +487,50 @@ need = []
     return main, dep, main_text, live_dep_text
 
 
-def settle_rebuilds(session: LspSession) -> None:
-    """Wait for any in-flight project rebuild to be swapped in.
+def eventually(
+    probe: Callable[[], Any],
+    want: Callable[[Any], bool],
+    description: str,
+    deadline: float = 20.0,
+) -> Any:
+    """Poll a project-backed probe until the rebuild behind it has landed.
 
-    A rebuild runs off the analysis thread, so the edit that triggered it is
-    answered from the PREVIOUS snapshot and the new one arrives a moment later,
-    announced by the republish that follows the swap. An assertion about
-    post-rebuild state has to wait for that republish; it cannot assume the edit
-    rebuilt inline. Waiting for the diagnostics stream to fall quiet is how a
-    client sees it, so it is how the test sees it too.
+    A rebuild runs off the analysis thread, so the edit that scheduled it is
+    answered from the PREVIOUS snapshot and the new one is swapped in a moment
+    later. How long that moment is belongs to the machine, not the contract, so
+    these are asserted with a deadline rather than a sleep.
+
+    Waiting for the diagnostics stream to fall quiet cannot serve here: a
+    rebuild that is still running IS quiet, so silence reads as settled on any
+    machine slow enough for the question to matter.
     """
-    session.quiet_diagnostics()
+    end = time.monotonic() + deadline
+    last: Any = None
+    while True:
+        last = probe()
+        if want(last):
+            return last
+        if time.monotonic() >= end:
+            raise ProtocolError(f"{description} never settled; last result {last!r}")
+        time.sleep(0.05)
+
+
+def settled_result(session: LspSession, method: str, params: dict[str, Any],
+                   want: Callable[[Any], bool], description: str) -> Any:
+    """Issue `method` until its result settles into `want`."""
+    return eventually(lambda: session.request(method, params).get("result"),
+                      want, description)
 
 
 def assert_definition(session: LspSession, main: Path, definition: Path, text: str) -> None:
     """Check that `answer` resolves into the expected project root."""
     lines = text.splitlines()
     line = next(index for index, value in enumerate(lines) if " + direct + " in value)
-    response = session.request(
-        "textDocument/definition",
-        {
-            "textDocument": {"uri": main.as_uri()},
-            "position": {"line": line, "character": lines[line].index("direct") + 1},
-        },
-    )
-    result = response.get("result")
+    result = settled_result(
+        session, "textDocument/definition",
+        {"textDocument": {"uri": main.as_uri()},
+         "position": {"line": line, "character": lines[line].index("direct") + 1}},
+        lambda r: isinstance(r, dict), "definition of `direct`")
     require(isinstance(result, dict), f"definition is not a Location: {result!r}")
     require(result.get("uri") == definition.as_uri(), f"definition escaped its root: {result!r}")
     assert_range(result.get("range"), "definition.range")
@@ -522,12 +541,11 @@ def definition_after(session: LspSession, path: Path, text: str, prefix: str) ->
     lines = text.splitlines()
     line = next(i for i, value in enumerate(lines) if prefix in value and "use " not in value)
     character = lines[line].index(prefix) + len(prefix) + 1
-    response = session.request(
-        "textDocument/definition",
+    result = settled_result(
+        session, "textDocument/definition",
         {"textDocument": {"uri": path.as_uri()},
          "position": {"line": line, "character": character}},
-    )
-    result = response.get("result")
+        lambda r: isinstance(r, dict), f"definition after {prefix!r}")
     require(isinstance(result, dict), f"definition after {prefix!r} is not a Location: {result!r}")
     return result
 
@@ -536,12 +554,11 @@ def definition(session: LspSession, path: Path, text: str, name: str) -> dict[st
     """Request a definition at the last occurrence of name."""
     lines = text.splitlines()
     line = next(index for index in range(len(lines) - 1, -1, -1) if name in lines[index])
-    response = session.request(
-        "textDocument/definition",
+    result = settled_result(
+        session, "textDocument/definition",
         {"textDocument": {"uri": path.as_uri()},
          "position": {"line": line, "character": lines[line].index(name) + 1}},
-    )
-    result = response.get("result")
+        lambda r: isinstance(r, dict), f"definition for {name}")
     require(isinstance(result, dict), f"definition for {name} is not a Location: {result!r}")
     return result
 
@@ -670,7 +687,6 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": shared_left_v2}]},
             )
             session.diagnostics(shared_left[0].as_uri(), 2)
-            settle_rebuilds(session)
             assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
             assert_definition(session, *shared_right)
             assert_definition(session, shared_left[0], shared_left[1], shared_left_v2)
@@ -709,6 +725,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             # fingerprint scan, not on the next request
             time.sleep(0.4)
             assert_definition(session, *alpha)
+
 
             # An unsaved export change in one module must be visible from another
             # open module through the retained compiler snapshot, not editor fallback.
@@ -756,12 +773,12 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": broken_text}]},
             )
             session.diagnostics(alpha_main.as_uri(), 3)
-            broken_overlay = session.request(
-                "textDocument/definition",
+            broken_overlay = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": alpha_main.as_uri()},
                  "position": {"line": 8, "character": 30}},
-            )
-            require(broken_overlay.get("result") is None,
+                lambda r: r is None, "invalid unsaved import stops resolving")
+            require(broken_overlay is None,
                     f"invalid unsaved import unexpectedly analyzed: {broken_overlay!r}")
             session.notify(
                 "textDocument/didChange",
@@ -769,19 +786,17 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": main_v2}]},
             )
             session.diagnostics(alpha_main.as_uri(), 4)
-            settle_rebuilds(session)
             require(definition(session, alpha_main, main_v2, "live").get("uri") == alpha_def.as_uri(),
                     "failed snapshot did not retry after the next unsaved revision")
 
             session.notify("textDocument/didClose", {"textDocument": {"uri": alpha_def.as_uri()}})
             assert_diagnostics(session.diagnostics(alpha_def.as_uri(), None), False)
-            settle_rebuilds(session)
-            after_close = session.request(
-                "textDocument/definition",
+            after_close = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": alpha_main.as_uri()},
                  "position": {"line": 5, "character": 35}},
-            )
-            require(after_close.get("result") is None,
+                lambda r: r is None, "closed unsaved export stops being authoritative")
+            require(after_close is None,
                     f"closed unsaved export remained authoritative: {after_close!r}")
             session.notify(
                 "textDocument/didChange",
@@ -789,7 +804,6 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                  "contentChanges": [{"text": alpha_text}]},
             )
             assert_diagnostics(session.diagnostics(alpha_main.as_uri(), 5), False, 5)
-            settle_rebuilds(session)
             assert_definition(session, alpha_main, alpha_def, alpha_text)
 
             # A dependency opened before its ancestor graph is loaded must still
@@ -809,7 +823,6 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                                   "version": 1, "text": vendor_text}},
             )
             assert_diagnostics(session.diagnostics(vendor_main.as_uri(), 1), False, 1)
-            settle_rebuilds(session)
             vendor_definition = definition(session, vendor_main, vendor_text, "live")
             require(vendor_definition.get("uri") == vendor_dep.as_uri(),
                     f"vendored unsaved export did not resolve: {vendor_definition!r}")
@@ -949,6 +962,26 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                              {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
         finished = False
         try:
+            def log() -> str:
+                return trace_path.read_text(encoding="utf-8", errors="replace")
+
+            def scheduled() -> int:
+                return log().count("off the analysis thread")
+
+            def quiesced() -> bool:
+                """True when every scheduled rebuild has finished.
+
+                Every build logs that it finished; the inline first one also logs
+                that it was analyzed, so subtracting those leaves the off-thread
+                ones. Counting the server's own record is deterministic, where
+                waiting for the diagnostics stream to fall quiet is not: a build
+                that is still running is quiet.
+                """
+                text_log = log()
+                finished = max(0, text_log.count("project: rebuilt")
+                                  - text_log.count("project: analyzed"))
+                return finished >= text_log.count("off the analysis thread")
+
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
             session.notify("initialized", {})
             session.notify(
@@ -957,7 +990,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
-            settle_rebuilds(session)
+            eventually(quiesced, lambda done: done, "the initial load to quiesce", 60.0)
 
             edited = text + "\n# one edit, one rebuild\n"
             session.notify(
@@ -982,12 +1015,11 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
 
             # and the rebuild does land, republishing the document it moved
             session.diagnostics(main.as_uri(), 2)
-            settle_rebuilds(session)
+            eventually(quiesced, lambda done: done, "the rebuild to quiesce", 60.0)
 
             # a burst of edits during a build coalesces into ONE follow-up build,
             # not one per edit. counted from the server's own log, not timed.
-            before = trace_path.read_text(encoding="utf-8", errors="replace").count(
-                "off the analysis thread")
+            before = scheduled()
             version = 2
             for _ in range(12):
                 version += 1
@@ -997,9 +1029,8 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
                 )
             session.diagnostics(main.as_uri(), version)
-            settle_rebuilds(session)
-            after = trace_path.read_text(encoding="utf-8", errors="replace").count(
-                "off the analysis thread")
+            eventually(quiesced, lambda done: done, "the burst's rebuilds to quiesce", 60.0)
+            after = scheduled()
             require(after - before <= 2,
                     f"a burst of 12 edits started {after - before} rebuilds, not at most 2")
 
@@ -1090,13 +1121,14 @@ def run_import_navigation(server: Path, timeout: float) -> None:
                                   "version": 1, "text": bridge_text}},
             )
             session.diagnostics(bridge.as_uri(), 1)
-            settle_rebuilds(session)
             blines = bridge_text.splitlines()
             bline = next(i for i, v in enumerate(blines) if v.startswith("fwd "))
             fwd = {"textDocument": {"uri": bridge.as_uri()},
                    "position": {"line": bline, "character": blines[bline].index("answer") + 1}}
-            response = session.request("textDocument/definition", fwd)
-            result = response.get("result")
+            result = eventually(
+                lambda: session.request("textDocument/definition", fwd).get("result"),
+                lambda r: isinstance(r, dict) and r.get("uri") == defs.as_uri(),
+                "fwd re-export path")
             require(isinstance(result, dict) and result.get("uri") == defs.as_uri(),
                     f"a fwd re-export path did not resolve: {result!r}")
 
@@ -1486,16 +1518,16 @@ def run_completion_context(server: Path, timeout: float) -> None:
                 )
                 session.diagnostics(main.as_uri(), version[0])
                 # this case is about what PROJECT-backed completion offers, so it
-                # waits for the off-thread rebuild the edit scheduled. without the
-                # wait it would silently grade the isolated editor result instead,
-                # which `isIncomplete` is then asserted to rule out.
-                settle_rebuilds(session)
-                response = session.request(
-                    "textDocument/completion",
+                # waits for the rebuild the edit scheduled. `isIncomplete` is the
+                # server's own word for which analysis answered, so it is both
+                # the thing waited on and the thing asserted - without it this
+                # would silently grade the isolated editor result instead.
+                result = settled_result(
+                    session, "textDocument/completion",
                     {"textDocument": {"uri": main.as_uri()},
                      "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
-                )
-                result = response.get("result")
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                    f"project-backed completion for {probe!r}")
                 require(isinstance(result, dict), f"completion is not a list: {result!r}")
                 require(result.get("isIncomplete") is False,
                         f"completion answered from isolated analysis: {result!r}")
@@ -1606,12 +1638,12 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
                     f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
 
             session.diagnostics(main.as_uri(), version)
-            settle_rebuilds(session)
-            rebuilt = session.request(
-                "textDocument/completion",
+            rebuilt = settled_result(
+                session, "textDocument/completion",
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": stale_line, "character": len("    current.")}},
-            ).get("result")
+                lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                "completion after the deferred rebuild")
             require(isinstance(rebuilt, dict) and rebuilt.get("isIncomplete") is False,
                     f"completion stayed isolated after the deferred rebuild: {rebuilt!r}")
             rebuilt_labels = [item.get("label") for item in rebuilt.get("items", [])]
@@ -1775,7 +1807,7 @@ def run_signature_help(server: Path, timeout: float) -> None:
             anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
             version = [1]
 
-            def help_at(probe: str) -> dict[str, Any] | None:
+            def help_at(probe: str, want: Callable[[Any], bool] | None = None) -> dict[str, Any] | None:
                 edited = list(lines)
                 edited.insert(anchor_line + 1, "    " + probe)
                 version[0] += 1
@@ -1785,13 +1817,12 @@ def run_signature_help(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
                 )
                 session.diagnostics(main.as_uri(), version[0])
-                settle_rebuilds(session)
-                response = session.request(
-                    "textDocument/signatureHelp",
+                settled = want or (lambda r: isinstance(r, dict) and r.get("signatures"))
+                return settled_result(
+                    session, "textDocument/signatureHelp",
                     {"textDocument": {"uri": main.as_uri()},
                      "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
-                )
-                return response.get("result")
+                    settled, f"signatureHelp for {probe!r}")
 
             # the argument list is unclosed at every one of these positions
             opened = help_at("take[i32](")
@@ -1815,9 +1846,9 @@ def run_signature_help(server: Path, timeout: float) -> None:
             require(quoted, "a paren inside a string broke the enclosing call")
 
             # a cursor outside any call, and a callee that resolves to nothing
-            require(help_at("val zz: i64 = 1;") is None,
+            require(help_at("val zz: i64 = 1;", lambda r: r is None) is None,
                     "signatureHelp answered outside a call")
-            require(help_at("no_such_function(") is None,
+            require(help_at("no_such_function(", lambda r: r is None) is None,
                     "signatureHelp answered for an unresolvable callee")
 
             session.finish()
@@ -2559,20 +2590,19 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             line = next(i for i, value in enumerate(lines) if "watched" in value and "use " not in value)
             character = lines[line].index("watched") + 1
 
-            def poke_and_settle() -> None:
-                """Trigger the fingerprint scan, then wait for the rebuild it schedules.
+            def poke() -> None:
+                """Trigger the fingerprint scan that notices the on-disk change.
 
-                The scan runs inside a request, and the rebuild it finds work for
-                runs off the analysis thread, so one request schedules and a later
-                one observes. Sleeping past the 250 ms scan window is what makes
-                the scan happen at all; settling is what makes the result visible.
+                The scan runs inside a request and only schedules the rebuild, so
+                one request schedules and a later one observes. Sleeping past the
+                250 ms scan window is what makes the scan happen at all; the
+                polling assertions that follow are what make the result visible.
                 """
                 session.request(
                     "textDocument/hover",
                     {"textDocument": {"uri": main.as_uri()},
                      "position": {"line": line, "character": character}},
                 )
-                settle_rebuilds(session)
 
             # the edit must keep the project compiling: mach 5.0 releases a
             # project whose sema phase is rejected (briar-systems/mach#3337)
@@ -2580,30 +2610,31 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
                 "pub val watched: i32 = 9;", "pub val watched: i32 = 99;")
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
-            poke_and_settle()
-            hover = session.request(
-                "textDocument/hover",
+            poke()
+            hover = settled_result(
+                session, "textDocument/hover",
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": line, "character": character}},
-            )
-            require("watched: i32 = 99" in json.dumps(hover.get("result")),
+                lambda r: "watched: i32 = 99" in json.dumps(r),
+                "hover reflecting the on-disk change")
+            require("watched: i32 = 99" in json.dumps(hover),
                     f"active watcher suppressed source fingerprint fallback: {hover!r}")
 
             broken = changed + "use watch.missing.nope;\n"
             defs.write_text(broken, encoding="utf-8")
             time.sleep(0.3)
-            poke_and_settle()
-            failed = session.request(
-                "textDocument/definition",
+            poke()
+            failed = settled_result(
+                session, "textDocument/definition",
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": line, "character": character}},
-            )
-            require(failed.get("result") is None,
+                lambda r: r is None, "broken on-disk source stops resolving")
+            require(failed is None,
                     f"broken on-disk source retained a stale snapshot: {failed!r}")
 
             defs.write_text(changed, encoding="utf-8")
             time.sleep(0.3)
-            poke_and_settle()
+            poke()
             repaired = definition(session, main, text, "watched")
             require(repaired.get("uri") == defs.as_uri(),
                     f"failed root did not retry after disk source repair: {repaired!r}")
@@ -2683,7 +2714,6 @@ def run_same_fqn_reverse(server: Path, timeout: float) -> None:
                  "contentChanges": [{"text": right_v2}]},
             )
             session.diagnostics(right[0].as_uri(), 2)
-            settle_rebuilds(session)
             assert_definition(session, right[0], right[1], right_v2)
             assert_definition(session, *left)
             session.finish()
