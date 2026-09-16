@@ -10,13 +10,14 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 HEADER_MAX = 8 * 1024
 BODY_MAX = 16 * 1024 * 1024
@@ -1058,6 +1059,215 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
         finally:
             if not finished:
                 session.abort()
+
+
+class SyntaxOnlyFeature(NamedTuple):
+    """One request answered from a PHASE_PARSE analysis of the open buffer alone."""
+
+    name: str
+    method: str
+    params: Callable[[str, str], dict[str, Any]]
+    valid: Callable[[Any], bool]
+
+
+# every handler that reaches `analysis.standalone` at `editor.PHASE_PARSE`, which
+# today is `document_symbol` by way of `analysis.syntax_tree`. a syntax-only
+# handler answers from the buffer and must never touch the project, so each one
+# is held to the same latency contract; #221 foldingRange and #222 selectionRange
+# join the table when they land.
+SYNTAX_ONLY_FEATURES = (
+    SyntaxOnlyFeature(
+        name="documentSymbol",
+        method="textDocument/documentSymbol",
+        params=lambda uri, text: {"textDocument": {"uri": uri}},
+        valid=lambda result: isinstance(result, list) and bool(result),
+    ),
+)
+
+# the first requests against a healthy project pay a one-time cold project load,
+# so the contract is about steady state and these samples are discarded
+SYNTAX_ONLY_WARMUP = 2
+# odd, so the median is a sample rather than a mean of two
+SYNTAX_ONLY_SAMPLES = 9
+# healthy-project median over standalone median. measured in the same process on
+# the same machine, so machine load cancels: over seven runs each way the
+# absolute medians moved by 5x while the ratio stayed inside 2.77-5.41x against
+# mach v5.0.4 and 0.53-1.20x against v5.1.0. 2.0 separates them.
+SYNTAX_ONLY_RATIO = 2.0
+# under a few milliseconds both paths are dominated by framing rather than by
+# analysis and a ratio means nothing. a project reload never measured below
+# 6.6ms, so this cannot mask one.
+SYNTAX_ONLY_FLOOR = 0.003
+# the manifest fingerprint fallback coalesces to at most one scan per 250 ms per
+# root, so a request inside that window still sees the previous state
+FINGERPRINT_WINDOW = 0.4
+# a reload costs what the project's dependencies cost to load, so a fixture with
+# no dependencies cannot show one: a dependency-free project reloaded in under
+# 3ms even while broken, and the regression was invisible against it. these are
+# the std modules the fixture imports, aliased because several share a leaf name.
+SYNTAX_ONLY_STD_MODULES = (
+    "std.allocator", "std.allocator.arena", "std.allocator.bump", "std.allocator.fixed",
+    "std.allocator.heap", "std.allocator.page", "std.chrono.date", "std.chrono.duration",
+    "std.chrono.format", "std.chrono.time", "std.collections.bitset", "std.collections.deque",
+    "std.collections.heap", "std.collections.map", "std.collections.set",
+    "std.collections.slice", "std.collections.sort", "std.collections.vector",
+    "std.compress.gzip", "std.compress.inflate", "std.compress.zlib", "std.crypto.ct",
+    "std.crypto.hash.crc32", "std.crypto.hash.sha256", "std.crypto.hash.sha512",
+    "std.crypto.hash.keccak", "std.crypto.rand", "std.data.json", "std.data.toml",
+    "std.encoding.base64", "std.encoding.binary", "std.encoding.hex", "std.filesystem",
+    "std.format", "std.input", "std.io.file", "std.io.reader", "std.io.writer",
+    "std.log", "std.math", "std.math.bignum", "std.math.bits", "std.math.float",
+    "std.math.mat4", "std.math.quat", "std.memory", "std.net.dns", "std.net.ip",
+)
+
+
+def write_std_backed_project(parent: Path) -> tuple[Path, str]:
+    """Create an app whose vendored dependency is this repo's own `dep/std`.
+
+    A reload's cost is its dependencies', so the project has to carry a real one
+    for the reload to be visible at all. `dep/std` is already on disk in any tree
+    that could have built the server under test.
+    """
+    source = Path(__file__).resolve().parents[1] / "dep" / "std"
+    require((source / "mach.toml").is_file(),
+            f"the std dependency is not realized: {source} (run `mach dep pull .`)")
+    root = parent / "stdapp"
+    (root / "src").mkdir(parents=True)
+    shutil.copytree(source, root / "dep" / "std",
+                    ignore=shutil.ignore_patterns(".git", "out", "dep"))
+    (root / "mach.toml").write_text(
+        """[project]
+id = "stdapp"
+version = "0.1.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+
+[dep.std]
+path = "dep/std"
+""",
+        encoding="utf-8",
+    )
+    uses = "".join(f"use m{i}: {module};\n"
+                   for i, module in enumerate(SYNTAX_ONLY_STD_MODULES))
+    text = f"{uses}\npub fun main() i32 {{\n    ret 0;\n}}\n"
+    main = root / "src" / "main.mach"
+    main.write_text(text, encoding="utf-8")
+    return main, text
+
+
+def syntax_only_median(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
+                       text: str, label: str, samples: int) -> tuple[float, Any]:
+    """Median latency over `samples` identical requests, with the last reply."""
+    durations: list[float] = []
+    result: Any = None
+    for _ in range(samples):
+        started = time.monotonic()
+        response = session.request(feature.method, feature.params(uri, text))
+        durations.append(time.monotonic() - started)
+        result = response.get("result")
+        require(feature.valid(result),
+                f"{feature.name} answered nothing usable {label}: {response!r}")
+    durations.sort()
+    return durations[len(durations) // 2], result
+
+
+def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, float, float]]:
+    """A syntax-only request must not reload the project through the editor session.
+
+    Until mach#3431, `editor.analyze` tore the project down on every call, so a
+    request needing nothing but a parse of the open buffer paid a full project
+    reload: against this repo, 1586.9ms healthy versus 34.8ms under a manifest
+    that cannot load, a 45.6x gap that shipped in 0.18.0 unnoticed. The only
+    latency assertion documentSymbol had broke the manifest first, so it measured
+    the one path that was never slow.
+
+    Two things make this able to fail where that one could not. The project
+    carries a real dependency, because a reload costs what its dependencies cost
+    and a dependency-free fixture shows nothing. And the bound is a ratio against
+    the standalone path measured in the same run rather than a wall-clock
+    threshold, so it neither flakes under machine load nor passes because the
+    machine was fast.
+    """
+    require(SYNTAX_ONLY_FEATURES, "no syntax-only feature is under a latency assertion")
+    measured: list[tuple[str, float, float]] = []
+    with tempfile.TemporaryDirectory(prefix="mls-synlat-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_std_backed_project(root)
+        manifest = main.parents[1] / "mach.toml"
+        manifest_text = manifest.read_text(encoding="utf-8")
+        uri = main.as_uri()
+        session = LspSession(server, main.parents[1], timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": main.parents[1].as_uri(),
+                                           "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": uri, "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            # the fixture must load cleanly, or "healthy" is not healthy and the
+            # comparison is between two standalone paths
+            assert_diagnostics(session.diagnostics(uri, 1), False, 1)
+
+            for feature in SYNTAX_ONLY_FEATURES:
+                syntax_only_median(session, feature, uri, text,
+                                   "warming the project load", SYNTAX_ONLY_WARMUP)
+                healthy, healthy_result = syntax_only_median(
+                    session, feature, uri, text,
+                    "against a healthy project", SYNTAX_ONLY_SAMPLES)
+
+                manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+                time.sleep(FINGERPRINT_WINDOW)
+                try:
+                    standalone, standalone_result = syntax_only_median(
+                        session, feature, uri, text,
+                        "under a broken manifest", SYNTAX_ONLY_SAMPLES)
+                finally:
+                    manifest.write_text(manifest_text, encoding="utf-8")
+                    time.sleep(FINGERPRINT_WINDOW)
+
+                # a syntax-only answer is a function of the buffer, so losing the
+                # project must not change it. without this the ratio could be met
+                # by answering less.
+                require(healthy_result == standalone_result,
+                        f"{feature.name} answered differently once the project was lost")
+
+                allowed = max(standalone * SYNTAX_ONLY_RATIO, SYNTAX_ONLY_FLOOR)
+                require(healthy <= allowed,
+                        f"{feature.name} reloads the project on a healthy root: "
+                        f"{healthy * 1000:.1f}ms healthy vs {standalone * 1000:.1f}ms "
+                        f"standalone ({healthy / standalone:.2f}x, allowed "
+                        f"{allowed * 1000:.1f}ms)")
+                measured.append((feature.name, healthy, standalone))
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+    return measured
 
 
 def run_completion_context(server: Path, timeout: float) -> None:
@@ -2940,6 +3150,7 @@ def main() -> int:
         run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
+        syntax_only = run_syntax_only_latency(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
         run_document_highlight(server, args.timeout)
@@ -2971,6 +3182,7 @@ def main() -> int:
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
+    print("  a syntax-only request answers from the buffer without reloading the project")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")
     print("  documentHighlight classifies reads and writes in the active file")
@@ -2993,6 +3205,9 @@ def main() -> int:
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
+    for name, healthy, standalone in syntax_only:
+        print(f"  {name} steady state: {healthy * 1000:.1f}ms healthy, "
+              f"{standalone * 1000:.1f}ms standalone ({healthy / standalone:.2f}x)")
     for label, duration in timings:
         print(f"  {label}: {duration:.3f}s")
     return 0
