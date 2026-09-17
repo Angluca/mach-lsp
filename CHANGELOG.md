@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fix(project): on windows, an open document that no module imports is
   analyzed (#273). Open documents join the load when they lie under the source
   directory, and that test only accepted `/`, while windows paths are spelled
-  with `\\`. Such a document was never loaded, and definition, workspace symbols
+  with `\`. Such a document was never loaded, and definition, workspace symbols
   and references all skipped it.
 
 ## [0.19.0] - 2026-09-16
