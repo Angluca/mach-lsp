@@ -1305,7 +1305,7 @@ fun collect_extra_roots(in: *BuildInput, sn: *sess.Session, m: *manifest.Manifes
 fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[intern.StrId, str] {
     val prefix: usize = str_len(src_dir);
     val plen:   usize = str_len(path);
-    if (plen <= prefix + 6 || path[prefix] != '/') { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
+    if (plen <= prefix + 6 || !pathlib.is_separator(path[prefix])) { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
     if (path[plen - 5] != '.' || path[plen - 4] != 'm' || path[plen - 3] != 'a'
         || path[plen - 2] != 'c' || path[plen - 1] != 'h') { ret res[intern.StrId, str].err{"project: document is not a Mach source file"}; }
     val rel_len: usize                     = plen - prefix - 1 - 5;
@@ -1322,9 +1322,10 @@ fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[i
     buf[id_len] = '.';
     var j: usize = 0;
     for (j < rel_len) {
+        # module path segments, whichever separator the platform spells them with
         val c: u8 = path[prefix + 1 + j];
-        if (c == '/') { buf[id_len + 1 + j] = '.'; }
-        or            { buf[id_len + 1 + j] = c; }
+        if (pathlib.is_separator(c)) { buf[id_len + 1 + j] = '.'; }
+        or                           { buf[id_len + 1 + j] = c; }
         j = j + 1;
     }
     val ir: res[intern.StrId, allocator.Error] = intern.intern_bytes(?sn.interner, buf::str, total);
@@ -1529,7 +1530,7 @@ fun is_under(file: str, dir: str) bool {
     val fl: usize = str_len(file);
     if (fl < dl || !str_starts_with(file, dir)) { ret false; }
     if (fl == dl)                               { ret true; }
-    ret file[dl] == '/';
+    ret pathlib.is_separator(file[dl]);
 }
 
 fun document_own_root(w: *Workspace, r: *Root, path: str) bool {
@@ -3074,6 +3075,24 @@ test "project: uri and path round-trip" {
         or {
             if (!str_equals(u2, "file:///C:/src/main.mach")) { fail = true; }
         }
+    }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# an open document is found under its source directory whichever separator the
+# platform spells paths with (#273): windows paths come back from `clean` with
+# backslashes
+test "project: a document is under its source directory with native separators" {
+    var fail: bool = false;
+    if (!is_under("/p/src/m.mach", "/p/src")) { fail = true; }
+    if (is_under("/p/srcx/m.mach", "/p/src")) { fail = true; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!is_under("C:\\p\\src\\m.mach", "C:\\p\\src")) { fail = true; }
+        if (is_under("C:\\p\\srcx\\m.mach", "C:\\p\\src")) { fail = true; }
+    }
+    $or {
+        if (is_under("/p/src\\m.mach", "/p/src")) { fail = true; }
     }
     if (fail) { ret 1; }
     ret 0;
