@@ -580,7 +580,7 @@ fun note_response(r: *Relay, body: str, len: usize) bool {
 fun note_sideband(r: *Relay, root: *sj.Value) bool {
     val method: str = json.text(json.member(root, "method"), r.alloc);
     if (method == nil) { ret false; }
-    val ours: bool = sideband.owns(method);
+    val ours:   bool      = sideband.owns(method);
     val params: *sj.Value = json.member(root, "params");
     if (str_equals(method, sideband.LOADING)) {
         val on: bool = json.boolean(json.member(params, "loading"), false);
@@ -673,7 +673,7 @@ fun note_request(r: *Relay, body: str, len: usize) {
                 mutex.lock(?r.reqs_mu);
                 # an idle worker starts on this request now; a busy one starts
                 # it when it finishes what it is doing
-                if (!pending.active(?r.reqs)) { r.progress_at = now_ns(); }
+                if (!pending.active(?r.reqs))   { r.progress_at = now_ns(); }
                 if (!pending.open(?r.reqs, id)) { trace.log("supervisor: could not record a request\n"); }
                 mutex.unlock(?r.reqs_mu);
                 json.free_str(id, r.alloc);

@@ -48,8 +48,8 @@ pub fun loading(alloc: *Allocator, on: bool) {
 
 # tell the supervisor a request was held for a build, or resumed from one
 # ---
-# id:   the request's id token as it appeared on the wire
-# on:   true when held, false when resumed
+# id: the request's id token as it appeared on the wire
+# on: true when held, false when resumed
 pub fun held(alloc: *Allocator, id: str, on: bool) {
     if (id == nil) { ret; }
     var b: json.Buf = json.buf_init(alloc);

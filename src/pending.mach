@@ -145,13 +145,13 @@ test "pending: requests close by id token, in any order, numeric or string" {
     var l:    Ledger = init(?pa);
     var fail: bool   = false;
     if (!open(?l, "1") || !open(?l, "\"a\"") || !open(?l, "3")) { fail = true; }
-    if (!open(?l, "4") || !open(?l, "5"))                        { fail = true; }
-    if (l.len != 5)                                              { fail = true; }
-    if (!close(?l, "\"a\""))                                     { fail = true; }
-    if (close(?l, "a"))                                          { fail = true; }
-    if (close(?l, "\"a\""))                                      { fail = true; }
-    if (!close(?l, "1"))                                         { fail = true; }
-    if (l.len != 3 || !str_equals(l.items[0].id, "3"))           { fail = true; }
+    if (!open(?l, "4") || !open(?l, "5"))                       { fail = true; }
+    if (l.len != 5)                                             { fail = true; }
+    if (!close(?l, "\"a\""))                                    { fail = true; }
+    if (close(?l, "a"))                                         { fail = true; }
+    if (close(?l, "\"a\""))                                     { fail = true; }
+    if (!close(?l, "1"))                                        { fail = true; }
+    if (l.len != 3 || !str_equals(l.items[0].id, "3"))          { fail = true; }
     dnit(?l);
     if (fail) { ret 1; }
     ret 0;
