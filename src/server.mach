@@ -252,6 +252,7 @@ pub fun run(srv: *Server) i64 {
 
     # every accepted message is answered before the exit code is decided
     jobs.join(?srv.q);
+    settings.settle_trace(srv.alloc);
     trace.log("=== mach-lsp exiting ===\n");
 
     if (transport.write_failed())                                              { ret 1; }
@@ -677,11 +678,17 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
 # answer the initialize request with the server's capabilities (full-text
 # document sync) and mark the server running
 fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
-    # what the client configured, before anything else is traced (#264)
-    var st: settings.Settings = settings.parse(params, srv.alloc, false);
-    trace.start(st.trace, st.lsp_trace, st.trace_file);
+    # what the client configured decides where the trace goes and whether it
+    # is on, so it is applied before anything is written (#264, #285). the
+    # notes about it are written once there is somewhere to write them
+    var st:  settings.Settings  = settings.parse(params, srv.alloc, false);
+    var eff: settings.Effective = settings.effective(?st, srv.alloc, false);
+    trace.start(eff.level, eff.file);
+    settings.effective_dnit(?eff, srv.alloc);
     settings.dnit(?st, srv.alloc);
-    var noted: settings.Settings = settings.parse(params, srv.alloc, true);
+    var noted:     settings.Settings  = settings.parse(params, srv.alloc, true);
+    var noted_eff: settings.Effective = settings.effective(?noted, srv.alloc, true);
+    settings.effective_dnit(?noted_eff, srv.alloc);
     settings.dnit(?noted, srv.alloc);
 
     # remember whether the client can accept a dynamic watch registration, so
@@ -812,6 +819,7 @@ fun handle_exit(srv: *Server) {
     # return through `run` is not reachable here. Ending the process is what the
     # notification asked for; responses are written unbuffered, so nothing that
     # was owed to the client is still pending.
+    settings.settle_trace(srv.alloc);
     trace.log("=== mach-lsp exiting ===\n");
     exec.exit(srv.exit_code);
 }

@@ -1630,8 +1630,9 @@ def run_settings(server: Path, timeout: float) -> None:
 
     The option wins over the environment, the environment over the LSP
     `initialize.trace`, and `$/setTrace` moves the level afterwards. A key the
-    server does not know, or a value it cannot use, is noted and ignored; it
-    never fails `initialize`.
+    server does not know, or a value it cannot use, from an option or the
+    environment, is noted and ignored; it never fails `initialize`. Nothing is
+    traced before `initialize` has decided where the trace goes (#285).
     """
     SAMPLE = "pub fun sample(n: i32) i32 {\n    ret n;\n}\n"
 
@@ -1725,11 +1726,78 @@ def run_settings(server: Path, timeout: float) -> None:
             lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
                                                     "initialize.trace off silenced MLS_TRACE")))
 
-        # while the option does
+        # while the option does, entirely: nothing from before `initialize`
+        # reaches the environment's file either, bodies included (#285)
         envlog.unlink(missing_ok=True)
-        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
-            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" not in read(envlog),
-                                                    "the trace option did not override MLS_TRACE")))
+        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "bodies", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require(read(envlog) == "",
+                                                    f"the trace option did not silence MLS_TRACE: {read(envlog)[:400]!r}")))
+
+        # a chosen file takes the whole session, its start included, and the
+        # environment's file is never written
+        envlog.unlink(missing_ok=True)
+        chosen = envlog.parent / "chosen.log"
+        run({"initializationOptions": {"traceFile": str(chosen)}},
+            {"MLS_TRACE": "bodies", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: symbols(s, d))
+        require(read(envlog) == "", f"a chosen traceFile left lines in MLS_TRACE_FILE: {read(envlog)[:400]!r}")
+        text = read(chosen)
+        require("=== mach-lsp started ===" in text and "method initialize" in text,
+                f"the lines from before initialize did not reach the chosen file: {text[:400]!r}")
+        require(re.search(r"recv: \d+ bytes\n", text) and '"method":"initialize"' not in text,
+                f"a line from before initialize carried a body: {text[:600]!r}")
+        require('"method":"textDocument/documentSymbol"' in text, "MLS_TRACE=bodies stopped applying after initialize")
+        require(f"settings: trace bodies (environment), to {chosen} (option), request deadline 120000ms (default)" in text,
+                f"the effective settings were not traced: {text[:800]!r}")
+
+        # MLS_TRACE=off is off, and unusable environment values are noted
+        envlog.unlink(missing_ok=True)
+        run({}, {"MLS_TRACE": "off", "MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: symbols(s, d))
+        require(read(envlog) == "", f"MLS_TRACE=off traced: {read(envlog)[:400]!r}")
+        for value, note in (("soon", "MLS_REQUEST_DEADLINE_MS `soon` is not an integer; ignored"),
+                            ("10", "MLS_REQUEST_DEADLINE_MS 10 is below 1000; ignored")):
+            envlog.unlink(missing_ok=True)
+            run({}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog), "MLS_REQUEST_DEADLINE_MS": value},
+                lambda s, d, _: symbols(s, d))
+            require(note in read(envlog), f"an unusable environment deadline was not noted: {read(envlog)[:600]!r}")
+        envlog.unlink(missing_ok=True)
+        run({}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog), "MLS_REQUEST_DEADLINE_MS": "4000"},
+            lambda s, d, _: symbols(s, d))
+        require("request deadline 4000ms (environment)" in read(envlog),
+                f"the environment's deadline was not traced: {read(envlog)[:600]!r}")
+
+    # with no file named, the trace goes to stderr, where an editor collects it
+    def to_stderr(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        session.finish()
+        session.stderr_reader.join(timeout=timeout)
+        err = session.stderr_text()
+        require("method textDocument/documentSymbol" in err, f"the trace did not go to stderr: {err[:400]!r}")
+        require("to stderr (default)" in err, f"stderr was not named as the destination: {err[:600]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-stderr-") as name:
+        directory = Path(name).resolve()
+        session, doc = session_with(directory, {}, {"MLS_TRACE": "1"})
+        try:
+            to_stderr(session, doc, directory)
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+    # a session that ends before `initialize` still writes what it kept
+    with tempfile.TemporaryDirectory(prefix="mls-settings-early-") as name:
+        directory = Path(name).resolve()
+        early = directory / "early.log"
+        session = LspSession(server, directory, timeout, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(early)})
+        try:
+            session.proc.stdin.close()
+            code = session.proc.wait(timeout=timeout)
+            require(code == 1, f"input closing before initialize exited {code}, want 1")
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+        require("=== mach-lsp started ===" in read(early) and "input closed" in read(early),
+                f"a session with no initialize lost its trace: {read(early)[:400]!r}")
 
 
 def worker_pid(session: "LspSession") -> int:

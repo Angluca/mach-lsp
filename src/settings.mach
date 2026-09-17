@@ -9,13 +9,20 @@
 #   traceFile          absolute path                    MLS_TRACE_FILE
 #   requestDeadlineMs  integer >= 1000                  MLS_REQUEST_DEADLINE_MS
 #
+# The trace level has one more source, the LSP `initialize.trace` value, after
+# the environment: an editor's default `trace: "off"` does not silence a trace
+# the user turned on in the environment, and an explicit option does. With no
+# file named, the trace goes to stderr.
+#
 # A key this server does not know, and a value it cannot use, is ignored with a
-# note in the trace. `initialize` never fails because of configuration: a client
-# that sends a newer server's settings still gets a working one.
+# note in the trace, whether it came from an option or the environment.
+# `initialize` never fails because of configuration: a client that sends a
+# newer server's settings still gets a working one.
 #
 # Both halves of the server read these: the supervisor owns the request
-# deadline, and the worker answers `initialize`. They parse the same frame with
-# this module, so they cannot disagree about what it said.
+# deadline, and the worker answers `initialize`. They resolve the same frame
+# with this module, so they cannot disagree about what it said. The worker is
+# the one that writes the notes.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -27,6 +34,7 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use std.allocator.Allocator;
+use std.process.env;
 
 use sj:      std.data.json;
 use strutil: std.text.string;
@@ -40,9 +48,21 @@ pub val TRACE_OFF:      u8 = trace.LEVEL_OFF;
 pub val TRACE_MESSAGES: u8 = trace.LEVEL_MESSAGES;
 pub val TRACE_BODIES:   u8 = trace.LEVEL_BODIES;
 
-# the smallest request deadline a client may ask for, in milliseconds. below it
-# the watchdog would end ordinary cold loads
+# the smallest request deadline that may be configured, in milliseconds
 pub val MIN_DEADLINE_MS: i64 = 1000;
+
+# the request deadline when nothing configures one. not part of the interface
+pub val DEFAULT_DEADLINE_MS: i64 = 120000;
+
+val TRACE_VAR:    str = "MLS_TRACE";
+val FILE_VAR:     str = "MLS_TRACE_FILE";
+val DEADLINE_VAR: str = "MLS_REQUEST_DEADLINE_MS";
+
+# where an effective value came from, as the trace names it
+pub val FROM_OPTION:  str = "option";
+pub val FROM_ENV:     str = "environment";
+pub val FROM_LSP:     str = "initialize.trace";
+pub val FROM_DEFAULT: str = "default";
 
 # the configuration one `initialize` carried
 # ---
@@ -111,6 +131,168 @@ fun apply_option(s: *Settings, key: str, v: *sj.Value, alloc: *Allocator, report
 pub fun dnit(s: *Settings, alloc: *Allocator) {
     json.free_str(s.trace_file, alloc);
     s.trace_file = nil;
+}
+
+# what the server runs with, once options, environment and defaults are applied
+# ---
+# level:       the trace level
+# file:        the trace file, owned, or nil for stderr
+# deadline_ms: the request deadline
+pub rec Effective {
+    level:       u8;
+    file:        str;
+    deadline_ms: i64;
+}
+
+# apply the environment and the defaults under what the client configured
+# ---
+# s:      the parsed options, or nil when there were none
+# alloc:  allocator for the owned file path
+# report: note each unusable environment value, and the result
+# ret:    the effective settings; release with `effective_dnit`
+pub fun effective(s: *Settings, alloc: *Allocator, report: bool) Effective {
+    var e: Effective = Effective{level: TRACE_OFF, file: nil, deadline_ms: DEFAULT_DEADLINE_MS};
+
+    var given_level: opt[u8]  = opt[u8].none{};
+    var lsp_level:   opt[u8]  = opt[u8].none{};
+    var given_ms:    opt[i64] = opt[i64].none{};
+    if (s != nil) {
+        given_level = s.trace;
+        lsp_level   = s.lsp_trace;
+        given_ms    = s.deadline_ms;
+    }
+
+    var level_from: str     = FROM_DEFAULT;
+    val env_level:  opt[u8] = env_trace(report);
+    if (sel given_level.some) {
+        e.level    = given_level.some;
+        level_from = FROM_OPTION;
+    }
+    or (sel env_level.some) {
+        e.level    = env_level.some;
+        level_from = FROM_ENV;
+    }
+    or (sel lsp_level.some) {
+        e.level    = lsp_level.some;
+        level_from = FROM_LSP;
+    }
+
+    var file_from: str = FROM_DEFAULT;
+    val env_path:  str = env_file(alloc, report);
+    if (s != nil && s.trace_file != nil) {
+        e.file    = json.dup(s.trace_file, alloc);
+        file_from = FROM_OPTION;
+        json.free_str(env_path, alloc);
+    }
+    or (env_path != nil) {
+        e.file    = env_path;
+        file_from = FROM_ENV;
+    }
+
+    var deadline_from: str      = FROM_DEFAULT;
+    val env_deadline:  opt[i64] = env_deadline_ms(report);
+    if (sel given_ms.some) {
+        e.deadline_ms = given_ms.some;
+        deadline_from = FROM_OPTION;
+    }
+    or (sel env_deadline.some) {
+        e.deadline_ms = env_deadline.some;
+        deadline_from = FROM_ENV;
+    }
+
+    if (report) {
+        trace.logf("settings: trace {} ({}), to {} ({}), request deadline {}ms ({})",
+            level_name(e.level), level_from, file_name(e.file), file_from, e.deadline_ms, deadline_from);
+    }
+    ret e;
+}
+
+# apply the environment's trace settings when no `initialize` ever did, so what
+# the trace kept for it is written or dropped
+pub fun settle_trace(alloc: *Allocator) {
+    if (trace.settled()) { ret; }
+    var e: Effective = effective(nil, alloc, false);
+    trace.start(e.level, e.file);
+    effective_dnit(?e, alloc);
+}
+
+pub fun effective_dnit(e: *Effective, alloc: *Allocator) {
+    json.free_str(e.file, alloc);
+    e.file = nil;
+}
+
+fun level_name(level: u8) str {
+    if (level == TRACE_BODIES)   { ret "bodies"; }
+    if (level == TRACE_MESSAGES) { ret "messages"; }
+    ret "off";
+}
+
+fun file_name(file: str) str {
+    if (file == nil) { ret "stderr"; }
+    ret file;
+}
+
+# MLS_TRACE: `off`, `messages` or `bodies`. any other value turns the trace on
+# at `messages`, so `MLS_TRACE=1` works; an empty one is as if unset
+fun env_trace(report: bool) opt[u8] {
+    var buf: [32]u8;
+    val n_o: opt[usize] = read_env(TRACE_VAR, ?buf[0], 32, report);
+    if (sel n_o.none) { ret opt[u8].none{}; }
+    val v: str = (?buf[0])::str;
+    if (str_equals(v, "off"))    { ret opt[u8].some{TRACE_OFF}; }
+    if (str_equals(v, "bodies")) { ret opt[u8].some{TRACE_BODIES}; }
+    ret opt[u8].some{TRACE_MESSAGES};
+}
+
+# MLS_TRACE_FILE, owned, or nil when unset or unusable
+fun env_file(alloc: *Allocator, report: bool) str {
+    var buf: [trace.MAX_PATH]u8;
+    val n_o: opt[usize] = read_env(FILE_VAR, ?buf[0], trace.MAX_PATH, report);
+    if (sel n_o.none) { ret nil; }
+    ret json.dup((?buf[0])::str, alloc);
+}
+
+# MLS_REQUEST_DEADLINE_MS, when it is an integer of at least the minimum
+fun env_deadline_ms(report: bool) opt[i64] {
+    var buf: [24]u8;
+    val n_o: opt[usize] = read_env(DEADLINE_VAR, ?buf[0], 24, report);
+    if (sel n_o.none) { ret opt[i64].none{}; }
+    val n:  usize = n_o.some;
+    var ms: i64   = 0;
+    var i:  usize = 0;
+    for (i < n) {
+        if (buf[i] < '0' || buf[i] > '9' || i >= 12) {
+            if (report) { trace.logf("settings: {} `{}` is not an integer; ignored", DEADLINE_VAR, (?buf[0])::str); }
+            ret opt[i64].none{};
+        }
+        ms = ms * 10 + (buf[i]::i64 - '0'::i64);
+        i  = i + 1;
+    }
+    if (ms < MIN_DEADLINE_MS) {
+        if (report) { trace.logf("settings: {} {} is below {}; ignored", DEADLINE_VAR, ms, MIN_DEADLINE_MS); }
+        ret opt[i64].none{};
+    }
+    ret opt[i64].some{ms};
+}
+
+# a variable's value, nul-terminated in `buf`, or none when it is unset, empty,
+# unreadable or too long, noting the last two
+fun read_env(name: str, buf: *u8, cap: usize, report: bool) opt[usize] {
+    val r: res[opt[usize], env.EnvError] = env.get(name, buf, cap);
+    if (sel r.err) {
+        if (report) { trace.logf("settings: {} could not be read; ignored", name); }
+        ret opt[usize].none{};
+    }
+    val n_o: opt[usize] = r.ok;
+    if (sel n_o.none) { ret opt[usize].none{}; }
+    val n: usize = n_o.some;
+    if (n == 0) { ret opt[usize].none{}; }
+    if (n >= cap) {
+        if (report) { trace.logf("settings: {} is longer than {} bytes; ignored", name, cap - 1); }
+        ret opt[usize].none{};
+    }
+    buf[n] = 0;
+    ret opt[usize].some{n};
 }
 
 # the trace level a `$/setTrace` or `initialize.trace` value names: the LSP

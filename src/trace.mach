@@ -1,77 +1,56 @@
-# append-only file trace log for debugging the server over stdio
+# the server's trace: notes about its own behaviour, and a record of messages
 #
-# the LSP speaks JSON-RPC on stdout, so diagnostics about the server's own
-# behaviour cannot go there. every notable event is appended to a fixed log
-# path instead. tracing is best-effort: a failed open or write is silently
-# dropped so logging never disturbs the protocol stream.
+# The LSP speaks JSON-RPC on stdout, so a trace goes to a file, or to stderr,
+# where an editor collects a server's own output. Where it goes and how much it
+# records are decided by `settings`, from the client's options, the environment
+# and the defaults, and applied here by `start` once `initialize` has said what
+# it configures (#264).
 #
-# tracing is gated on the MLS_TRACE environment variable, evaluated once on
-# the first log call: when it is unset every later call returns immediately
-# with no syscalls. when it is set the log file is opened once and the
-# descriptor is reused for the life of the process, so each enabled call
-# costs a single write.
+# Nothing is written before that (#285). A line from before `initialize` is
+# kept in memory, and written once the destination is known, or dropped when
+# the trace turns out to be off. So a session is never split across two
+# destinations, and an option that silences the trace silences all of it.
 #
-# a client may set both at `initialize` and move the level with `$/setTrace`
-# (`settings`, #264); `start` and `set_level` apply those over the environment.
-#
-# what a trace may contain is a separate decision from whether it is on. A
+# What a trace may contain is a separate decision from whether it is on. A
 # message body is the user's source code: every `didOpen` carries a whole file
-# and every `didChange` carries whatever they just typed. Writing that to a
-# world-readable path in /tmp is not a reasonable price for finding out which
-# requests arrived in which order, which is what tracing is usually turned on
-# for. So the default records only what a message IS - direction, method, id,
-# size, timing - and the bodies themselves need `MLS_TRACE=bodies`, which is a
-# deliberate second decision and still capped, because a trace that pages in a
-# 40 KB buffer per keystroke is unreadable as well as invasive.
+# and every `didChange` carries whatever they just typed. So the default
+# records only what a message IS - direction, method, id, size, timing - and
+# the bodies need the `bodies` level, which is a deliberate second decision and
+# still capped. A line kept from before `initialize` never carries a body,
+# because the level that would allow one is not known yet.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.option.opt;
-use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use chrono: std.chrono.time;
 use fmtstr: std.format;
 use std.io.writer;
-use std.process.env;
+use std.sync.atomic;
+use std.sync.mutex;
 use std.system.os;
 
-# file the trace log is appended to when nothing overrides it
-val LOG_PATH: str = "/tmp/mach-lsp.log";
+# how much a trace records: nothing, what each message is, or its body too
+pub val LEVEL_OFF:      u8 = 0;
+pub val LEVEL_MESSAGES: u8 = 1;
+pub val LEVEL_BODIES:   u8 = 2;
 
-# environment variable naming a different file to append to
-#
-# A fixed path in a shared temp directory is the wrong default to force on
-# anyone: it collides between concurrent servers and it puts the log somewhere
-# the user did not choose. It stays the default because a trace has to land
-# somewhere without configuration, but it is only the default.
-val PATH_VAR: str = "MLS_TRACE_FILE";
+# the longest trace file path, with its terminator
+pub val MAX_PATH: usize = 512;
 
-# storage for a path read from the environment; the descriptor is opened once
-# so this is only touched during that open
-var PATH_BUF: [512]u8;
-
-# environment variable that enables tracing when set
-val TRACE_VAR: str = "MLS_TRACE";
-
-# the value of MLS_TRACE that additionally permits message bodies in the log
-#
-# One variable answers both questions - whether to trace, and what a trace may
-# contain - because they are read at the same moment and a second variable was
-# a second thing to get wrong on a platform this cannot be tested on by hand.
-val BODIES_WORD: str = "bodies";
-
-# most bytes of any one body written to the log
+# most bytes of any one body written to the trace
 #
 # Enough to read a request and its arguments; far short of a source file.
 val BODY_CAP: usize = 512;
 
-# cached body gate, resolved with the enable gate
-var BODIES_ENABLED: bool = false;
+# most bytes kept from before `initialize`
+#
+# A client sends `initialize` first, so this holds a few lines. It is bounded
+# for the client that never does.
+val EARLY_CAP: usize = 8192;
 
 # whether this process records protocol frames
 #
@@ -84,166 +63,139 @@ var BODIES_ENABLED: bool = false;
 # are few and far apart.
 var FRAMES: bool = true;
 
+# whether `start` has run; read without the lock, written under it
+var SETTLED: i64 = 0;
+
+# the level `start` chose, moved by `set_level`
+var LEVEL: u8 = LEVEL_OFF;
+
+# where the trace goes: the chosen file, or stderr when none was chosen
+var CHOSEN_PATH: [MAX_PATH]u8;
+var PATH_CHOSEN: bool = false;
+
+# the open destination, or invalid while the trace is off or could not open.
+# the handle is left open once opened, because another thread may be writing
+# to it, and a closed number can be reused by an unrelated open
+var LOG_FD: usize = os.INVALID_HANDLE;
+
+# the lines from before `start`, and how many bytes did not fit
+var EARLY:      [EARLY_CAP]u8;
+var EARLY_LEN:  usize = 0;
+var EARLY_LOST: usize = 0;
+
+# guards the early lines and the switch to the destination; the writes after
+# `start` do not take it
+var MU: mutex.Mutex = 0;
+
 # stop recording protocol frames in this process
 pub fun mute_frames() {
     FRAMES = false;
 }
 
-# how much a trace records: nothing, what each message is, or its body too
-pub val LEVEL_OFF:      u8 = 0;
-pub val LEVEL_MESSAGES: u8 = 1;
-pub val LEVEL_BODIES:   u8 = 2;
-
-# the longest chosen trace path, with its terminator
-pub val MAX_PATH: usize = 512;
-
-# a trace file a client chose, and whether it chose one; used in place of the
-# environment's and the default when the log is next opened
-var CHOSEN_PATH: [MAX_PATH]u8;
-var PATH_CHOSEN: bool = false;
-
-# storage for the MLS_TRACE value; read once alongside the gate
-var GATE_BUF: [32]u8;
-
-# whether the MLS_TRACE gate has been evaluated yet
-var LOG_CHECKED: bool = false;
-
-# cached MLS_TRACE gate; writes happen only when true
-var LOG_ENABLED: bool = false;
-
-# trace log handle, opened lazily once tracing is enabled. invalid until
-# opened, and left invalid when the open fails so logging stays a silent no-op
-# (best-effort)
-var LOG_FD: usize = os.INVALID_HANDLE;
-
-# report whether the MLS_TRACE variable is set
-# ---
-# ret: true when MLS_TRACE is present in the environment
-fun trace_enabled() bool {
-    val r: res[opt[usize], env.EnvError] = env.get(TRACE_VAR, ?GATE_BUF[0], 31);
-    if (sel r.err) { ret false; }
-    val n: opt[usize] = r.ok;
-    if (sel n.none) { ret false; }
-    var len: usize = n.some;
-    if (len > 31) { len = 31; }
-    GATE_BUF[len]  = 0;
-    BODIES_ENABLED = str_equals((?GATE_BUF[0])::str, BODIES_WORD);
-    ret true;
+# whether `start` has run
+pub fun settled() bool {
+    ret atomic.load(?SETTLED) != 0;
 }
 
-# open the trace log for appending
+# apply the trace settings, and write or drop what was kept until now
 # ---
-# ret: a live handle, or os.INVALID_HANDLE on failure
-fun trace_open() usize {
-    if (PATH_CHOSEN) { ret open_append(?CHOSEN_PATH[0]); }
-    val r: res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
-    if (sel r.ok) {
-        val n: opt[usize] = r.ok;
-        if (sel n.some) {
-            if (n.some > 0) {
-                PATH_BUF[n.some] = 0;
-                ret open_append(?PATH_BUF[0]);
-            }
+# level: the effective level
+# file:  the file to append to, or nil for stderr
+pub fun start(level: u8, file: str) {
+    mutex.lock(?MU);
+    if (settled()) {
+        mutex.unlock(?MU);
+        ret;
+    }
+    if (file != nil && str_len(file) < MAX_PATH) {
+        val n: usize = str_len(file);
+        var i: usize = 0;
+        for (i < n) {
+            CHOSEN_PATH[i] = file[i];
+            i              = i + 1;
+        }
+        CHOSEN_PATH[n] = 0;
+        PATH_CHOSEN    = true;
+    }
+    LEVEL = level;
+    if (LEVEL != LEVEL_OFF) { LOG_FD = open_destination(); }
+    if (LEVEL != LEVEL_OFF && LOG_FD != os.INVALID_HANDLE) {
+        if (EARLY_LEN > 0) { os.write(LOG_FD, ?EARLY[0], EARLY_LEN); }
+        if (EARLY_LOST > 0) {
+            atomic.store(?SETTLED, 1);
+            logf("trace: {} bytes from before initialize did not fit and were dropped", EARLY_LOST);
         }
     }
-    ret open_append(LOG_PATH::*u8);
+    EARLY_LEN  = 0;
+    EARLY_LOST = 0;
+    atomic.store(?SETTLED, 1);
+    mutex.unlock(?MU);
 }
 
-fun open_append(path: *u8) usize {
+# move the level, as `$/setTrace` does. it overrides whatever `start` chose,
+# and means nothing before it
+pub fun set_level(level: u8) {
+    if (!settled()) { ret; }
+    mutex.lock(?MU);
+    LEVEL = level;
+    if (LEVEL != LEVEL_OFF && LOG_FD == os.INVALID_HANDLE) { LOG_FD = open_destination(); }
+    mutex.unlock(?MU);
+}
+
+fun open_destination() usize {
+    if (!PATH_CHOSEN) { ret os.stderr(); }
     var h:  usize = os.INVALID_HANDLE;
-    val rc: i64   = os.open(os.working_dir(), path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 420, ?h);
+    val rc: i64   = os.open(os.working_dir(), ?CHOSEN_PATH[0], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 420, ?h);
     if (rc < 0) { ret os.INVALID_HANDLE; }
     ret h;
 }
 
-# evaluate the environment gate once and open the log when it is on
-fun ensure_checked() {
-    if (LOG_CHECKED) { ret; }
-    LOG_CHECKED = true;
-    LOG_ENABLED = trace_enabled();
-    if (LOG_ENABLED) { LOG_FD = trace_open(); }
-}
-
-# apply what a client configured at `initialize`
-#
-# The level is the client's option when it gave one, else the environment's
-# when MLS_TRACE is set, else the LSP `initialize.trace` value, else off: an
-# editor's default `trace: "off"` does not silence a trace the user turned on
-# in the environment, and an explicit option does. A chosen file replaces the
-# environment's and the default. The descriptor already open is left open
-# rather than closed, because another thread may be writing to it, and a closed
-# number can be reused by an unrelated open.
-# ---
-# level:     the `trace` option, or none
-# lsp_level: the LSP `initialize.trace` value, or none
-# file:      the `traceFile` option, or nil
-pub fun start(level: opt[u8], lsp_level: opt[u8], file: str) {
-    ensure_checked();
-    val env_on: bool = LOG_ENABLED;
-    if (file != nil) {
-        val n: usize = str_len(file);
-        if (n < MAX_PATH) {
-            var i: usize = 0;
-            for (i < n) {
-                CHOSEN_PATH[i] = file[i];
-                i              = i + 1;
-            }
-            CHOSEN_PATH[n] = 0;
-            PATH_CHOSEN    = true;
-            LOG_FD         = os.INVALID_HANDLE;
-        }
-    }
-    if (sel level.some)     { set_level(level.some); }
-    or (env_on)             { set_level_keeping(); }
-    or (sel lsp_level.some) { set_level(lsp_level.some); }
-}
-
-# move the level, as `$/setTrace` does. it overrides whatever `start` chose
-pub fun set_level(level: u8) {
-    ensure_checked();
-    LOG_ENABLED    = level != LEVEL_OFF;
-    BODIES_ENABLED = level == LEVEL_BODIES;
-    if (LOG_ENABLED && LOG_FD == os.INVALID_HANDLE) { LOG_FD = trace_open(); }
-}
-
-# keep the environment's level, reopening at a newly chosen file
-fun set_level_keeping() {
-    if (LOG_ENABLED && LOG_FD == os.INVALID_HANDLE) { LOG_FD = trace_open(); }
-}
-
-# append a message to the trace log, best-effort
-#
-# the MLS_TRACE gate and log descriptor are resolved on the first call and
-# reused thereafter; when tracing is disabled this returns with no syscalls.
+# append a message to the trace, best-effort
 # ---
 # msg: null-terminated message to append; nil / empty is a no-op
 pub fun log(msg: str) {
-    ensure_checked();
-
-    if (!LOG_ENABLED)                { ret; }
-    if (LOG_FD == os.INVALID_HANDLE) { ret; }
-    if (msg == nil)                  { ret; }
+    if (msg == nil) { ret; }
     val len: usize = str_len(msg);
     if (len == 0) { ret; }
-
+    if (!settled()) {
+        mutex.lock(?MU);
+        val kept: bool = keep(msg::*u8, len);
+        mutex.unlock(?MU);
+        if (kept) { ret; }
+    }
+    if (!enabled()) { ret; }
     os.write(LOG_FD, msg::*u8, len);
 }
 
-# whether tracing is on, so a caller can skip building a message it would drop
-# ---
-# ret: true when MLS_TRACE is set and the log is open
-pub fun enabled() bool {
-    ensure_checked();
-    ret LOG_ENABLED && LOG_FD != os.INVALID_HANDLE;
+# keep bytes from before `start`, under the lock. false when `start` has run
+# since the caller looked, so the caller writes them instead
+fun keep(p: *u8, len: usize) bool {
+    if (settled()) { ret false; }
+    var n: usize = len;
+    if (n > EARLY_CAP - EARLY_LEN) {
+        EARLY_LOST = EARLY_LOST + (n - (EARLY_CAP - EARLY_LEN));
+        n          = EARLY_CAP - EARLY_LEN;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        EARLY[EARLY_LEN + i] = p[i];
+        i                    = i + 1;
+    }
+    EARLY_LEN = EARLY_LEN + n;
+    ret true;
 }
 
-# whether message bodies may be written to the log
-#
-# Requires tracing to be on as well: the body gate widens what a trace contains,
-# it does not turn one on.
+# whether a line would be recorded, so a caller can skip building one it would
+# drop. before `start` every line is kept, since the trace may turn out on
+pub fun enabled() bool {
+    if (!settled()) { ret true; }
+    ret LEVEL != LEVEL_OFF && LOG_FD != os.INVALID_HANDLE;
+}
+
+# whether message bodies may be written to the trace
 pub fun bodies() bool {
-    if (!enabled()) { ret false; }
-    ret BODIES_ENABLED;
+    if (!settled()) { ret false; }
+    ret enabled() && LEVEL == LEVEL_BODIES;
 }
 
 # record one protocol frame
@@ -272,14 +224,8 @@ pub fun frame(label: str, body: str, len: usize) {
         log("\n");
         ret;
     }
-    write_prefix(body, BODY_CAP);
+    if (body != nil) { os.write(LOG_FD, body::*u8, BODY_CAP); }
     logf(" ... [{} of {} bytes]", BODY_CAP, len);
-}
-
-# append the first `n` bytes of `s` verbatim
-fun write_prefix(s: str, n: usize) {
-    if (LOG_FD == os.INVALID_HANDLE || s == nil) { ret; }
-    os.write(LOG_FD, s::*u8, n);
 }
 
 # monotonic nanoseconds, for span timing
@@ -291,17 +237,36 @@ pub fun now_ns() i64 {
     ret chrono.time_unix_nsec(c.ok);
 }
 
-# writer sink appending straight to the open trace descriptor
+# writer sink appending to the trace destination
 fun trace_sink(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
     os.write(LOG_FD, p, len);
     ret res[usize, writer.WriteError].ok{len};
 }
 
-# append one formatted line to the trace log; a no-op when tracing is off
+# writer sink appending to the early lines; the caller holds the lock
+fun early_sink(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
+    keep(p, len);
+    ret res[usize, writer.WriteError].ok{len};
+}
+
+# append one formatted line to the trace; a no-op when the trace is off
 # ---
 # fmt: std.format hole syntax
 # va:  comptime variadic argument pack
 pub fun logf(fmt: str, va: ...) {
+    if (!settled()) {
+        mutex.lock(?MU);
+        if (!settled()) {
+            var e: writer.Writer;
+            e.ctx     = nil;
+            e.f_write = early_sink;
+            fmtstr.vformat(?e, fmt, va...);
+            keep("\n"::*u8, 1);
+            mutex.unlock(?MU);
+            ret;
+        }
+        mutex.unlock(?MU);
+    }
     if (!enabled()) { ret; }
     var w: writer.Writer;
     w.ctx     = nil;
@@ -309,3 +274,5 @@ pub fun logf(fmt: str, va: ...) {
     fmtstr.vformat(?w, fmt, va...);
     os.write(LOG_FD, "\n"::*u8, 1);
 }
+
+use std.types.result.res;
