@@ -50,6 +50,7 @@ use mls.textedit;
 use mls.tokens;
 use mls.trace;
 use mls.transport;
+use mls.uris;
 use mls.version;
 use mls.workspace;
 use sj: std.data.json;
@@ -1079,7 +1080,7 @@ fun republish_all(srv: *Server) {
 # register/update `uri`'s buffer and publish its diagnostics.
 # `is_open` selects open vs change registration; both end in a publish
 fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) {
-    val path: str = project.path_of_uri(srv.alloc, uri);
+    val path: str = uris.path_of(srv.alloc, uri);
     if (path == nil) { ret; }
     var dr: res[*documents.Document, str];
     if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(settings): a relative `traceFile` is resolved against the workspace
+  root, the first of `workspaceFolders`, else `rootUri` (#287). With neither it
+  is ignored with a note, as before.
+
 ### Fixed
 - fix(rename): a rename that would break the project, or change what it means,
   is refused with `RequestFailed` rather than returned as edits (#286). Each
@@ -22,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load takes longer than the deadline (#284). The deadline now bounds the time
   the worker spends on any one message while a request waits for it. A project
   load, and a request held for a rebuild, do not count against it. The worker
-  tells the supervisor when it takes up a message, loads, or holds a request. Responses the client sends to the server's own
-  requests, such as progress token creation, are no longer taken for requests.
+  tells the supervisor when it takes up a message, loads, or holds a request.
+  Responses the client sends to the server's own requests, such as progress
+  token creation, are no longer taken for requests.
   That mistake left a request marked outstanding that no reply would ever
   close, so every replacement worker was ended within a fraction of a second
   until the server exited. When the worker dies, every request it still owed is
@@ -34,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trace` option turned tracing off or `traceFile` named another file. Those
   lines are now held in memory, without bodies. They are written to the chosen
   destination, or dropped when tracing is off.
+- docs: the README names the pinned mach as v5.4.0, and says the worker's
+  memory figures are resident plus swap, with the scenario each one measures
+  (#287).
 - fix(trace): with no file configured, the trace goes to stderr rather than the
   shared `/tmp/mach-lsp.log` (#285).
 - fix(settings): `MLS_TRACE=off` turns tracing off instead of on. An unusable
