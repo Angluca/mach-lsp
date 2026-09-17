@@ -313,6 +313,7 @@ fun trace_method(srv: *Server, root: *sj.Value) {
 # The parse arena and every compiler-owned structure belong to this thread.
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
+    sideband.next(srv.alloc);
 
     # a message boundary is the only place a rebuilt snapshot may be swapped in,
     # because it is the only place no request holds a pointer into the outgoing
@@ -460,6 +461,7 @@ fun wake_analysis(ctx: ptr) {
 # editor, so the swap and its republish cannot wait for the next keystroke.
 fun handle_signal(ctx: ptr) {
     val srv: *Server = ctx::*Server;
+    sideband.next(srv.alloc);
     collect_rebuilds(srv);
 }
 

@@ -8,11 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- fix(rename): a rename that would break the project, or change what it means,
+  is refused with `RequestFailed` rather than returned as edits (#286). Each
+  file the rename touches is parsed again and must produce the same tree. That
+  refuses names that are not identifiers, and names the grammar reads
+  differently where they would stand, while contextual keywords the grammar
+  accepts in every such place stay renameable. A new name already bound in a
+  touched module, a built-in type, or a local in a top-level declaration the
+  rename touches is refused too, as is a field name the record already has.
+  Renaming a dependency's symbol is now an error, from rename and from
+  prepareRename, rather than an empty edit or null.
 - fix(supervisor): `requestDeadlineMs` no longer ends the server when a project
-  load takes longer than the deadline (#284). The deadline now bounds only the
-  time the worker spends handling a request. A project load, and a request held
-  for a rebuild, do not count against it, and the worker tells the supervisor
-  when either is happening. Responses the client sends to the server's own
+  load takes longer than the deadline (#284). The deadline now bounds the time
+  the worker spends on any one message while a request waits for it. A project
+  load, and a request held for a rebuild, do not count against it. The worker
+  tells the supervisor when it takes up a message, loads, or holds a request. Responses the client sends to the server's own
   requests, such as progress token creation, are no longer taken for requests.
   That mistake left a request marked outstanding that no reply would ever
   close, so every replacement worker was ended within a fraction of a second

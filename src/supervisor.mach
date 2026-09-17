@@ -355,10 +355,10 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
 
 # end a worker that has stopped answering, and bound shutdown
 #
-# The request deadline bounds how long the worker may spend handling a request.
-# Its clock runs only while it is: not while the worker loads a project, and not
-# for a request it holds for a build (`sideband`). It starts when a request
-# arrives at an idle worker, or when the worker last finished something.
+# The request deadline bounds how long the worker may spend on one message while
+# a request waits for it. The clock restarts whenever the worker takes up its
+# next message or answers one, and stops while it loads a project or when every
+# waiting request is held for a build (`sideband`).
 #
 # A compiler stuck in non-cooperative code cannot read a cancellation frame, so
 # there is nothing to ask: the only way to get the session back is to end the
@@ -562,7 +562,12 @@ fun note_sideband(r: *Relay, root: *sj.Value) bool {
     if (method == nil) { ret false; }
     val ours:   bool      = sideband.owns(method);
     val params: *sj.Value = json.member(root, "params");
-    if (str_equals(method, sideband.LOADING)) {
+    if (str_equals(method, sideband.NEXT)) {
+        mutex.lock(?r.reqs_mu);
+        r.progress_at = now_ns();
+        mutex.unlock(?r.reqs_mu);
+    }
+    or (str_equals(method, sideband.LOADING)) {
         val on: bool = json.boolean(json.member(params, "loading"), false);
         mutex.lock(?r.reqs_mu);
         r.loading = on;

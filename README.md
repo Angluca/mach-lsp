@@ -69,7 +69,15 @@ when it has any, and otherwise the snapshot's semantic diagnostics that avoid
 the edits.
 
 Cross-module references and rename walk the retained graph. Rename is restricted
-to project-owned declarations, so vendored dependency sources remain read-only.
+to project-owned declarations, so vendored dependency sources remain read-only,
+and renaming a dependency's symbol is refused with `RequestFailed`. A rename is
+also refused when its result would not mean what the code meant before: a new
+name that is not a mach identifier, one the grammar would read as something
+else where it is written (a call statement renamed to `ret`), or one already
+bound where the symbol is declared or used. That last check is conservative:
+a local of the new name anywhere in a top-level declaration the rename touches
+refuses it, because mach does not expose its scopes. A field cannot be renamed
+to the name of another field of its record.
 Completion offers, by prefix, every name the document's resolve table binds,
 whether or not it is in scope at the cursor. After a `.` it offers a module
 alias's public symbols, or the fields of the record or union the receiver has.
@@ -196,11 +204,10 @@ newer server still gets a working one. `workspace/didChangeConfiguration` is
 ignored.
 
 `requestDeadlineMs` is a tuning knob. It bounds how long the analysis worker may
-spend handling one request before the server answers it with `ServerCancelled`
-and replaces the worker. Loading a project does not count against it, and
-neither does a request waiting for a rebuild. A request that arrives while the
-worker is busy starts its clock when the worker gets to it. Its default is not
-part of the interface and may change.
+spend on any one message while a request waits for it. Past it, the server
+answers every waiting request with `ServerCancelled` and replaces the worker.
+Loading a project does not count against it, and neither does a request held
+for a rebuild. Its default is not part of the interface and may change.
 
 ## Tracing
 
