@@ -167,6 +167,16 @@ class LspSession:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
 
+    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a request and return its response, error or not."""
+        request_id = self.next_id
+        self.next_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        self._send(message)
+        return self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
+
     def request_after_notifications(
         self,
         notifications: list[tuple[str, dict[str, Any]]],
@@ -932,13 +942,13 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             )
             require("i64" in json.dumps(vendor_hover.get("result")),
                     f"vendored overlay did not participate in sema: {vendor_hover!r}")
-            vendor_rename = session.request(
+            vendor_rename = session.call(
                 "textDocument/rename",
                 {"textDocument": {"uri": vendor_main.as_uri()},
                  "position": {"line": vendor_line, "character": vendor_char}, "newName": "changed"},
             )
-            changes = vendor_rename.get("result", {}).get("changes")
-            require(changes == {}, f"vendored dependency rename was writable: {vendor_rename!r}")
+            require((vendor_rename.get("error") or {}).get("code") == -32803,
+                    f"vendored dependency rename was not refused: {vendor_rename!r}")
             session.notify("textDocument/didClose", {"textDocument": {"uri": vendor_main.as_uri()}})
             session.notify("textDocument/didClose", {"textDocument": {"uri": vendor_dep.as_uri()}})
 
@@ -1811,14 +1821,23 @@ def worker_pid(session: "LspSession") -> int:
     raise AssertionError("no analysis worker")
 
 
-def slow_project(parent: Path, project_id: str, value: int) -> tuple[Path, str]:
-    """A project whose cold load lasts long enough to stop the worker inside it."""
+class SlowProject(NamedTuple):
+    main: Path
+    text: str
+
+
+def slow_project(parent: Path, project_id: str, value: int) -> SlowProject:
+    """A project whose load, and whose first rebuild, last long enough to stop
+    the worker inside them. The bulk is in its own module, so the entry module,
+    and every message about it, stays small."""
     main, _, text = write_project(parent, project_id, value)
-    bulk = "".join(f"pub fun bulk_{i}(a: i32, b: i32) i32 {{ ret a + b + {i}; }}\n"
-                   for i in range(20000))
-    body = text + bulk
-    main.write_text(body, encoding="utf-8")
-    return main, body
+    bulk = main.parent / "bulk.mach"
+    bulk_text = "".join(f"pub fun bulk_{i}(a: i32, b: i32) i32 {{ ret a + b + {i}; }}\n"
+                        for i in range(20000))
+    bulk.write_text(bulk_text, encoding="utf-8")
+    text = f"use {project_id}.bulk;\n" + text
+    main.write_text(text, encoding="utf-8")
+    return SlowProject(main, text)
 
 
 def run_deadline_spares_load(server: Path, timeout: float) -> None:
@@ -1842,7 +1861,8 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
         return
     with tempfile.TemporaryDirectory(prefix="mls-deadload-") as directory:
         root = Path(directory).resolve()
-        main, body = slow_project(root, "deadload", 3)
+        slow = slow_project(root, "deadload", 3)
+        main, body = slow.main, slow.text
         session = LspSession(server, root, timeout, answer_progress=True)
         stopped = None
         finished = False
@@ -1863,12 +1883,13 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             stopped = worker
             token = begin["params"]["token"]
 
-            line = next(i for i, l in enumerate(body.split("\n")) if l.startswith("pub fun bulk_7("))
+            line = next(i for i, l in enumerate(body.split("\n")) if "ret take[i32](b)" in l)
+            column = body.split("\n")[line].index("take") + 1
             waiting = session.next_id
             session.next_id += 1
             session._send({"jsonrpc": "2.0", "id": waiting, "method": "textDocument/hover",
                            "params": {"textDocument": {"uri": main.as_uri()},
-                                      "position": {"line": line, "character": 8}}})
+                                      "position": {"line": line, "character": column}}})
             session.assert_no_message(
                 lambda item: (item.get("id") == waiting
                               or item.get("method") == "window/showMessage"
@@ -1897,15 +1918,15 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             require(worker_pid(session) == worker, "the worker was replaced during its load")
 
             # a rename held for the rebuild an edit starts waits past the deadline
-            # too, and is answered from the rebuilt snapshot
-            edited = body + "\n# edited\n"
+            # too, and is answered from the rebuilt snapshot. the first rebuild
+            # goes into a cold session, so it is as long as the load
             session.notify("textDocument/didChange", {
                 "textDocument": {"uri": main.as_uri(), "version": 2},
-                "contentChanges": [{"text": edited}]})
+                "contentChanges": [{"text": body + "\n# edited\n"}]})
             started = time.monotonic()
             renamed = session.request("textDocument/rename", {
                 "textDocument": {"uri": main.as_uri()},
-                "position": {"line": line, "character": 8}, "newName": "bulk_seven"})
+                "position": {"line": line, "character": column}, "newName": "take_all"})
             held_for = time.monotonic() - started
             edits = (renamed.get("result") or {}).get("changes") or {}
             require(edits, f"a rename held past the deadline was not answered with edits: {renamed!r}")
@@ -1923,7 +1944,7 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             require((ended.get("error") or {}).get("code") == -32802,
                     f"a wedged request was not ended by the deadline: {ended!r}")
             hover = session.request("textDocument/hover", {
-                "textDocument": {"uri": main.as_uri()}, "position": {"line": line, "character": 8}})
+                "textDocument": {"uri": main.as_uri()}, "position": {"line": line, "character": column}})
             require(hover.get("result"), f"the replacement did not serve after reloading: {hover!r}")
             notes = [m for m in session.pending if m.get("method") == "window/showMessage"]
             require(len(notes) == 1 and notes[0]["params"]["type"] == 2,
@@ -2312,6 +2333,127 @@ pub fun aliased(n: i32) i32 {
     ret h(n);
 }
 """
+
+
+def apply_workspace_edit(changes: dict[str, list[dict[str, Any]]]) -> None:
+    """Write a WorkspaceEdit's `changes` to disk. Positions are UTF-16, and the
+    fixtures are ASCII, so a column is a character index."""
+    for uri, edits in changes.items():
+        path = Path(uri_file(uri))
+        lines = path.read_text(encoding="utf-8").split("\n")
+        for e in sorted(edits, key=lambda e: (e["range"]["start"]["line"], e["range"]["start"]["character"]),
+                        reverse=True):
+            start, end = e["range"]["start"], e["range"]["end"]
+            require(start["line"] == end["line"], f"a rename edit spans lines: {e!r}")
+            line = lines[start["line"]]
+            lines[start["line"]] = line[:start["character"]] + e["newText"] + line[end["character"]:]
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_rename_validation(server: Path, timeout: float) -> None:
+    """A rename is refused when it would break the project or change what it means (#286).
+
+    The property is checked end to end: every rename the server answers with
+    edits is applied to a copy of the project, and the compiler must accept the
+    result. The names that must be refused are refused with RequestFailed:
+    names that are not identifiers, a word the grammar reads as something else
+    where it would stand, and a name already bound where the symbol is declared
+    or used, whether a module-level name, a built-in type or a local. A
+    contextual keyword the grammar accepts in every place the rename writes it
+    is allowed, and compiles. A field cannot take the name of another field of
+    its record.
+    """
+    compiler = os.environ.get("MACH_COMPILER") or shutil.which("mach")
+    with tempfile.TemporaryDirectory(prefix="mls-renames-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        # a call standing as a statement, where `if` and `ret` read as keywords
+        (main.parent / "stmt.mach").write_text(
+            "use nav.defs.helper;\n\npub fun twice(n: i32) i32 {\n    helper(n);\n    ret helper(n);\n}\n",
+            encoding="utf-8")
+        text = "use nav.stmt;\n" + text
+        main.write_text(text, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+
+            def rename(position: dict[str, Any], new_name: str) -> dict[str, Any]:
+                return session.call("textDocument/rename", {
+                    "textDocument": {"uri": main.as_uri()}, "position": position, "newName": new_name})
+
+            def compiles_after(changes: dict[str, list[dict[str, Any]]]) -> str | None:
+                if compiler is None:
+                    return None
+                copy = Path(directory) / "copy"
+                if copy.exists():
+                    shutil.rmtree(copy)
+                shutil.copytree(root / "nav", copy)
+                moved = {uri.replace((root / "nav").as_uri(), copy.as_uri(), 1): e for uri, e in changes.items()}
+                apply_workspace_edit(moved)
+                done = subprocess.run([compiler, "check", str(copy)], capture_output=True, text=True, timeout=timeout)
+                return None if done.returncode == 0 else (done.stdout + done.stderr)[:600]
+
+            at_call = nav_position(text, "ret helper(n) + helper(n + 1);", "helper")
+            at_param = nav_position(text, "pub fun local(n: i32) i32 {", "(n")
+            at_c = nav_position(text, "val c: Color = make();", "c")
+            refused = {
+                (json.dumps(at_call), ""): "is not a mach identifier",
+                (json.dumps(at_call), "has space"): "is not a mach identifier",
+                (json.dumps(at_call), "x.y"): "is not a mach identifier",
+                (json.dumps(at_call), "1bad"): "is not a mach identifier",
+                (json.dumps(at_call), "if"): "would change what the code means where it is written (stmt.mach)",
+                (json.dumps(at_call), "ret"): "would change what the code means where it is written (stmt.mach)",
+                (json.dumps(at_call), "local"): "is already bound in this module",
+                (json.dumps(at_call), "Box"): "is already bound in this module",
+                (json.dumps(at_call), "i32"): "names a built-in type",
+                (json.dumps(at_call), "n"): "is already bound in a declaration the rename touches",
+                (json.dumps(at_param), "helper"): "is already bound in this module",
+                (json.dumps(at_c), "n"): "is already bound in a declaration the rename touches",
+                (json.dumps(at_c), "b"): "is already bound in a declaration the rename touches",
+            }
+            for (where, new_name), why in refused.items():
+                answer = rename(json.loads(where), new_name)
+                error = answer.get("error") or {}
+                require(error.get("code") == -32803 and why in error.get("message", ""),
+                        f"rename to {new_name!r} was not refused with {why!r}: {answer!r}")
+
+            # allowed: a fresh name, and contextual keywords wherever the grammar
+            # takes them. whatever is allowed must compile
+            for where, new_name in ((at_call, "assist"), (at_call, "fun"),
+                                    (at_param, "count"), (at_param, "ret"), (at_c, "shade")):
+                answer = rename(where, new_name)
+                if "error" in answer:
+                    require(new_name in ("ret", "fun") and answer["error"].get("code") == -32803,
+                            f"rename to {new_name!r} was refused: {answer!r}")
+                    continue
+                changes = (answer.get("result") or {}).get("changes") or {}
+                require(changes, f"rename to {new_name!r} produced no edits: {answer!r}")
+                broken = compiles_after(changes)
+                require(broken is None, f"rename to {new_name!r} was allowed but breaks the project: {broken}")
+
+            # a field cannot take another field's name
+            at_field = nav_position(text, "val n: i32   = b.v + b.inner.w;", ".v")
+            answer = rename(at_field, "inner")
+            require((answer.get("error") or {}).get("code") == -32803
+                    and "already a field" in answer["error"].get("message", ""),
+                    f"a field rename onto another field was not refused: {answer!r}")
+            answer = rename(at_field, "value")
+            changes = (answer.get("result") or {}).get("changes") or {}
+            require(changes, f"a field rename produced no edits: {answer!r}")
+            broken = compiles_after(changes)
+            require(broken is None, f"a field rename was allowed but breaks the project: {broken}")
+            if compiler is None:
+                print("  rename validation: compile check skipped (no mach compiler)")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_cross_module_references(server: Path, timeout: float) -> None:
@@ -4815,7 +4957,8 @@ def run_progress_reporting(server: Path, timeout: float) -> None:
         # how loaded the machine is, and so does the time to end the worker, so
         # this does not get tighter under CI contention. a load is never ended by
         # the request deadline (#284), so the worker is killed outright
-        main, body = slow_project(root, "progorphan", 5)
+        slow = slow_project(root, "progorphan", 5)
+        main, body = slow.main, slow.text
         session = LspSession(server, root, timeout)
         try:
             session.request(
@@ -5036,6 +5179,7 @@ def main() -> int:
         run_option_deadline(server, args.timeout)
         run_deadline_spares_load(server, args.timeout)
         run_cross_module_references(server, args.timeout)
+        run_rename_validation(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)

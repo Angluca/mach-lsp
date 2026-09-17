@@ -58,6 +58,7 @@ use mls.analysis;
 use mls.documents;
 use mls.features;
 use mls.json;
+use mls.names;
 use mls.positions;
 use mls.project;
 use mls.render;
@@ -1376,7 +1377,11 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyz
     val t: FieldTarget = to.some;
 
     if (!field_record_renameable(ws, an.root, t)) {
-        render.reply_empty_edit(alloc, id_raw);
+        render.reply_error(alloc, id_raw, render.REQUEST_FAILED, DEPENDENCY_REFUSAL);
+        ret true;
+    }
+    if (record_has_field(t.rs, new_name)) {
+        refuse_rename(alloc, id_raw, "is already a field of this record", new_name, nil);
         ret true;
     }
 
@@ -1393,7 +1398,9 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyz
         ret true;
     }
 
-    emit_field_rename(ws, an.root, alloc, id_raw, refs, n, t, new_name);
+    if (field_rename_keeps_meaning(ws, an.root, alloc, refs, n, t, new_name, id_raw)) {
+        emit_field_rename(ws, an.root, alloc, id_raw, refs, n, t, new_name);
+    }
     free_field_refs(ws, refs, n);
     deallocate[FieldXRef](alloc, refs, cap);
     ret true;
@@ -1710,7 +1717,12 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 
     val new_name: str = json.text(json.member(params, "newName"), alloc);
     if (new_name == nil) {
-        render.reply_null(alloc, id_raw);
+        render.reply_error(alloc, id_raw, render.REQUEST_FAILED, "the new name is missing");
+        ret;
+    }
+    if (!names.identifier(alloc, new_name)) {
+        refuse_rename(alloc, id_raw, "is not a mach identifier", new_name, nil);
+        json.free_str(new_name, alloc);
         ret;
     }
 
@@ -1745,7 +1757,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     }
     val sym: *rslv.Symbol = so.some;
     if (!renameable(ws, an.root, sym)) {
-        render.reply_empty_edit(alloc, id_raw);
+        render.reply_error(alloc, id_raw, render.REQUEST_FAILED, DEPENDENCY_REFUSAL);
         json.free_str(new_name, alloc);
         ret;
     }
@@ -1783,6 +1795,12 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var set: RefSet = empty_refs();
     if (!build_refs(ws, alloc, an, uri, sym, sr.sym_id, true, ?set)) {
         render.reply_empty_edit(alloc, id_raw);
+        json.free_str(new_name, alloc);
+        ret;
+    }
+    if (!rename_keeps_meaning(alloc, an.interner, decl_sym, set.items, set.len, name, new_name,
+        bind, has_bind, doc, has_doc, id_raw)) {
+        free_refs(ws, alloc, ?set);
         json.free_str(new_name, alloc);
         ret;
     }
@@ -1852,7 +1870,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
         ret;
     }
     if (!renameable(ws, an.root, so.some)) {
-        render.reply_null(alloc, id_raw);
+        render.reply_error(alloc, id_raw, render.REQUEST_FAILED, DEPENDENCY_REFUSAL);
         ret;
     }
 
@@ -2233,12 +2251,14 @@ rec WalkSink {
     new_text: str;
     guard:    str;
     unmapped: bool;
+    spans:    *names.Spans;
 }
 
 # what shape one walked span is emitted as
 val SINK_LOCATION:  u8 = 0;
 val SINK_TEXT_EDIT: u8 = 1;
 val SINK_HIGHLIGHT: u8 = 2;
+val SINK_COLLECT:   u8 = 3;
 
 # a sink appending into `b`
 #
@@ -2263,6 +2283,14 @@ fun sink_init_mode(b: *json.Buf, alloc: *Allocator, mode: u8, new_text: str, gua
     k.new_text = new_text;
     k.guard    = guard;
     k.unmapped = false;
+    k.spans    = nil;
+    ret k;
+}
+
+# a sink recording the snapshot spans a walk visits, into `spans`
+fun sink_collect(spans: *names.Spans, alloc: *Allocator, guard: str) WalkSink {
+    var k: WalkSink = sink_init_mode(nil, alloc, SINK_COLLECT, nil, guard);
+    k.spans = spans;
     ret k;
 }
 
@@ -2280,6 +2308,11 @@ fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSi
 # the client's buffer is not written; the sink records it, because an edit set
 # with a hole in it must not be offered at all.
 fun sink_emit(k: *WalkSink, text: positions.Text, uri: str, span: token.Span) {
+    if (k.mode == SINK_COLLECT) {
+        if (!names.spans_push(k.spans, span)) { k.unmapped = true; }
+        k.count = k.count + 1;
+        ret;
+    }
     if (!positions.maps(text, span)) {
         k.unmapped = true;
         ret;
@@ -2408,6 +2441,176 @@ fun push_rename_group(b: *json.Buf, s: *XRef, include_bind: bool, bind: token.Sp
 
     json.buf_push_byte(b, ']');
     ret true;
+}
+
+# what a rename refuses with when the symbol belongs to a dependency
+val DEPENDENCY_REFUSAL: str = "this is declared in a dependency, which is not the editor's to rename";
+
+# answer a rename with RequestFailed, saying `new_name` and why, and where when
+# `file` names it
+fun refuse_rename(alloc: *Allocator, id_raw: str, why: str, new_name: str, file: str) {
+    var m: json.Buf = json.buf_init(alloc);
+    json.buf_push(?m, "`");
+    json.buf_push(?m, new_name);
+    json.buf_push(?m, "` ");
+    json.buf_push(?m, why);
+    if (file != nil) {
+        json.buf_push(?m, " (");
+        json.buf_push(?m, file_label(file));
+        json.buf_push(?m, ")");
+    }
+    render.reply_error(alloc, id_raw, render.REQUEST_FAILED, json.buf_str(?m));
+    json.buf_dnit(?m);
+}
+
+# the last path segment of a URI, for a message
+fun file_label(uri: str) str {
+    val n:    usize = str_len(uri);
+    var last: usize = 0;
+    var i:    usize = 0;
+    for (i < n) {
+        if (uri[i] == '/') { last = i + 1; }
+        i = i + 1;
+    }
+    ret (?uri[last])::str;
+}
+
+# whether renaming `target` to `new_name` across `refs` leaves every file
+# meaning what it did (#286); answers the request with the reason when not
+#
+# Each file's edits are collected by the same walk that writes them, applied to
+# the snapshot text, and parsed again (`names.shape`). Then the file's own
+# symbols are checked for the new name: a module-level binding or built-in type
+# of that name would take the renamed references, and so would a local declared
+# in any top-level declaration a rename site sits in. That last rule is wider
+# than the scopes involved, because the resolver does not expose its scopes.
+fun rename_keeps_meaning(alloc: *Allocator, itn: *intern.Interner, target: *rslv.Symbol, refs: *XRef, nref: usize,
+    name: str, new_name: str, bind: token.Span, has_bind: bool, doc: token.Span, has_doc: bool, id_raw: str) bool {
+    var spans: names.Spans = names.spans_init(alloc);
+    fin { names.spans_dnit(?spans); }
+    var i: usize = 0;
+    for (i < nref) {
+        val s: *XRef = ?refs[i];
+        names.spans_clear(?spans);
+        var k: WalkSink = sink_collect(?spans, alloc, name);
+        walk_refs(s, i == 0 && has_bind, bind, i == 0 && has_doc, doc, ?k);
+        if (k.unmapped) {
+            render.reply_error(alloc, id_raw, render.REQUEST_FAILED, "the rename could not be checked");
+            ret false;
+        }
+        if (spans.len > 0) {
+            if (!file_keeps_shape(alloc, s.text.file.text, ?spans, new_name, s.uri, id_raw)) { ret false; }
+            val why: str = symbol_clash(itn, s, target, ?spans, new_name);
+            if (why != nil) {
+                refuse_rename(alloc, id_raw, why, new_name, s.uri);
+                ret false;
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the field version of `rename_keeps_meaning`: a field name is only bound in its
+# record, which the caller checked, so what remains is how each file parses
+fun field_rename_keeps_meaning(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, refs: *FieldXRef, nref: usize,
+    t: FieldTarget, new_name: str, id_raw: str) bool {
+    val ti:    *type.TypeInterner = project.type_interner(ws, root);
+    var spans: names.Spans        = names.spans_init(alloc);
+    fin { names.spans_dnit(?spans); }
+    var i: usize = 0;
+    for (i < nref) {
+        names.spans_clear(?spans);
+        var k: WalkSink = sink_collect(?spans, alloc, nil);
+        walk_field_sites(?refs[i], ti, t, true, ?k);
+        if (k.unmapped) {
+            render.reply_error(alloc, id_raw, render.REQUEST_FAILED, "the rename could not be checked");
+            ret false;
+        }
+        if (spans.len > 0 && !file_keeps_shape(alloc, refs[i].text.file.text, ?spans, new_name, refs[i].uri, id_raw)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `text` with `spans` renamed parses as it did; answers the request when not
+fun file_keeps_shape(alloc: *Allocator, text: str, spans: *names.Spans, new_name: str, uri: str, id_raw: str) bool {
+    val edited: str = names.apply(alloc, text, spans, new_name);
+    if (edited == nil) {
+        render.reply_error(alloc, id_raw, render.REQUEST_FAILED, "the rename could not be checked");
+        ret false;
+    }
+    val shape: u8 = names.shape(alloc, text, edited);
+    names.applied_free(alloc, edited);
+    if (shape == names.SHAPE_CHANGED) {
+        refuse_rename(alloc, id_raw, "would change what the code means where it is written", new_name, uri);
+        ret false;
+    }
+    if (shape == names.SHAPE_UNCHECKED) {
+        refuse_rename(alloc, id_raw, "cannot be checked, because the file does not parse", new_name, uri);
+        ret false;
+    }
+    ret true;
+}
+
+# why the new name clashes with a binding in `s`'s module, or nil
+fun symbol_clash(itn: *intern.Interner, s: *XRef, target: *rslv.Symbol, spans: *names.Spans, new_name: str) str {
+    var si: u32 = 0;
+    for (si < s.rr.symbol_count) {
+        val sid: rslv.SymbolId = si::rslv.SymbolId;
+        val sym: *rslv.Symbol  = ?s.rr.symbols[si];
+        si = si + 1;
+        if (sid == s.target)                                                                           { cnt; }
+        if (features.symbol_denotes(s.rr, sid, target.origin, target.decl, target.canon, target.kind)) { cnt; }
+        val no: opt[str] = intern.lookup(itn, sym.name);
+        if (sel no.none)                    { cnt; }
+        if (!str_equals(no.some, new_name)) { cnt; }
+
+        if (sym.kind == rslv.SYM_PRIM || sym.kind == rslv.SYM_VECTOR) { ret "names a built-in type"; }
+        if ((sym.flags & rslv.SYM_FLAG_MODULE) != 0 || sym.kind == rslv.SYM_USE || sym.kind == rslv.SYM_IMPORTED) {
+            ret "is already bound in this module";
+        }
+        if (shares_declaration(s.a, sym, spans)) { ret "is already bound in a declaration the rename touches"; }
+    }
+    ret nil;
+}
+
+# whether local `sym` is declared inside a top-level declaration that also
+# holds one of `spans`. a local whose declaration cannot be found is assumed to
+fun shares_declaration(a: *ast.Ast, sym: *rslv.Symbol, spans: *names.Spans) bool {
+    val so: opt[token.Span] = features.decl_span_of(a, sym);
+    if (sel so.none) { ret true; }
+    val at: usize = so.some.offset;
+    val n:  u32   = features.top_level_count(a);
+    var i:  u32   = 0;
+    for (i < n) {
+        val d_o: opt[*decl.Decl] = ast.get_decl(a, features.top_level_decl(a, i));
+        i = i + 1;
+        if (sel d_o.none) { cnt; }
+        val outer: token.Span = d_o.some.span;
+        if (at < outer.offset || at >= outer.offset + outer.len) { cnt; }
+        var j: usize = 0;
+        for (j < spans.len) {
+            val sp: token.Span = spans.items[j];
+            if (sp.offset >= outer.offset && sp.offset < outer.offset + outer.len) { ret true; }
+            j = j + 1;
+        }
+        ret false;
+    }
+    ret true;
+}
+
+# whether the record already has a field spelled `name`
+fun record_has_field(rs: project.RecordSite, name: str) bool {
+    var i: u32 = 0;
+    for (i < rs.fields_len) {
+        val f: token.Span = (?rs.a.typed_names[rs.fields_start + i]).name;
+        if (features.span_text_equals(rs.text.file, f, name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # send a DocumentSymbol[] of the file's top-level decls.
