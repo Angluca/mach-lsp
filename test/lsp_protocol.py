@@ -2089,16 +2089,27 @@ def run_document_symbol_kinds(server: Path, timeout: float) -> None:
             require(isinstance(symbols, list) and symbols,
                     f"documentSymbol returned nothing: {symbols!r}")
             kinds = {entry["name"]: entry["kind"] for entry in symbols}
-            expected = {"R": 23, "U": 10, "D": 26, "V": 14, "W": 13, "f": 12}
+            expected = {"R": 23, "U": 10, "T": 10, "D": 26, "V": 14, "W": 13, "f": 12}
             for name, kind in expected.items():
                 require(kinds.get(name) == kind,
                         f"{name} is SymbolKind {kinds.get(name)!r}, expected {kind}")
 
-            # `tag` has no arm in `features.decl_name_span`, so it never reaches
-            # the outline at all - #249. Asserted rather than described: fixing
-            # that issue turns this red, which is the prompt to add "T": 10 above.
-            require("T" not in kinds,
-                    "a tag now reaches documentSymbol - #249 is fixed, so assert its kind")
+            # a tag's cases are its members (#249)
+            tag = next(entry for entry in symbols if entry["name"] == "T")
+            cases = [(child["name"], child["kind"]) for child in tag.get("children", [])]
+            require(cases == [("one", 22), ("two", 22)],
+                    f"the tag's cases are not its enum members: {cases!r}")
+
+            # definition on a tag's own name lands on that name
+            lines = KIND_BUFFER.splitlines()
+            tag_line = next(i for i, value in enumerate(lines) if value.startswith("pub tag T"))
+            column = lines[tag_line].index("T:")
+            found = session.request("textDocument/definition", {
+                "textDocument": {"uri": buffer.as_uri()},
+                "position": {"line": tag_line, "character": column}})["result"]
+            require(isinstance(found, dict) and found.get("range", {}).get("start")
+                    == {"line": tag_line, "character": column},
+                    f"definition on a tag's name did not land on it: {found!r}")
 
             session.finish()
             finished = True

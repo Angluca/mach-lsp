@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- fix(features): `tag` declarations have a name span (#249). The outline
+  listed no tag, and definition, references, rename and highlight could not
+  start from a tag's name. The outline also lists a tag's cases as enum members,
+  with a payload type as the detail.
+
 ## [0.19.0] - 2026-09-16
 
 Navigation, answers while the project rebuilds, off-thread rebuilds, and the
