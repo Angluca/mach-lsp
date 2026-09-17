@@ -6,8 +6,11 @@ editor APIs.
 
 ## Status
 
-mach-lsp implements lifecycle, full-text synchronization, diagnostics, hover,
-definition, references, rename/prepareRename, document symbols, and completion.
+mach-lsp implements lifecycle, incremental text synchronization, diagnostics
+(including a project's own, on its `mach.toml`), hover, definition, type
+definition, references, rename and prepareRename, document highlight, document
+symbols, workspace symbols, call hierarchy, semantic tokens, inlay hints,
+signature help, quick-fix code actions, and completion.
 
 Project documents are analyzed by the compiler's retained frontend API. Each
 manifest root owns a stable long-lived compiler Session and one current Project
@@ -67,8 +70,9 @@ the edits.
 
 Cross-module references and rename walk the retained graph. Rename is restricted
 to project-owned declarations, so vendored dependency sources remain read-only.
-Completion is currently a flat list of module names, import aliases, and primitive
-types rather than a lexical scope view.
+Completion offers, by prefix, every name the document's resolve table binds,
+whether or not it is in scope at the cursor. After a `.` it offers a module
+alias's public symbols, or the fields of the record or union the receiver has.
 
 The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols do not pay that cost; moving semantic work
@@ -276,7 +280,7 @@ server. The changelog names the mach release each mls release links.
 
 ## Deferred
 
-- workspace symbol search;
-- scope-aware completion (member access after `.`, lexically scoped locals)
-  — the resolver's scope chain is internal to the resolve pass and not
-  exposed by the side tables.
+- scope-aware completion (only the names in scope at the cursor): the
+  resolver's scope chain is internal to the resolve pass and not exposed by
+  its side tables;
+- `utf-8` position encoding (#269).
