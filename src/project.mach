@@ -67,6 +67,7 @@ use mls.json;
 use mls.notes;
 use mls.positions;
 use mls.progress;
+use mls.sideband;
 use mls.textdiff;
 use mls.trace;
 use mls.transport;
@@ -1103,9 +1104,14 @@ fun try_load(w: *Workspace, r: *Root) bool {
     val started_ns: i64 = trace.now_ns();
     fin { trace.logf("project: analyzed {} in {}ms", r.path, (trace.now_ns() - started_ns) / 1000000); }
 
+    # the requests waiting behind this load are not stuck, and the supervisor
+    # cannot tell that from outside. the end is declared after the report's
+    # close so it is sent before it: once the report ends, the load has
+    sideband.loading(w.alloc, true);
     var token: str = nil;
     if (!r.analyzed_once) { token = progress.start(w.alloc, "mach: analyzing project"); }
     fin { progress.finish(w.alloc, token, nil); }
+    fin { sideband.loading(w.alloc, false); }
 
     r.dirty = false;
     val in: *BuildInput = capture_input(w, r);

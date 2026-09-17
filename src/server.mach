@@ -44,6 +44,7 @@ use mls.progress;
 use mls.project;
 use mls.render;
 use mls.settings;
+use mls.sideband;
 use mls.signature;
 use mls.textedit;
 use mls.tokens;
@@ -369,7 +370,10 @@ fun release_held(srv: *Server) {
     var i:     usize        = 0;
     for (i < batch.len) {
         val e: *parked.Entry = ?batch.items[i];
-        if (jobs.cancel_has(?srv.cancels, e.id) || !still_waiting(srv, e)) { redispatch(srv, e); }
+        if (jobs.cancel_has(?srv.cancels, e.id) || !still_waiting(srv, e)) {
+            sideband.held(srv.alloc, e.id, false);
+            redispatch(srv, e);
+        }
         or {
             if (!parked.push(?srv.held, e.body, e.len, e.uri, e.id)) {
                 send_error_token(srv, e.id, render.CONTENT_MODIFIED, "the request could not be held");
@@ -901,6 +905,8 @@ fun hold(srv: *Server, id: *sj.Value, uri: str, d: *documents.Document) bool {
     val token: str = json.id_text(id, srv.alloc);
     if (token == nil) { ret false; }
     val held: bool = parked.push(?srv.held, srv.body, srv.body_len, uri, token);
+    # a held request is waiting for a build, which the deadline does not bound
+    if (held) { sideband.held(srv.alloc, token, true); }
     json.free_str(token, srv.alloc);
     if (!held) { ret false; }
     project.catch_up(?srv.ws, d);

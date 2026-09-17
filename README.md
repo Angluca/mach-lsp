@@ -192,9 +192,12 @@ in the trace. Configuration never fails `initialize`, so a client written for a
 newer server still gets a working one. `workspace/didChangeConfiguration` is
 ignored.
 
-`requestDeadlineMs` is a tuning knob. It bounds how long a request may wait on
-the analysis worker before the server answers it with an error and replaces the
-worker. Its default is not part of the interface and may change.
+`requestDeadlineMs` is a tuning knob. It bounds how long the analysis worker may
+spend handling one request before the server answers it with `ServerCancelled`
+and replaces the worker. Loading a project does not count against it, and
+neither does a request waiting for a rebuild. A request that arrives while the
+worker is busy starts its clock when the worker gets to it. Its default is not
+part of the interface and may change.
 
 ## Tracing
 
