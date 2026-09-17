@@ -126,6 +126,20 @@ target without a native runner and is not shipped.
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
 
+## Command line
+
+The public interface is two invocations:
+
+| invocation | behaviour |
+| --- | --- |
+| `mls` | the language server, speaking LSP over stdin/stdout |
+| `mls --version` | prints `mls <version>` and exits |
+
+`mls --worker` is **private**. The server re-launches itself with it to run the
+analysis in a supervised child process, so a compiler fault is a child exit the
+editor never sees. It is not a stable interface: its name, its arguments and
+its behaviour may change in any release. Editors and scripts must not pass it.
+
 ## Tracing
 
 The server speaks JSON-RPC on stdout, so it cannot log there. Set the

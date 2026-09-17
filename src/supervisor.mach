@@ -64,6 +64,10 @@ use mls.transport;
 use sj: std.data.json;
 
 # the argument that selects the worker role
+#
+# private: only this process passes it, to a copy of itself. it is not part of
+# the command line users and editors may rely on (README, "Command line"), so it
+# may change in any release
 pub val WORKER_FLAG: str = "--worker";
 
 # exit code when the worker died on a signal and could not be recovered,
