@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
+- chore(license): copyright is attributed to Briar Systems LLC, 2025-2026
+  (#277). The MIT terms are unchanged.
 - docs: the README states the first-load time, rebuild times and resident
   memory as known limits, measured on this repository (#268).
 - feat(version): `mls --version` prints `mls <version> (mach <version>)`, and
