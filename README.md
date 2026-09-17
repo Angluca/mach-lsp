@@ -183,6 +183,9 @@ setting has an environment variable behind it, and the order is: the
 | `traceFile` | `MLS_TRACE_FILE` | an absolute path the trace is appended to |
 | `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
 
+An unusable value is ignored and noted in the trace, whether it came from an
+option or from the environment.
+
 ```json
 { "initializationOptions": { "trace": "messages", "traceFile": "/home/me/mls.log" } }
 ```
@@ -202,8 +205,15 @@ part of the interface and may change.
 ## Tracing
 
 The server speaks JSON-RPC on stdout, so it cannot log there. A trace is
-appended to `traceFile`, else `MLS_TRACE_FILE`, else `/tmp/mach-lsp.log`. With
-nothing configured, the default, the server performs no logging.
+appended to `traceFile`, else `MLS_TRACE_FILE`, else written to stderr, where
+an editor collects a server's own output. With nothing configured, the default,
+the server performs no logging.
+
+Nothing is written until `initialize` has settled where the trace goes and
+whether it is on. The lines from before it are kept and written to that
+destination, without message bodies, or dropped when the trace is off. A
+session that ends before `initialize` uses the environment alone. The trace
+names the settings in effect and where each came from.
 
 What a trace contains is a separate decision from whether it is on. A message
 body is your source code: every `didOpen` carries a whole file and every
@@ -218,8 +228,8 @@ size, timing) and no bodies.
 | `messages` | one line per message, and the server's own notes |
 | `bodies` | also message bodies, truncated at 512 bytes each |
 
-`MLS_TRACE` set to `bodies` means `bodies`, and set to any other value means
-`messages`. The LSP trace setting names the same levels `off`, `messages` and
+`MLS_TRACE` takes `off`, `messages` or `bodies`, and any other non-empty
+value means `messages`, so `MLS_TRACE=1` works. The LSP trace setting names the same levels `off`, `messages` and
 `verbose`.
 
 The level at startup is the first of these that is given:
@@ -269,7 +279,13 @@ a new mls major.
 
 | Module | Responsibility |
 |---|---|
-| `main` | entry point; page allocator + server loop |
+| `main` | entry point: `--version`, then the supervisor or, with `--worker`, the server loop |
+| `supervisor` | the client-facing process: relays frames to the analysis worker, ends a stuck one, and replaces one that dies |
+| `mirror` | the session state a replacement worker is replayed |
+| `pending` | the requests the supervisor has seen and the worker still owes |
+| `sideband` | the worker telling the supervisor when it loads or holds a request |
+| `settings` | `initialize` options over the environment and the defaults |
+| `version` | the server's version and the linked mach's, fixed at compile time |
 | `server` | lifecycle state, reading loop, and the analysis-thread dispatch |
 | `jobs` | bounded message queue feeding the single analysis thread |
 | `transport` | LSP base-protocol framing over stdin/stdout |
@@ -282,7 +298,20 @@ a new mls major.
 | `features` | offset → id → symbol query core over the resolve side tables |
 | `project` | stable per-root compiler Sessions and retained Project snapshots, overlays, routing, fingerprints, module views, and invalidation |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
-| `trace` | append-only debug trace log (`/tmp/mach-lsp.log`) |
+| `build` | the single-slot worker rebuilds run on, off the analysis thread |
+| `notes` | what a project load says about the project itself, shown on `mach.toml` |
+| `progress` | work-done progress for a cold load |
+| `textedit` | applying an LSP change list to a document's text |
+| `analysis` | resolving a positional request to the document view that answers it |
+| `types` | helpers over sema's typing output |
+| `render` | one spelling per LSP value: ranges, locations, symbol kinds |
+| `signature` | signatureHelp |
+| `hints` | inlay hints naming arguments at a call |
+| `tokens` | semantic tokens, classified from resolved meaning |
+| `actions` | code actions from the compiler's own fixes |
+| `callhierarchy` | call hierarchy across modules |
+| `workspace` | workspace/symbol |
+| `trace` | the debug trace, held until `initialize` settles its destination |
 
 ## Deferred
 
