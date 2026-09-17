@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-17
+
+Configuration at `initialize`, project-level diagnostics on `mach.toml`,
+cross-module references and rename, and the move to mach's compiler ranges.
+This is the release the 1.0 surface ships in first (#270).
+
+**The linked mach moves from v5.2.1 to v5.4.0**, and std from v3.2.0 to v4.0.0.
+Projects are now checked against mach 5.4.0: one whose `[project].mach`, or a
+dependency's, excludes 5.4.0 is not loaded, and the reason is shown on its
+`mach.toml`. Building mls itself needs mach 5.3 or later.
+
 ### Added
 - feat(project): what a project load says about the project itself is shown on
   the root's `mach.toml` (#266). mach 5.3 records some warnings against no source

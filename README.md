@@ -123,7 +123,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.19.0 t=x86_64-linux
+v=0.20.0 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -257,7 +257,10 @@ loads with a warning there that gives the line to add. Both clear when the
 manifest is fixed.
 
 So a project that requires a newer mach than the server links needs a newer
-server. The changelog names the mach release each mls release links.
+server. A release that moves the linked mach says so in the changelog, naming
+the old and new version. Moving to a new mach minor is at least an mls minor
+release, an mls patch release moves only mach's patch, and a new mach major is
+a new mls major.
 
 ## Architecture
 
