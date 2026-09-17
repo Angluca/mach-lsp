@@ -1872,9 +1872,10 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
 
     The worker is stopped inside its cold load for well past the deadline, then
     resumed: the request waiting on the load is answered with a result, by the
-    same worker. A rename held for a rebuild longer than the deadline is
-    answered the same way. A request that really wedges is still ended, and the replacement,
-    which loads again under the same deadline, serves.
+    same worker. A rename held for a rebuild is answered the same way after the
+    worker is stopped past the deadline while holding it. A request that really
+    wedges is still ended, and the replacement, which loads again under the same
+    deadline, serves.
     """
     if os.name != "posix":
         print("  deadline spares load: skipped (needs pgrep and SIGSTOP)")
@@ -1883,6 +1884,7 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
         root = Path(directory).resolve()
         slow = slow_project(root, "deadload", 3)
         main, body = slow.main, slow.text
+        trace_log = root / "trace.log"
         session = LspSession(server, root, timeout, answer_progress=True)
         stopped = None
         finished = False
@@ -1890,7 +1892,8 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             session.request("initialize", {
                 "rootUri": root.as_uri(),
                 "capabilities": {"window": {"workDoneProgress": True}},
-                "initializationOptions": {"requestDeadlineMs": 1000}})
+                "initializationOptions": {"requestDeadlineMs": 1000, "trace": "messages",
+                                          "traceFile": str(trace_log)}})
             session.notify("initialized", {})
             worker = worker_pid(session)
             session.notify("textDocument/didOpen", {"textDocument": {
@@ -1938,19 +1941,38 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             require(worker_pid(session) == worker, "the worker was replaced during its load")
 
             # a rename held for the rebuild an edit starts waits past the deadline
-            # too, and is answered from the rebuilt snapshot. the first rebuild
-            # goes into a cold session, so it is as long as the load
+            # too, and is answered from the rebuilt snapshot. how long a rebuild
+            # takes depends on the machine, so the worker is stopped once it
+            # reports the hold, for longer than the deadline
+            holding = "server: holding a request until its snapshot catches up"
+            holds = trace_log.read_text(encoding="utf-8", errors="replace").count(holding)
             session.notify("textDocument/didChange", {
                 "textDocument": {"uri": main.as_uri(), "version": 2},
                 "contentChanges": [{"text": body + "\n# edited\n"}]})
-            started = time.monotonic()
-            renamed = session.request("textDocument/rename", {
-                "textDocument": {"uri": main.as_uri()},
-                "position": {"line": line, "character": column}, "newName": "take_all"})
-            held_for = time.monotonic() - started
+            renaming = session.next_id
+            session.next_id += 1
+            session._send({"jsonrpc": "2.0", "id": renaming, "method": "textDocument/rename",
+                           "params": {"textDocument": {"uri": main.as_uri()},
+                                      "position": {"line": line, "character": column}, "newName": "take_all"}})
+            deadline = time.monotonic() + timeout
+            while trace_log.read_text(encoding="utf-8", errors="replace").count(holding) == holds:
+                require(time.monotonic() < deadline, "the rename was never held")
+                session.assert_no_message(lambda item: item.get("id") == renaming,
+                                          "rename answer before it was held, which proves nothing",
+                                          settle=0.02)
+            # the hold's sideband is written before its trace line; let the supervisor read it
+            time.sleep(0.2)
+            os.kill(worker, signal.SIGSTOP)
+            stopped = worker
+            time.sleep(1.8)
+            stopped = None
+            try:
+                os.kill(worker, signal.SIGCONT)
+            except ProcessLookupError as error:
+                raise ProtocolError("the worker was ended while it held the rename for a rebuild") from error
+            renamed = session.wait_for(lambda item: item.get("id") == renaming, "the held rename's answer")
             edits = (renamed.get("result") or {}).get("changes") or {}
             require(edits, f"a rename held past the deadline was not answered with edits: {renamed!r}")
-            require(held_for > 1.5, f"the rename was not held for a rebuild ({held_for:.2f}s), so this proves nothing")
             require(worker_pid(session) == worker, "the worker was replaced while a request was held")
 
             # a request that wedges is still ended, and the reloading replacement serves
