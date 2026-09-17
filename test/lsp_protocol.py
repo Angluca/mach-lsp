@@ -16,6 +16,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
@@ -28,17 +30,23 @@ class ProtocolError(RuntimeError):
     """Raised when the live protocol session violates an asserted contract."""
 
 
-def source_diagnostics(item: dict[str, Any]) -> bool:
-    """Whether a message publishes diagnostics for a source file.
+def uri_file(uri: str) -> str:
+    """The file a `file://` URI names, spelled so two URIs for it compare equal.
 
-    A load also publishes what it says about the project on the root's
-    `mach.toml` (#266), whenever that changes. Checks about how an edit moves a
-    source file's diagnostics look past those.
+    The server percent-encodes what a client may leave bare, such as a Windows
+    drive's colon, so URIs it builds are compared as the paths they name.
     """
-    if item.get("method") != "textDocument/publishDiagnostics":
-        return False
-    uri = (item.get("params") or {}).get("uri", "")
-    return not uri.endswith("/mach.toml")
+    path = urllib.request.url2pathname(urllib.parse.unquote(urllib.parse.urlparse(uri).path))
+    return os.path.normcase(os.path.normpath(path))
+
+
+def manifest_of(uri: str) -> str | None:
+    """The `mach.toml` of the nearest project enclosing a document, as `uri_file` spells it."""
+    directory = Path(uri_file(uri)).parent
+    for candidate in (directory, *directory.parents):
+        if (candidate / "mach.toml").is_file():
+            return uri_file((candidate / "mach.toml").as_uri())
+    return None
 
 
 class LspSession:
@@ -72,6 +80,9 @@ class LspSession:
         self.next_id = 1
         self.message_count = 0
         self.timings: list[tuple[str, float]] = []
+        # the manifests of the projects this session opened documents in. a load
+        # publishes what it says about the project on exactly these (#266)
+        self.manifests: set[str] = set()
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
         self.reader.start()
@@ -115,6 +126,10 @@ class LspSession:
             self.stderr_chunks.append(chunk)
 
     def _send(self, message: dict[str, Any]) -> None:
+        if message.get("method") == "textDocument/didOpen":
+            manifest = manifest_of(message["params"]["textDocument"]["uri"])
+            if manifest is not None:
+                self.manifests.add(manifest)
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
         frame = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
         try:
@@ -271,6 +286,18 @@ class LspSession:
             f"diagnostics for {uri}",
         )
 
+    def source_diagnostics(self, item: dict[str, Any]) -> bool:
+        """Whether a message publishes diagnostics for anything but an opened project's manifest.
+
+        A load inside a request publishes what it says about the project on that
+        project's `mach.toml` (#266). Only those exact files are set aside: any
+        other publish during a request is still one too many.
+        """
+        if item.get("method") != "textDocument/publishDiagnostics":
+            return False
+        uri = (item.get("params") or {}).get("uri", "")
+        return uri_file(uri) not in self.manifests
+
     def quiet_diagnostics(self, settle: float = 0.4) -> list[dict[str, Any]]:
         """Return any diagnostics published since the last wait.
 
@@ -279,8 +306,8 @@ class LspSession:
         (the request's own reply drained the inbox past it); `settle` also
         catches a publish still in flight behind that reply.
         """
-        found = [m for m in self.pending if source_diagnostics(m)]
-        self.pending = [m for m in self.pending if not source_diagnostics(m)]
+        found = [m for m in self.pending if self.source_diagnostics(m)]
+        self.pending = [m for m in self.pending if not self.source_diagnostics(m)]
         deadline = time.monotonic() + settle
         while True:
             remaining = deadline - time.monotonic()
@@ -293,7 +320,7 @@ class LspSession:
             if item is None or isinstance(item, BaseException):
                 return found
             self.message_count += 1
-            if source_diagnostics(item):
+            if self.source_diagnostics(item):
                 found.append(item)
             else:
                 self.pending.append(item)
@@ -1496,7 +1523,7 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
                   what: str) -> list[dict[str, Any]]:
         message = session.wait_for(
             lambda item: (item.get("method") == "textDocument/publishDiagnostics"
-                          and item.get("params", {}).get("uri") == uri
+                          and uri_file(item.get("params", {}).get("uri", "")) == uri_file(uri)
                           and want(item["params"].get("diagnostics", []))),
             what)
         return message["params"]["diagnostics"]
@@ -1791,7 +1818,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                     f"a request during a rebuild was not answered: {symbols!r}")
             # nothing republished while that request was outstanding, so the
             # rebuild had not finished when it was answered
-            early = [item for item in session.pending if source_diagnostics(item)]
+            early = [item for item in session.pending if session.source_diagnostics(item)]
             require(not early,
                     f"the rebuild finished before the request was answered: {early!r}")
 
