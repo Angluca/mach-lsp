@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - docs: the README names the pinned mach as v5.4.0, and says the worker's
   memory figures are resident plus swap, with the scenario each one measures
   (#287).
+- test: the check that a request held for a rebuild outlives the deadline no
+  longer depends on how fast the machine rebuilds (#294).
 - fix(trace): with no file configured, the trace goes to stderr rather than the
   shared `/tmp/mach-lsp.log` (#285).
 - fix(settings): `MLS_TRACE=off` turns tracing off instead of on. An unusable
