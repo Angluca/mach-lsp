@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- docs: the README documents the public command line, `mls` and
+  `mls --version`, and marks `mls --worker` private (#265). `--worker` is the
+  supervisor's re-launch of itself, with no stability promise.
+
 ### Fixed
 - fix(features): `tag` declarations have a name span (#249). The outline
   listed no tag, and definition, references, rename and highlight could not
