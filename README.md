@@ -131,7 +131,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.20.0 t=x86_64-linux
+v=0.21.0 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -167,7 +167,7 @@ shipped.
 version to the mach version that release links:
 
 ```json
-{"0.20.1": "5.4.0", "0.20.0": "5.4.0", "0.19.0": "5.2.1"}
+{"0.21.0": "5.4.0", "0.20.0": "5.4.0", "0.19.0": "5.2.1"}
 ```
 
 A server refuses a project whose `[project].mach` range excludes its mach, so
