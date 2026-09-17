@@ -175,7 +175,7 @@ jobs:
         run: |
           set -euo pipefail
           git submodule update --init --depth 1 dep/mach
-          python3 .github/ci/releases.py "$VERSION" dist/RELEASES.json
+          python3 .github/release/releases.py "$VERSION" dist/RELEASES.json
 
       - name: RELEASES.json names the mach this release links
         run: |
