@@ -316,7 +316,7 @@ test "uris: a local file URI decodes to its path" {
         if (!str_equals(b, "/home/u/x.mach")) { fail = true; }
     }
     if (to_path(?pa, "http://example/x") != nil) { fail = true; }
-    if (fail)                                        { ret 1; }
+    if (fail)                                    { ret 1; }
     ret 0;
 }
 
@@ -369,7 +369,7 @@ test "uris: a malformed escape or an encoded NUL is refused" {
     # an embedded NUL would truncate every later path comparison
     if (to_path(?pa, "file:///a%00b") != nil) { fail = true; }
     if (to_path(?pa, "file://") != nil)       { fail = true; }
-    if (fail)                                     { ret 1; }
+    if (fail)                                 { ret 1; }
     ret 0;
 }
 

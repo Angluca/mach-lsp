@@ -71,8 +71,8 @@ use mls.sideband;
 use mls.textdiff;
 use mls.trace;
 use mls.transport;
-use mls.uris;
 use mtypes: mls.types;
+use mls.uris;
 
 use mach.lang.fail;
 use mach.lang.fe.token;
