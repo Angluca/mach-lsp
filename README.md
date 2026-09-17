@@ -78,15 +78,16 @@ off the request path is tracked by #143.
 
 These are the costs of the current design, not defects awaiting a fix. The
 figures are from this repository, which analyzes the whole compiler and
-standard library (`dep/mach`, `dep/std`): a release build on mach 5.2.1, on an
-8-core Ryzen 7 5800X3D. Smaller projects pay proportionally less.
+standard library (`dep/mach`, `dep/std`): a release build on mach 5.4.0 with
+std 4.0.0, on an 8-core Ryzen 7 5800X3D. Smaller projects pay proportionally
+less.
 
 | cost | figure | why |
 | --- | --- | --- |
-| first semantic answer after opening a project | ~28-30 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
-| first rebuild after that load | ~30 s | a root keeps two sessions, and the second is cold until its first build (#252) |
-| every later rebuild | ~2 s | the compiler rebuilds the project, not only what an edit touched (#250) |
-| analysis worker memory | ~540 MiB after the first load, 0.9-1.0 GiB with both sessions built, ~1.15 GiB peak while rebuilding | the two sessions are the price of rebuilds that never block requests (#248) |
+| first semantic answer after opening a project | ~26 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
+| first rebuild after that load | ~26 s | a root keeps two sessions, and the second is cold until its first build (#252) |
+| every later rebuild | ~1.2-1.4 s | a rebuild still walks the whole project to find what an edit changed (#250) |
+| analysis worker memory | ~870 MiB after the first load, ~1.35 GiB once both sessions have built, ~1.7 GiB peak while the second builds for the first time; flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
 
 While a rebuild runs, the edited buffer keeps answering from the snapshot it
 has (see above), so neither rebuild figure is time without answers. Syntax-only

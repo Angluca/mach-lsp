@@ -27,8 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
-- chore(dep): the server links mach 5.3.1, built against std 4.0.0, the std
-  mach's own CI proves (#266). std 4.0 passes descriptors as pointer-width
+- docs(readme): the known limits are measured again on mach 5.4.0 and std 4.0.0
+  (#280): about 26 s to the first semantic answer and to the first rebuild,
+  1.2-1.4 s for later rebuilds, and 870 MiB to 1.35 GiB of worker memory with a
+  1.7 GiB peak.
+- chore(dep): the server links mach 5.4.0, built against std 4.0.0, the std
+  mach's own CI proves (#266, #280). 5.4.0 carries the fix for mach#3536,
+  without which a rebuild with std 4.0 took 16-25 s on this repository. std 4.0 passes descriptors as pointer-width
   handles, so the transport, the supervisor's pipes and the trace log hold
   handles now. Projects are checked against the linked mach's version: one whose
   `[project].mach` excludes it is not loaded. The README's Compiler
