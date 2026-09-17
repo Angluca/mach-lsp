@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close, so every replacement worker was ended within a fraction of a second
   until the server exited. When the worker dies, every request it still owed is
   now answered, including held requests and requests with string ids.
+- fix(trace): nothing is traced before `initialize` has settled where the trace
+  goes (#285). The first lines of a session, including the `initialize` body at
+  the `bodies` level, used to go to the environment's file even when the
+  `trace` option turned tracing off or `traceFile` named another file. Those
+  lines are now held in memory, without bodies. They are written to the chosen
+  destination, or dropped when tracing is off.
+- fix(trace): with no file configured, the trace goes to stderr rather than the
+  shared `/tmp/mach-lsp.log` (#285).
+- fix(settings): `MLS_TRACE=off` turns tracing off instead of on. An unusable
+  `MLS_TRACE_FILE` or `MLS_REQUEST_DEADLINE_MS` is noted in the trace the way an
+  unusable option is. `MLS_REQUEST_DEADLINE_MS` now has the same minimum as the
+  option. The trace names the effective settings and where each came from
+  (#285, #287).
 
 ## [0.20.0] - 2026-09-17
 

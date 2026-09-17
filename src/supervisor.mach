@@ -94,22 +94,6 @@ val MAX_RESTARTS: i64 = 5;
 # response is to stop and say so rather than to keep spawning.
 val MAX_BARREN: i64 = 2;
 
-# how long the worker may spend handling a request before it is declared hung
-#
-# A compiler stuck in non-cooperative code cannot read a cancellation, so the
-# only way out is to end the process. The clock runs only while the worker is
-# handling a request: not while it loads a project, and not for a request it
-# holds for a build (`sideband`). It starts when the request arrives at an idle
-# worker, or when the worker last finished something. The number is far above
-# any real request, because the failure mode of a deadline that is too short is
-# to kill work that was about to succeed.
-val DEFAULT_DEADLINE_NS: i64 = 120000000000;
-
-# the same bound, overridable for a workspace where two minutes is genuinely
-# too short - and for the test, which cannot wait that long to prove the
-# watchdog fires
-val DEADLINE_VAR: str = "MLS_REQUEST_DEADLINE_MS";
-
 # how long the worker gets to exit on its own after the client says `exit`
 #
 # Shutdown must terminate even when analysis is wedged, because a language
@@ -180,7 +164,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     RELAY.reqs        = pending.init(alloc);
     RELAY.loading     = false;
     RELAY.progress_at = 0;
-    RELAY.deadline    = configured_deadline();
+    RELAY.deadline    = env_deadline(alloc);
     mirror.init(?RELAY.mir, alloc);
 
     var pid: i64 = start_worker(self, ?to_worker, ?from_worker);
@@ -321,6 +305,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     mutex.lock(?RELAY.reqs_mu);
     pending.dnit(?RELAY.reqs);
     mutex.unlock(?RELAY.reqs_mu);
+    settings.settle_trace(alloc);
     ret code;
 }
 
@@ -369,6 +354,11 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
 }
 
 # end a worker that has stopped answering, and bound shutdown
+#
+# The request deadline bounds how long the worker may spend handling a request.
+# Its clock runs only while it is: not while the worker loads a project, and not
+# for a request it holds for a build (`sideband`). It starts when a request
+# arrives at an idle worker, or when the worker last finished something.
 #
 # A compiler stuck in non-cooperative code cannot read a cancellation frame, so
 # there is nothing to ask: the only way to get the session back is to end the
@@ -447,9 +437,11 @@ fun apply_settings(r: *Relay, body: str, len: usize) {
         val params: *sj.Value = json.member(?parsed.root, "params");
         if (json.text_equals(method, "initialize", r.alloc)) {
             # the notes are the worker's to write; both halves share the file
-            var st: settings.Settings = settings.parse(params, r.alloc, false);
-            trace.start(st.trace, st.lsp_trace, st.trace_file);
-            if (sel st.deadline_ms.some) { atomic.store(?r.deadline, st.deadline_ms.some * 1000000); }
+            var st:  settings.Settings  = settings.parse(params, r.alloc, false);
+            var eff: settings.Effective = settings.effective(?st, r.alloc, false);
+            trace.start(eff.level, eff.file);
+            atomic.store(?r.deadline, eff.deadline_ms * 1000000);
+            settings.effective_dnit(?eff, r.alloc);
             settings.dnit(?st, r.alloc);
         }
         or (json.text_equals(method, "$/setTrace", r.alloc)) {
@@ -461,24 +453,12 @@ fun apply_settings(r: *Relay, body: str, len: usize) {
     json.reader_dnit(?rd);
 }
 
-# the request deadline, from the environment when it names one
-fun configured_deadline() i64 {
-    var buf: [24]u8;
-    val r:   res[opt[usize], env.EnvError] = env.get(DEADLINE_VAR, ?buf[0], 24);
-    if (sel r.err) { ret DEFAULT_DEADLINE_NS; }
-    val n_o: opt[usize] = r.ok;
-    if (sel n_o.none) { ret DEFAULT_DEADLINE_NS; }
-    val n: usize = n_o.some;
-    if (n == 0) { ret DEFAULT_DEADLINE_NS; }
-    var ms: i64   = 0;
-    var i:  usize = 0;
-    for (i < n) {
-        if (buf[i] < '0' || buf[i] > '9') { ret DEFAULT_DEADLINE_NS; }
-        ms = ms * 10 + (buf[i]::i64 - '0'::i64);
-        i  = i + 1;
-    }
-    if (ms <= 0) { ret DEFAULT_DEADLINE_NS; }
-    ret ms * 1000000;
+# the request deadline before `initialize` says otherwise
+fun env_deadline(alloc: *Allocator) i64 {
+    var eff: settings.Effective = settings.effective(nil, alloc, false);
+    val ns:  i64                = eff.deadline_ms * 1000000;
+    settings.effective_dnit(?eff, alloc);
+    ret ns;
 }
 
 # forward client frames to the worker, recording what a replay would need
