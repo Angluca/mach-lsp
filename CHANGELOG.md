@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
+- docs: the README states the first-load time, rebuild times and resident
+  memory as known limits, measured on this repository (#268).
 - feat(version): `mls --version` prints `mls <version> (mach <version>)`, and
   `initialize` reports the compiler version as `serverInfo.mach`.
   `serverInfo.version` is unchanged.
