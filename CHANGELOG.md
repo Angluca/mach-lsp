@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
+- docs(readme): the status and deferred lists match what the server
+  advertises: incremental sync, workspace symbols, member completion and the
+  other features added since they were written (#280).
 - docs(readme): the known limits are measured again on mach 5.4.0 and std 4.0.0
   (#280): about 26 s to the first semantic answer and to the first rebuild,
   1.2-1.4 s for later rebuilds, and 870 MiB to 1.35 GiB of worker memory with a
