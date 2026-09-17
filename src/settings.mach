@@ -1,0 +1,170 @@
+# what a client configures at `initialize` (#264)
+#
+# The whole surface is three `initializationOptions` keys and the LSP trace
+# value; nothing changes after `initialize` except the trace level, which
+# `$/setTrace` moves. Each key has an environment variable behind it, and the
+# precedence is: option, then environment, then default.
+#
+#   trace              "off" | "messages" | "bodies"    MLS_TRACE
+#   traceFile          absolute path                    MLS_TRACE_FILE
+#   requestDeadlineMs  integer >= 1000                  MLS_REQUEST_DEADLINE_MS
+#
+# A key this server does not know, and a value it cannot use, is ignored with a
+# note in the trace. `initialize` never fails because of configuration: a client
+# that sends a newer server's settings still gets a working one.
+#
+# Both halves of the server read these: the supervisor owns the request
+# deadline, and the worker answers `initialize`. They parse the same frame with
+# this module, so they cannot disagree about what it said.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.allocator.Allocator;
+
+use sj:      std.data.json;
+use strutil: std.text.string;
+use pathlib: std.types.path;
+
+use mls.json;
+use mls.trace;
+
+# how much a trace records, as `trace` spells it
+pub val TRACE_OFF:      u8 = trace.LEVEL_OFF;
+pub val TRACE_MESSAGES: u8 = trace.LEVEL_MESSAGES;
+pub val TRACE_BODIES:   u8 = trace.LEVEL_BODIES;
+
+# the smallest request deadline a client may ask for, in milliseconds. below it
+# the watchdog would end ordinary cold loads
+pub val MIN_DEADLINE_MS: i64 = 1000;
+
+# the configuration one `initialize` carried
+# ---
+# trace:       the `trace` option, when valid
+# lsp_trace:   the LSP `initialize.trace` value, when valid
+# trace_file:  the `traceFile` option, owned, or nil
+# deadline_ms: the `requestDeadlineMs` option, when valid
+pub rec Settings {
+    trace:       opt[u8];
+    lsp_trace:   opt[u8];
+    trace_file:  str;
+    deadline_ms: opt[i64];
+}
+
+# the configuration in an `initialize` request's params
+#
+# The notes about ignored keys and values are only worth writing once the trace
+# they go to is configured, which these very settings decide. So a caller parses
+# quietly, applies the result, and parses again with `report` to write them.
+# ---
+# params: the request's `params`, or nil
+# alloc:  allocator for the owned trace file path
+# report: write a trace note for each ignored key or value
+# ret:    the settings; release with `dnit`
+pub fun parse(params: *sj.Value, alloc: *Allocator, report: bool) Settings {
+    var s: Settings = Settings{
+        trace:       opt[u8].none{},
+        lsp_trace:   opt[u8].none{},
+        trace_file:  nil,
+        deadline_ms: opt[i64].none{},
+    };
+    val lsp: *sj.Value = json.member(params, "trace");
+    if (lsp != nil) {
+        s.lsp_trace = lsp_level(lsp, alloc);
+        if (report && sel s.lsp_trace.none) { trace.log("settings: initialize.trace is not off, messages or verbose; ignored\n"); }
+    }
+
+    val opts: *sj.Value = json.member(params, "initializationOptions");
+    if (opts == nil || json.is_null(opts)) { ret s; }
+    if (!sj.value_is_object(opts)) {
+        if (report) { trace.log("settings: initializationOptions is not an object; ignored\n"); }
+        ret s;
+    }
+
+    var i: usize = 0;
+    for (i < json.count(opts)) {
+        val key: str            = key_text(opts, i, alloc);
+        val v:   opt[*sj.Value] = sj.value_get(opts, i);
+        if (key != nil) {
+            if (sel v.some) { apply_option(?s, key, v.some, alloc, report); }
+            strutil.str_free(alloc, key);
+        }
+        i = i + 1;
+    }
+    ret s;
+}
+
+# fold one `initializationOptions` member into `s`
+fun apply_option(s: *Settings, key: str, v: *sj.Value, alloc: *Allocator, report: bool) {
+    if (str_equals(key, "trace"))             { s.trace = option_level(v, alloc, report); }
+    or (str_equals(key, "traceFile"))         { s.trace_file = option_file(v, alloc, report); }
+    or (str_equals(key, "requestDeadlineMs")) { s.deadline_ms = option_deadline(v, report); }
+    or (report)                               { trace.logf("settings: unknown option `{}` ignored", key); }
+}
+
+pub fun dnit(s: *Settings, alloc: *Allocator) {
+    json.free_str(s.trace_file, alloc);
+    s.trace_file = nil;
+}
+
+# the trace level a `$/setTrace` or `initialize.trace` value names: the LSP
+# spelling, where `verbose` is what this server calls bodies
+pub fun lsp_level(v: *sj.Value, alloc: *Allocator) opt[u8] {
+    if (json.text_equals(v, "off", alloc))      { ret opt[u8].some{TRACE_OFF}; }
+    if (json.text_equals(v, "messages", alloc)) { ret opt[u8].some{TRACE_MESSAGES}; }
+    if (json.text_equals(v, "verbose", alloc))  { ret opt[u8].some{TRACE_BODIES}; }
+    ret opt[u8].none{};
+}
+
+fun option_level(v: *sj.Value, alloc: *Allocator, report: bool) opt[u8] {
+    if (json.text_equals(v, "off", alloc))      { ret opt[u8].some{TRACE_OFF}; }
+    if (json.text_equals(v, "messages", alloc)) { ret opt[u8].some{TRACE_MESSAGES}; }
+    if (json.text_equals(v, "bodies", alloc))   { ret opt[u8].some{TRACE_BODIES}; }
+    if (report)                                 { trace.log("settings: option `trace` is not off, messages or bodies; ignored\n"); }
+    ret opt[u8].none{};
+}
+
+fun option_file(v: *sj.Value, alloc: *Allocator, report: bool) str {
+    val path: str = json.text(v, alloc);
+    if (path == nil) {
+        if (report) { trace.log("settings: option `traceFile` is not a string; ignored\n"); }
+        ret nil;
+    }
+    if (!pathlib.is_abs(path)) {
+        if (report) { trace.logf("settings: option `traceFile` `{}` is not absolute; ignored", path); }
+        json.free_str(path, alloc);
+        ret nil;
+    }
+    ret path;
+}
+
+fun option_deadline(v: *sj.Value, report: bool) opt[i64] {
+    if (!sj.value_is_number(v) || sj.value_is_float(v)) {
+        if (report) { trace.log("settings: option `requestDeadlineMs` is not an integer; ignored\n"); }
+        ret opt[i64].none{};
+    }
+    val ms: i64 = sj.value_number(v);
+    if (ms < MIN_DEADLINE_MS) {
+        if (report) { trace.logf("settings: option `requestDeadlineMs` {} is below {}; ignored", ms, MIN_DEADLINE_MS); }
+        ret opt[i64].none{};
+    }
+    ret opt[i64].some{ms};
+}
+
+# an owned, nul-terminated copy of object key `i`
+fun key_text(obj: *sj.Value, i: usize, alloc: *Allocator) str {
+    val ko: opt[str] = sj.value_key(obj, i);
+    if (sel ko.none) { ret nil; }
+    val n: usize                     = sj.value_key_len(obj, i);
+    val r: res[str, allocator.Error] = strutil.str_dup_range(alloc, ko.some, 0, n);
+    if (sel r.err) { ret nil; }
+    ret r.ok;
+}
+
+use std.allocator;
+use std.types.result.res;

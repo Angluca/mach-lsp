@@ -43,6 +43,7 @@ use mls.positions;
 use mls.progress;
 use mls.project;
 use mls.render;
+use mls.settings;
 use mls.signature;
 use mls.textedit;
 use mls.tokens;
@@ -562,6 +563,12 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_did_save(srv, params);
         ret;
     }
+    if (str_equals(method, "$/setTrace")) {
+        json.free_str(method, a);
+        val lo: opt[u8] = settings.lsp_level(json.member(params, "value"), a);
+        if (sel lo.some) { trace.set_level(lo.some); }
+        ret;
+    }
     if (str_equals(method, "workspace/didChangeConfiguration")) {
         json.free_str(method, a);
         ret;
@@ -666,6 +673,13 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
 # answer the initialize request with the server's capabilities (full-text
 # document sync) and mark the server running
 fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
+    # what the client configured, before anything else is traced (#264)
+    var st: settings.Settings = settings.parse(params, srv.alloc, false);
+    trace.start(st.trace, st.lsp_trace, st.trace_file);
+    settings.dnit(?st, srv.alloc);
+    var noted: settings.Settings = settings.parse(params, srv.alloc, true);
+    settings.dnit(?noted, srv.alloc);
+
     # remember whether the client can accept a dynamic watch registration, so
     # `initialized` only sends one when it will be honoured.
     val watched: *sj.Value = json.member(
@@ -696,6 +710,8 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
     json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
     json.buf_push_quoted(?b, version.VERSION);
+    json.buf_push(?b, ",\"mach\":");
+    json.buf_push_quoted(?b, version.MACH);
     json.buf_push(?b, "}}}");
     send_buf(srv, ?b);
 

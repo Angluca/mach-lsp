@@ -1428,32 +1428,189 @@ def run_stale_diagnostics(server: Path, timeout: float) -> None:
 def run_version(server: Path, timeout: float) -> None:
     """The binary reports the version it was built from, and starts nothing to do so.
 
-    A release asset is checked against its tag by this flag, and a client learns
-    the same value from `initialize`; both come from `[project].version`.
+    `mls --version` names the server and the compiler it links; `initialize`
+    reports them as separate keys, so `serverInfo.version` stays exactly the
+    server's own. Both come from the manifests the binary was built from.
     """
-    manifest = Path(__file__).resolve().parents[1] / "mach.toml"
-    match = re.search(r'^version = "([^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
-    require(match is not None, "mach.toml has no project version")
-    expected = match.group(1)
+    repo = Path(__file__).resolve().parents[1]
+
+    def manifest_version(path: Path) -> str:
+        match = re.search(r'^version = "([^"]+)"', path.read_text(encoding="utf-8"), re.M)
+        require(match is not None, f"{path} has no project version")
+        return match.group(1)
+
+    expected = manifest_version(repo / "mach.toml")
+    compiler = manifest_version(repo / "dep" / "mach" / "mach.toml")
 
     done = subprocess.run([str(server), "--version"], stdin=subprocess.DEVNULL,
                           capture_output=True, timeout=timeout)
     require(done.returncode == 0, f"--version exited {done.returncode}: {done.stderr!r}")
-    require(done.stdout.decode().strip() == f"mls {expected}",
-            f"--version printed {done.stdout!r}, expected mls {expected}")
+    require(done.stdout.decode().strip() == f"mls {expected} (mach {compiler})",
+            f"--version printed {done.stdout!r}, expected mls {expected} (mach {compiler})")
 
     with tempfile.TemporaryDirectory(prefix="mls-version-") as directory:
         session = LspSession(server, Path(directory), timeout)
         finished = False
         try:
             info = session.request("initialize", {"capabilities": {}})["result"].get("serverInfo", {})
-            require(info == {"name": "mach-lsp", "version": expected},
-                    f"initialize reported {info!r}, expected version {expected}")
+            require(info == {"name": "mach-lsp", "version": expected, "mach": compiler},
+                    f"initialize reported {info!r}")
             session.finish()
             finished = True
         finally:
             if not finished:
                 session.abort()
+
+
+def run_settings(server: Path, timeout: float) -> None:
+    """What a client configures at `initialize`, and how it combines (#264).
+
+    The option wins over the environment, the environment over the LSP
+    `initialize.trace`, and `$/setTrace` moves the level afterwards. A key the
+    server does not know, or a value it cannot use, is noted and ignored; it
+    never fails `initialize`.
+    """
+    SAMPLE = "pub fun sample(n: i32) i32 {\n    ret n;\n}\n"
+
+    def session_with(directory: Path, params: dict[str, Any], env: dict[str, str]) -> tuple[LspSession, Path]:
+        doc = directory / "sample.mach"
+        doc.write_text(SAMPLE, encoding="utf-8")
+        session = LspSession(server, directory, timeout, env)
+        answer = session.request("initialize", {"capabilities": {}, **params})
+        require("result" in answer, f"initialize failed under {params!r}: {answer!r}")
+        session.notify("initialized", {})
+        session.notify("textDocument/didOpen", {"textDocument": {
+            "uri": doc.as_uri(), "languageId": "mach", "version": 1, "text": SAMPLE}})
+        session.diagnostics(doc.as_uri(), 1)
+        return session, doc
+
+    def symbols(session: LspSession, doc: Path) -> None:
+        session.request("textDocument/documentSymbol", {"textDocument": {"uri": doc.as_uri()}})
+
+    def read(path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+    def run(params: dict[str, Any], env: dict[str, str], body: Callable[[LspSession, Path, Path], None]) -> None:
+        with tempfile.TemporaryDirectory(prefix="mls-settings-") as name:
+            directory = Path(name).resolve()
+            session, doc = session_with(directory, params, env)
+            finished = False
+            try:
+                body(session, doc, directory)
+                session.finish()
+                finished = True
+            finally:
+                if not finished:
+                    session.abort()
+
+    # the options alone turn tracing on, choose the file, and note what they ignore
+    def options(session: LspSession, doc: Path, directory: Path) -> None:
+        log = directory / "chosen.log"
+        symbols(session, doc)
+        text = read(log)
+        require("method textDocument/documentSymbol" in text,
+                f"the trace option did not trace into traceFile: {text[:400]!r}")
+        require('"method":"textDocument/documentSymbol"' not in text,
+                "messages level wrote a message body")
+        require("unknown option `colour` ignored" in text, f"an unknown key was not noted: {text[:600]!r}")
+        require("requestDeadlineMs` 10 is below 1000" in text, f"a short deadline was not noted: {text[:600]!r}")
+
+        # $/setTrace moves the level either way
+        session.notify("$/setTrace", {"value": "verbose"})
+        symbols(session, doc)
+        require('"method":"textDocument/documentSymbol"' in read(log), "verbose did not add message bodies")
+        session.notify("$/setTrace", {"value": "off"})
+        quiet = read(log).count("method textDocument/documentSymbol")
+        symbols(session, doc)
+        require(read(log).count("method textDocument/documentSymbol") == quiet,
+                "$/setTrace off still traced the next request")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-log-") as logdir:
+        chosen = Path(logdir).resolve() / "chosen.log"
+        run({"initializationOptions": {"trace": "messages", "traceFile": str(chosen),
+                                       "colour": "blue", "requestDeadlineMs": 10}},
+            {}, lambda s, d, _: options(s, d, chosen.parent))
+
+    # an unusable traceFile falls back to the environment's, with a note there
+    def relative(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        text = read(directory / "env.log")
+        require("method textDocument/documentSymbol" in text, "a relative traceFile did not fall back")
+        require("is not absolute" in text, f"the relative traceFile was not noted: {text[:600]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-env-") as logdir:
+        envlog = Path(logdir).resolve() / "env.log"
+        run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
+            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: relative(s, d, envlog.parent))
+
+        # the LSP trace value turns tracing on when the environment does not
+        envlog.unlink(missing_ok=True)
+        run({"trace": "messages"}, {"MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
+                                                    "initialize.trace messages did not trace")))
+
+        # but an editor's default `trace: "off"` does not silence the environment
+        envlog.unlink(missing_ok=True)
+        run({"trace": "off"}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
+                                                    "initialize.trace off silenced MLS_TRACE")))
+
+        # while the option does
+        envlog.unlink(missing_ok=True)
+        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" not in read(envlog),
+                                                    "the trace option did not override MLS_TRACE")))
+
+
+def run_option_deadline(server: Path, timeout: float) -> None:
+    """`requestDeadlineMs` bounds a wedged request with no environment at all.
+
+    The default is two minutes, so an ignored option shows as this test timing
+    out. POSIX only, like `run_hung_worker`, whose wedge it reuses.
+    """
+    if os.name != "posix":
+        print("  option deadline: skipped (needs pgrep and SIGSTOP)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-optdeadline-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "optdeadline", 7)
+        session = LspSession(server, root, timeout)
+        wedged = None
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {},
+                                           "initializationOptions": {"requestDeadlineMs": 1200}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+            for _ in range(200):
+                children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                          capture_output=True, text=True).stdout.split()
+                if children:
+                    wedged = int(children[0])
+                    break
+                time.sleep(0.02)
+            require(wedged is not None, "no analysis worker to wedge")
+            os.kill(wedged, signal.SIGSTOP)
+            pending = session.next_id
+            session.next_id += 1
+            session._send({"jsonrpc": "2.0", "id": pending, "method": "textDocument/documentSymbol",
+                           "params": {"textDocument": {"uri": main.as_uri()}}})
+            answer = session.wait_for(lambda item: item.get("id") == pending, "the wedged request's answer")
+            require((answer.get("error") or {}).get("code") == -32802,
+                    f"the option deadline did not end the wedged request: {answer!r}")
+            # the replacement worker was given the same options, and answers
+            symbols = session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(symbols.get("result"), f"the session did not recover: {symbols!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+            if wedged is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(wedged, signal.SIGKILL)
 
 
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
@@ -4533,6 +4690,8 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_version(server, args.timeout)
+        run_settings(server, args.timeout)
+        run_option_deadline(server, args.timeout)
         run_cross_module_references(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)

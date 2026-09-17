@@ -45,6 +45,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
@@ -59,6 +60,7 @@ use std.system.os;
 
 use mls.json;
 use mls.mirror;
+use mls.settings;
 use mls.trace;
 use mls.transport;
 use sj: std.data.json;
@@ -350,7 +352,7 @@ fun watchdog(arg: *u8) {
 
         # a request that has gone unanswered past the deadline
         val started: i64 = atomic.load(?r.req_at);
-        if (atomic.load(?r.have_id) != 0 && started != 0 && now - started > r.deadline) {
+        if (atomic.load(?r.have_id) != 0 && started != 0 && now - started > atomic.load(?r.deadline)) {
             atomic.store(?r.timed_out, 1);
             doomed = atomic.load(?r.pid);
             if (doomed > 0) { trace.logf("supervisor: worker exceeded the request deadline, ending pid {}", doomed); }
@@ -383,6 +385,41 @@ fun now_ns() i64 {
     var ts: os.Timespec;
     if (os.monotonic(?ts) < 0) { ret 0; }
     ret ts.sec * 1000000000 + ts.nsec;
+}
+
+# apply what the client configured to this process: the request deadline, which
+# the watchdog here enforces, and the trace, which this process writes status
+# lines to. the worker applies the same frame to itself, and a replacement
+# worker is replayed it
+#
+# Runs on the client pump. The deadline is read by the watchdog on the main
+# thread, so it is stored atomically.
+fun apply_settings(r: *Relay, body: str, len: usize) {
+    if (body == nil) { ret; }
+    val init:  bool = str_contains(body, "\"initialize\"");
+    val level: bool = str_contains(body, "\"$/setTrace\"");
+    if (!init && !level) { ret; }
+
+    var rd: json.Reader;
+    if (!json.reader_init(?rd, r.alloc)) { ret; }
+    var parsed: json.Message = json.read(?rd, body, len);
+    if (parsed.valid) {
+        val method: *sj.Value = json.member(?parsed.root, "method");
+        val params: *sj.Value = json.member(?parsed.root, "params");
+        if (json.text_equals(method, "initialize", r.alloc)) {
+            # the notes are the worker's to write; both halves share the file
+            var st: settings.Settings = settings.parse(params, r.alloc, false);
+            trace.start(st.trace, st.lsp_trace, st.trace_file);
+            if (sel st.deadline_ms.some) { atomic.store(?r.deadline, st.deadline_ms.some * 1000000); }
+            settings.dnit(?st, r.alloc);
+        }
+        or (json.text_equals(method, "$/setTrace", r.alloc)) {
+            val lo: opt[u8] = settings.lsp_level(json.member(params, "value"), r.alloc);
+            if (sel lo.some) { trace.set_level(lo.some); }
+        }
+    }
+    json.release(?rd);
+    json.reader_dnit(?rd);
 }
 
 # the request deadline, from the environment when it names one
@@ -432,6 +469,7 @@ fun pump_client(arg: *u8) {
         # frame lost to a dying worker's pipe is not lost to the session: it is
         # already in the state the replacement will be given.
         mirror.record(?r.mir, msg.body, msg.body_len);
+        apply_settings(r, msg.body, msg.body_len);
 
         if (r.to_worker >= 0 && atomic.load(?r.need_replay) == 0) {
             # a write that fails is a worker that has died, which the main
