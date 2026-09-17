@@ -118,8 +118,10 @@ The names are a contract: editor extensions download by them.
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
 | `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
 
-`<version>` has no leading `v`. `mls --version` prints `mls <version>`, and
-`initialize` reports the same value as `serverInfo.version`. Every shipped
+`<version>` has no leading `v`. `mls --version` prints
+`mls <version> (mach <compiler version>)`. `initialize` reports the same
+`<version>` as `serverInfo.version`, and the compiler version as
+`serverInfo.mach`. Every shipped
 platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
 target without a native runner and is not shipped.
 
@@ -133,35 +135,73 @@ The public interface is two invocations:
 | invocation | behaviour |
 | --- | --- |
 | `mls` | the language server, speaking LSP over stdin/stdout |
-| `mls --version` | prints `mls <version>` and exits |
+| `mls --version` | prints `mls <version> (mach <compiler version>)` and exits |
 
 `mls --worker` is **private**. The server re-launches itself with it to run the
 analysis in a supervised child process, so a compiler fault is a child exit the
 editor never sees. It is not a stable interface: its name, its arguments and
 its behaviour may change in any release. Editors and scripts must not pass it.
 
+## Configuration
+
+The server reads its configuration once, from the `initialize` request. Every
+setting has an environment variable behind it, and the order is: the
+`initializationOptions` key, then the environment variable, then the default.
+
+| `initializationOptions` key | environment | value |
+| --- | --- | --- |
+| `trace` | `MLS_TRACE` | `"off"`, `"messages"` or `"bodies"` (see [Tracing](#tracing)) |
+| `traceFile` | `MLS_TRACE_FILE` | an absolute path the trace is appended to |
+| `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
+
+```json
+{ "initializationOptions": { "trace": "messages", "traceFile": "/home/me/mls.log" } }
+```
+
+A key the server does not know, and a value it cannot use, is ignored and noted
+in the trace. Configuration never fails `initialize`, so a client written for a
+newer server still gets a working one. `workspace/didChangeConfiguration` is
+ignored.
+
+`requestDeadlineMs` is a tuning knob. It bounds how long a request may wait on
+the analysis worker before the server answers it with an error and replaces the
+worker. Its default is not part of the interface and may change.
+
 ## Tracing
 
-The server speaks JSON-RPC on stdout, so it cannot log there. Set the
-`MLS_TRACE` environment variable (to any value) to append a trace to
-`/tmp/mach-lsp.log`; leave it unset — the default — and the server performs no
-logging.
+The server speaks JSON-RPC on stdout, so it cannot log there. A trace is
+appended to `traceFile`, else `MLS_TRACE_FILE`, else `/tmp/mach-lsp.log`. With
+nothing configured, the default, the server performs no logging.
 
 What a trace contains is a separate decision from whether it is on. A message
 body is your source code: every `didOpen` carries a whole file and every
 `didChange` carries what you just typed. Tracing is normally turned on to see
-which requests arrived in what order, which does not need any of that, so by
-default the log records only what each message *is* — direction, method, id,
-size, timing — and no bodies.
+which requests arrived in what order, which does not need any of that, so the
+`messages` level records only what each message *is* (direction, method, id,
+size, timing) and no bodies.
 
-| variable | effect |
-|---|---|
-| `MLS_TRACE` | enables tracing (any value) |
-| `MLS_TRACE=bodies` | also records message bodies, truncated at 512 bytes each |
-| `MLS_TRACE_FILE` | appends to this path instead of `/tmp/mach-lsp.log` |
+| level | effect |
+| --- | --- |
+| `off` | no trace |
+| `messages` | one line per message, and the server's own notes |
+| `bodies` | also message bodies, truncated at 512 bytes each |
 
-Use `MLS_TRACE=bodies` only when you need the contents of a message, and be
-aware that the log will then contain fragments of whatever you have open.
+`MLS_TRACE` set to `bodies` means `bodies`, and set to any other value means
+`messages`. The LSP trace setting names the same levels `off`, `messages` and
+`verbose`.
+
+The level at startup is the first of these that is given:
+
+1. the `trace` option
+2. `MLS_TRACE`
+3. `initialize.trace`
+
+So `MLS_TRACE` is not silenced by an editor that sends `trace: "off"` by
+default, but the `trace` option does silence it. After startup, `$/setTrace`
+moves the level for the rest of the session, whatever set it.
+
+Use `bodies` only when you need the contents of a message, and be aware that
+the log will then contain fragments of whatever you have open.
 
 ## How the compiler dependency is wired
 
