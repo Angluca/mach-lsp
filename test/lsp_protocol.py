@@ -28,6 +28,19 @@ class ProtocolError(RuntimeError):
     """Raised when the live protocol session violates an asserted contract."""
 
 
+def source_diagnostics(item: dict[str, Any]) -> bool:
+    """Whether a message publishes diagnostics for a source file.
+
+    A load also publishes what it says about the project on the root's
+    `mach.toml` (#266), whenever that changes. Checks about how an edit moves a
+    source file's diagnostics look past those.
+    """
+    if item.get("method") != "textDocument/publishDiagnostics":
+        return False
+    uri = (item.get("params") or {}).get("uri", "")
+    return not uri.endswith("/mach.toml")
+
+
 class LspSession:
     """Drive one language-server process using LSP stdio framing."""
 
@@ -266,10 +279,8 @@ class LspSession:
         (the request's own reply drained the inbox past it); `settle` also
         catches a publish still in flight behind that reply.
         """
-        found = [m for m in self.pending
-                 if m.get("method") == "textDocument/publishDiagnostics"]
-        self.pending = [m for m in self.pending
-                        if m.get("method") != "textDocument/publishDiagnostics"]
+        found = [m for m in self.pending if source_diagnostics(m)]
+        self.pending = [m for m in self.pending if not source_diagnostics(m)]
         deadline = time.monotonic() + settle
         while True:
             remaining = deadline - time.monotonic()
@@ -282,7 +293,7 @@ class LspSession:
             if item is None or isinstance(item, BaseException):
                 return found
             self.message_count += 1
-            if item.get("method") == "textDocument/publishDiagnostics":
+            if source_diagnostics(item):
                 found.append(item)
             else:
                 self.pending.append(item)
@@ -1462,6 +1473,122 @@ def run_version(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_manifest_notes(server: Path, timeout: float) -> None:
+    """What a load says about the project itself shows on its mach.toml (#266).
+
+    A manifest without `[project].mach` loads with a warning that belongs to no
+    source file, and a compiler outside a stated range refuses the load. Both are
+    published on the root's `mach.toml`, and cleared when the manifest is fixed:
+    through `workspace/didChangeWatchedFiles`, through the next request when the
+    client sends no such notification, and for a root that never loaded as well
+    as one that did. A stale complaint on a fixed file is the failure this
+    guards.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    compiler = re.search(r'^version = "([^"]+)"',
+                         (repo / "dep" / "mach" / "mach.toml").read_text(encoding="utf-8"), re.M)
+    require(compiler is not None, "dep/mach/mach.toml has no version")
+    major, minor = compiler.group(1).split(".")[:2]
+    admitted = f'mach = "^{major}.{minor}"'
+    refused = 'mach = "^99"'
+
+    def notes_for(session: LspSession, uri: str, want: Callable[[list[dict[str, Any]]], bool],
+                  what: str) -> list[dict[str, Any]]:
+        message = session.wait_for(
+            lambda item: (item.get("method") == "textDocument/publishDiagnostics"
+                          and item.get("params", {}).get("uri") == uri
+                          and want(item["params"].get("diagnostics", []))),
+            what)
+        return message["params"]["diagnostics"]
+
+    def one(severity: int, text: str) -> Callable[[list[dict[str, Any]]], bool]:
+        return lambda found: (len(found) == 1 and found[0].get("severity") == severity
+                              and text in found[0].get("message", ""))
+
+    def cleared(found: list[dict[str, Any]]) -> bool:
+        return found == []
+
+    def changed(session: LspSession, uri: str) -> None:
+        session.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": uri, "type": 2}]})
+
+    def open_doc(session: LspSession, root: Path, main: Path, text: str) -> None:
+        session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+        session.notify("initialized", {})
+        session.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+
+    with tempfile.TemporaryDirectory(prefix="mls-notes-") as directory:
+        main, _, text = write_project(Path(directory).resolve(), "notes", 3)
+        root = Path(directory).resolve() / "notes"
+        manifest = root / "mach.toml"
+        uri = manifest.as_uri()
+        base = manifest.read_text(encoding="utf-8")
+        require(base.startswith("[project]\n") and "mach =" not in base,
+                "write_project's manifest changed shape")
+
+        def set_range(line: str | None) -> None:
+            manifest.write_text(base if line is None else base.replace("[project]\n", f"[project]\n{line}\n", 1),
+                                encoding="utf-8")
+
+        # a loaded root
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            open_doc(session, root, main, text)
+            found = notes_for(session, uri, one(2, "states no compiler range"),
+                              "the missing-range warning on mach.toml")
+            require(admitted in found[0]["message"],
+                    f"the warning does not name the line to add: {found[0]!r}")
+            session.diagnostics(main.as_uri(), 1)
+
+            set_range(admitted)
+            changed(session, uri)
+            notes_for(session, uri, cleared, "the warning cleared once the range was added")
+
+            set_range(refused)
+            changed(session, uri)
+            notes_for(session, uri, one(1, "does not accept it"),
+                      "the refusal on mach.toml")
+
+            # no watcher notification: the next request finds the new manifest
+            time.sleep(0.4)
+            set_range(admitted)
+            time.sleep(0.4)
+            # a semantic request is what consults the project, and with it the disk
+            session.request("textDocument/hover", {"textDocument": {"uri": main.as_uri()},
+                                                   "position": {"line": 0, "character": 0}})
+            notes_for(session, uri, cleared, "the refusal cleared by a request after an unannounced fix")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+        # a root that never loaded
+        set_range(refused)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            open_doc(session, root, main, text)
+            notes_for(session, uri, one(1, "does not accept it"),
+                      "the refusal of a first load on mach.toml")
+            session.wait_for(lambda item: (item.get("method") == "window/showMessage"
+                                           and "failed to load project" in item["params"].get("message", "")),
+                             "the load failure message")
+
+            set_range(admitted)
+            changed(session, uri)
+            notes_for(session, uri, cleared, "the refusal cleared once the root loaded")
+            symbols = session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(symbols.get("result"), f"the fixed root does not answer: {symbols!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_settings(server: Path, timeout: float) -> None:
     """What a client configures at `initialize`, and how it combines (#264).
 
@@ -1664,8 +1791,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                     f"a request during a rebuild was not answered: {symbols!r}")
             # nothing republished while that request was outstanding, so the
             # rebuild had not finished when it was answered
-            early = [item for item in session.pending
-                     if item.get("method") == "textDocument/publishDiagnostics"]
+            early = [item for item in session.pending if source_diagnostics(item)]
             require(not early,
                     f"the rebuild finished before the request was answered: {early!r}")
 
@@ -4698,6 +4824,7 @@ def main() -> int:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_version(server, args.timeout)
         run_settings(server, args.timeout)
+        run_manifest_notes(server, args.timeout)
         run_option_deadline(server, args.timeout)
         run_cross_module_references(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)

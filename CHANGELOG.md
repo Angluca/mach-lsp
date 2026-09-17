@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- feat(project): what a project load says about the project itself is shown on
+  the root's `mach.toml` (#266). mach 5.3 records some warnings against no source
+  file, such as the one for a manifest without `[project].mach`, and refuses a
+  load when the compiler is outside a range the closure states. Neither reached
+  the editor before. The server now publishes them as diagnostics on
+  `mach.toml`, and publishes the list again whenever it changes. A fixed
+  manifest therefore loses its complaint, whether the fix arrives as a watched
+  file change or is found by the next request. A root whose load failed is
+  retried as soon as a change is reported, and a rebuild for a loaded one starts
+  then too, rather than at the next message.
 - feat(settings): a configuration surface at `initialize` (#264). The
   `initializationOptions` keys `trace`, `traceFile` and `requestDeadlineMs`
   take precedence over `MLS_TRACE`, `MLS_TRACE_FILE` and
