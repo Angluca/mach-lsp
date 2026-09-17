@@ -1705,17 +1705,37 @@ def run_settings(server: Path, timeout: float) -> None:
                                        "colour": "blue", "requestDeadlineMs": 10}},
             {}, lambda s, d, _: options(s, d, chosen.parent))
 
-    # an unusable traceFile falls back to the environment's, with a note there
-    def relative(session: LspSession, doc: Path, directory: Path) -> None:
+    # a relative traceFile is under the workspace root: the first folder, else rootUri
+    def rooted(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        text = read(directory / "relative.log")
+        require("method textDocument/documentSymbol" in text,
+                f"a relative traceFile was not resolved against the workspace root: {sorted(directory.iterdir())!r}")
+        require("to " + str(directory / "relative.log") + " (option)" in text,
+                f"the resolved traceFile was not traced: {text[:600]!r}")
+
+    for params in (
+        lambda root: {"rootUri": root.as_uri()},
+        lambda root: {"rootUri": "file:///nonexistent-root",
+                      "workspaceFolders": [{"uri": root.as_uri(), "name": "w"}]},
+    ):
+        with tempfile.TemporaryDirectory(prefix="mls-settings-root-") as rootdir:
+            root = Path(rootdir).resolve()
+            run({**params(root), "initializationOptions": {"trace": "messages", "traceFile": "logs/../relative.log"}},
+                {}, lambda s, d, _: rooted(s, d, root))
+
+    # with no root, it falls back to the environment's, with a note there
+    def unrooted(session: LspSession, doc: Path, directory: Path) -> None:
         symbols(session, doc)
         text = read(directory / "env.log")
         require("method textDocument/documentSymbol" in text, "a relative traceFile did not fall back")
-        require("is not absolute" in text, f"the relative traceFile was not noted: {text[:600]!r}")
+        require("is relative and there is no workspace root" in text,
+                f"the unrooted traceFile was not noted: {text[:600]!r}")
 
     with tempfile.TemporaryDirectory(prefix="mls-settings-env-") as logdir:
         envlog = Path(logdir).resolve() / "env.log"
         run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
-            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: relative(s, d, envlog.parent))
+            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: unrooted(s, d, envlog.parent))
 
         # so does one too long to open
         envlog.unlink(missing_ok=True)

@@ -6,7 +6,7 @@
 # precedence is: option, then environment, then default.
 #
 #   trace              "off" | "messages" | "bodies"    MLS_TRACE
-#   traceFile          absolute path                    MLS_TRACE_FILE
+#   traceFile          path                             MLS_TRACE_FILE
 #   requestDeadlineMs  integer >= 1000                  MLS_REQUEST_DEADLINE_MS
 #
 # The trace level has one more source, the LSP `initialize.trace` value, after
@@ -32,7 +32,9 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.result.res;
 
+use std.allocator;
 use std.allocator.Allocator;
 use std.process.env;
 
@@ -42,6 +44,7 @@ use pathlib: std.types.path;
 
 use mls.json;
 use mls.trace;
+use mls.uris;
 
 # how much a trace records, as `trace` spells it
 pub val TRACE_OFF:      u8 = trace.LEVEL_OFF;
@@ -117,6 +120,7 @@ pub fun parse(params: *sj.Value, alloc: *Allocator, report: bool) Settings {
         }
         i = i + 1;
     }
+    s.trace_file = resolve_file(s.trace_file, params, alloc, report);
     ret s;
 }
 
@@ -314,20 +318,62 @@ fun option_level(v: *sj.Value, alloc: *Allocator, report: bool) opt[u8] {
 
 fun option_file(v: *sj.Value, alloc: *Allocator, report: bool) str {
     val path: str = json.text(v, alloc);
-    if (path == nil) {
-        if (report) { trace.log("settings: option `traceFile` is not a string; ignored\n"); }
-        ret nil;
-    }
+    if (path == nil && report) { trace.log("settings: option `traceFile` is not a string; ignored\n"); }
+    ret path;
+}
+
+# the `traceFile` option as the absolute path it names
+#
+# A relative path is relative to the workspace root: the first workspace folder,
+# else `rootUri`. A client that sends neither has no root to resolve against, so
+# the option is ignored rather than aimed at wherever the server was started.
+# ---
+# path:   the option as given, owned; consumed
+# params: the `initialize` params, for the workspace root
+# ret:    an owned absolute path, or nil when it cannot be used
+fun resolve_file(path: str, params: *sj.Value, alloc: *Allocator, report: bool) str {
+    if (path == nil) { ret nil; }
+    var out: str = path;
     if (!pathlib.is_abs(path)) {
-        if (report) { trace.logf("settings: option `traceFile` `{}` is not absolute; ignored", path); }
+        out = nil;
+        val root: str = workspace_root(params, alloc);
+        if (root == nil) {
+            if (report) { trace.logf("settings: option `traceFile` `{}` is relative and there is no workspace root; ignored", path); }
+        }
+        or {
+            val jr: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, root, path);
+            if (sel jr.ok) {
+                out = uris.normalize(alloc, jr.ok);
+                strutil.str_free(alloc, jr.ok);
+            }
+            strutil.str_free(alloc, root);
+        }
         json.free_str(path, alloc);
-        ret nil;
     }
-    if (str_len(path) >= trace.MAX_PATH) {
+    if (out != nil && str_len(out) >= trace.MAX_PATH) {
         if (report) { trace.logf("settings: option `traceFile` is longer than {} bytes; ignored", trace.MAX_PATH - 1); }
-        json.free_str(path, alloc);
+        strutil.str_free(alloc, out);
         ret nil;
     }
+    ret out;
+}
+
+# the filesystem path of the workspace root an `initialize` names, owned, or nil
+fun workspace_root(params: *sj.Value, alloc: *Allocator) str {
+    val folders: *sj.Value = json.member(params, "workspaceFolders");
+    if (folders != nil && sj.value_is_array(folders) && json.count(folders) > 0) {
+        val first: *sj.Value = json.element(folders, 0);
+        val uri:   str       = json.text(json.member(first, "uri"), alloc);
+        if (uri != nil) {
+            val path: str = uris.path_of(alloc, uri);
+            json.free_str(uri, alloc);
+            if (path != nil) { ret path; }
+        }
+    }
+    val root: str = json.text(json.member(params, "rootUri"), alloc);
+    if (root == nil) { ret nil; }
+    val path: str = uris.path_of(alloc, root);
+    json.free_str(root, alloc);
     ret path;
 }
 
@@ -353,6 +399,3 @@ fun key_text(obj: *sj.Value, i: usize, alloc: *Allocator) str {
     if (sel r.err) { ret nil; }
     ret r.ok;
 }
-
-use std.allocator;
-use std.types.result.res;
