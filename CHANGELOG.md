@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat(version): `mls --version` prints `mls <version> (mach <version>)`, and
   `initialize` reports the compiler version as `serverInfo.mach`.
   `serverInfo.version` is unchanged.
+- docs: the README documents the public command line, `mls` and
+  `mls --version`, and marks `mls --worker` private (#265). `--worker` is the
+  supervisor's re-launch of itself, with no stability promise.
 
 ### Fixed
 - fix(features): `tag` declarations have a name span (#249). The outline
