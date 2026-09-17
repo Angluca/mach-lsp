@@ -1546,18 +1546,13 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     var bind:     token.Span;
     val has_bind: bool = binding_span(an, sr.sym_id, ?bind);
 
-    val cap: usize                       = (project.module_count(an.root) + 1)::usize;
-    val ra:  res[*XRef, allocator.Error] = allocate[XRef](alloc, cap);
-    if (sel ra.err) {
+    var set: RefSet = empty_refs();
+    if (!build_refs(ws, alloc, an, uri, sym, sr.sym_id, false, ?set)) {
         render.reply_empty_array(alloc, id_raw);
         ret;
     }
-    val refs: *XRef = ra.ok;
-
-    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, false, refs, cap);
-    emit_locations(alloc, id_raw, refs, n, bind, has_bind);
-    free_refs(ws, refs, n);
-    deallocate[XRef](alloc, refs, cap);
+    emit_locations(alloc, id_raw, set.items, set.len, bind, has_bind);
+    free_refs(ws, alloc, ?set);
 }
 
 # answer textDocument/documentHighlight with every occurrence of the symbol at
@@ -1757,7 +1752,16 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched
-    val no: opt[str] = intern.lookup(an.interner, sym.name);
+    # the guard is the DECLARED name: a binding imported under an alias carries
+    # the alias as its own name, and only occurrences spelled as declared are
+    # rewritten
+    val decl_sym: *rslv.Symbol = project.defining_symbol_in(an.root, sym);
+    if (decl_sym == nil) {
+        render.reply_empty_edit(alloc, id_raw);
+        json.free_str(new_name, alloc);
+        ret;
+    }
+    val no: opt[str] = intern.lookup(an.interner, decl_sym.name);
     if (sel no.none) {
         render.reply_empty_edit(alloc, id_raw);
         json.free_str(new_name, alloc);
@@ -1775,20 +1779,14 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var doc:     token.Span;
     val has_doc: bool = param_generic_doc_span(an, sym, name, ?doc);
 
-    var cap: usize = project.module_count(an.root)::usize;
-    if (cap == 0) { cap = 1; }
-    val ra: res[*XRef, allocator.Error] = allocate[XRef](alloc, cap);
-    if (sel ra.err) {
+    var set: RefSet = empty_refs();
+    if (!build_refs(ws, alloc, an, uri, sym, sr.sym_id, true, ?set)) {
         render.reply_empty_edit(alloc, id_raw);
         json.free_str(new_name, alloc);
         ret;
     }
-    val refs: *XRef = ra.ok;
-
-    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, true, refs, cap);
-    emit_rename(alloc, id_raw, refs, n, new_name, name, bind, has_bind, doc, has_doc);
-    free_refs(ws, refs, n);
-    deallocate[XRef](alloc, refs, cap);
+    emit_rename(alloc, id_raw, set.items, set.len, new_name, name, bind, has_bind, doc, has_doc);
+    free_refs(ws, alloc, ?set);
     json.free_str(new_name, alloc);
 }
 
@@ -2089,67 +2087,132 @@ rec XRef {
     owned:  bool;
 }
 
-# collect each retained module whose resolver maps the target's canonical
-# (origin, declaration) identity. The active document is already that exact
-# ModuleEntry, so it uses the request URI and is neither bridged nor duplicated.
-fun build_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, sym: *rslv.Symbol, self_target: rslv.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
-    if (an.root == nil || sym.decl == id.DECL_NIL
-        || (sym.origin == an.own && ((sym.flags & rslv.SYM_FLAG_MODULE) == 0
-        || (sym.flags & rslv.SYM_FLAG_PUB) == 0))) {
-        out[0].a      = an.a;
-        out[0].rr     = an.rr;
-        out[0].text   = an.text;
-        out[0].uri    = uri;
-        out[0].target = self_target;
-        out[0].owned  = false;
-        ret 1;
-    }
-    var n:   usize = 0;
-    val mc:  u32   = project.module_count(an.root);
-    var mid: u32   = 0;
-    for (mid < mc && n < cap) {
-        val cur: sess.ModuleId = mid::sess.ModuleId;
-        if (project_only && !project.is_project_module(ws, an.root, cur)) {
-            mid = mid + 1;
-            cnt;
-        }
-        val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
-        if (sel mv_o.none) {
-            mid = mid + 1;
-            cnt;
-        }
-        val mv:  project.ModuleView = mv_o.some;
-        val tgt: rslv.SymbolId      = features.symbol_by_decl(mv.rr, sym.origin, sym.decl);
-        if (tgt == rslv.SYMBOL_NIL) {
-            mid = mid + 1;
-            cnt;
-        }
-        var muri: str = nil;
-        if (cur == an.own) { muri = uri; }
-        or                 { muri = project.module_uri(ws, an.root, cur); }
-        if (muri == nil) {
-            mid = mid + 1;
-            cnt;
-        }
-        out[n].a      = mv.a;
-        out[n].rr     = mv.rr;
-        out[n].text   = mv.text;
-        out[n].uri    = muri;
-        out[n].target = tgt;
-        out[n].owned  = cur != an.own;
-        n             = n + 1;
-        mid           = mid + 1;
-    }
-    ret n;
+# the files contributing references to one target, owned
+# ---
+# items: the entries, allocated for `cap`
+# len:   entries in use
+# cap:   allocation length
+rec RefSet {
+    items: *XRef;
+    len:   usize;
+    cap:   usize;
 }
 
-# release generated graph-module URIs; the active request URI is borrowed
-fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
+fun empty_refs() RefSet {
+    ret RefSet{items: nil, len: 0, cap: 0};
+}
+
+# collect every binding, in every retained module, that names the declaration
+# the cursor's symbol names
+#
+# Identity is the defining symbol's (origin, declaration), matched through
+# `features.symbol_denotes`: a `use`d binding carries its referent's origin but
+# no DeclId of its own, and is recognized by its canonical name and declaring
+# kind, which the whole root shares one interner for (#246). A module may bind
+# the same declaration more than once - imported plainly and under an alias -
+# and each binding is its own entry, since each is its own set of spans.
+#
+# A symbol that is not visible outside its module - a local, a non-`pub`
+# declaration - is walked in the requesting buffer alone. The active document
+# uses the request URI; every other module owns its generated file URI.
+# ---
+# ws:           the workspace
+# alloc:        request allocator for the entries
+# an:           the requesting buffer's analysis
+# uri:          its document URI
+# sym:          the symbol at the cursor
+# self_target:  its SymbolId in the requesting buffer
+# project_only: skip modules the user does not own (rename)
+# out:          receives the entries; release with `free_refs`
+# ret:          false when memory ran out
+fun build_refs(ws: *project.Workspace, alloc: *Allocator, an: analysis.Analyzed, uri: str, sym: *rslv.Symbol,
+    self_target: rslv.SymbolId, project_only: bool, out: *RefSet) bool {
+    val target: *rslv.Symbol = project.defining_symbol_in(an.root, sym);
+    val local:  bool         = an.root == nil || target == nil
+        || (target.origin == an.own && ((target.flags & rslv.SYM_FLAG_MODULE) == 0
+        || (target.flags & rslv.SYM_FLAG_PUB) == 0));
+    if (local) {
+        if (!reserve_refs(alloc, out, 1)) { ret false; }
+        out.items[0] = XRef{a: an.a, rr: an.rr, text: an.text, uri: uri, target: self_target, owned: false};
+        out.len      = 1;
+        ret true;
+    }
+
+    var total: usize = 0;
+    val mc:    u32   = project.module_count(an.root);
+    var pass:  u32   = 0;
+    for (pass < 2) {
+        if (pass == 1 && !reserve_refs(alloc, out, total)) { ret false; }
+        var mid: u32 = 0;
+        for (mid < mc) {
+            val cur: sess.ModuleId = mid::sess.ModuleId;
+            if (project_only && !project.is_project_module(ws, an.root, cur)) {
+                mid = mid + 1;
+                cnt;
+            }
+            val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
+            if (sel mv_o.none) {
+                mid = mid + 1;
+                cnt;
+            }
+            val mv: project.ModuleView = mv_o.some;
+            var si: u32                = 0;
+            for (si < mv.rr.symbol_count) {
+                val sid: rslv.SymbolId = si::rslv.SymbolId;
+                if (features.symbol_denotes(mv.rr, sid, target.origin, target.decl, target.canon, target.kind)) {
+                    if (pass == 0) { total = total + 1; }
+                    or {
+                        if (!push_ref(ws, an, uri, cur, mv, sid, out)) { ret false; }
+                    }
+                }
+                si = si + 1;
+            }
+            mid = mid + 1;
+        }
+        pass = pass + 1;
+    }
+    ret true;
+}
+
+# append the entry for binding `sid` of module `cur`; false when its URI could
+# not be built
+fun push_ref(ws: *project.Workspace, an: analysis.Analyzed, uri: str, cur: sess.ModuleId,
+    mv: project.ModuleView, sid: rslv.SymbolId, out: *RefSet) bool {
+    var muri:  str  = uri;
+    val owned: bool = cur != an.own;
+    if (owned)       { muri = project.module_uri(ws, an.root, cur); }
+    if (muri == nil) { ret false; }
+    if (out.len >= out.cap) {
+        if (owned) { json.free_str(muri, ws.alloc); }
+        ret false;
+    }
+    out.items[out.len] = XRef{a: mv.a, rr: mv.rr, text: mv.text, uri: muri, target: sid, owned: owned};
+    out.len            = out.len + 1;
+    ret true;
+}
+
+fun reserve_refs(alloc: *Allocator, out: *RefSet, n: usize) bool {
+    var cap: usize = n;
+    if (cap == 0) { cap = 1; }
+    val r: res[*XRef, allocator.Error] = allocate[XRef](alloc, cap);
+    if (sel r.err) { ret false; }
+    out.items = r.ok;
+    out.cap   = cap;
+    out.len   = 0;
+    ret true;
+}
+
+# release generated module URIs and the entries; the request URI is borrowed
+fun free_refs(ws: *project.Workspace, alloc: *Allocator, set: *RefSet) {
     var i: usize = 0;
-    for (i < n) {
-        if (refs[i].owned && refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
+    for (i < set.len) {
+        if (set.items[i].owned && set.items[i].uri != nil) { json.free_str(set.items[i].uri, ws.alloc); }
         i = i + 1;
     }
+    if (set.items != nil) { deallocate[XRef](alloc, set.items, set.cap); }
+    set.items = nil;
+    set.len   = 0;
+    set.cap   = 0;
 }
 
 # the size-or-write accumulator behind the shared reference walk.

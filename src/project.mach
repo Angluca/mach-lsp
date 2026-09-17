@@ -1741,6 +1741,20 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
     ret opt[Site].some{s};
 }
 
+# the declaration-bearing symbol `sym` names within `root`: `sym` itself when it
+# carries its declaration, otherwise the defining module's own symbol, or nil
+# when that module is not loaded
+# ---
+# root: the root the symbol was resolved under, or nil
+# sym:  any symbol, including a `use` or `fwd` binding
+# ret:  the defining symbol, or nil
+pub fun defining_symbol_in(root: *Root, sym: *rslv.Symbol) *rslv.Symbol {
+    if (sym.decl != id.DECL_NIL) { ret sym; }
+    val m: *driver.ModuleEntry = module_entry(root, sym.origin);
+    if (m == nil) { ret nil; }
+    ret defining_symbol(m.resolve_result, sym);
+}
+
 # the defining module's own symbol for `sym`. a `use` or `fwd` binding names
 # its definition by canonical name and kind and carries no DeclId of its own
 # (a `use` binding is SYM_IMPORTED over `definition_kind`, a `fwd` binding

@@ -1774,6 +1774,112 @@ def nav_ranges(text: str, within: str, needle: str) -> list[dict[str, Any]]:
         start = at + len(needle)
 
 
+NAV_ALIAS = """use h: nav.defs.helper;
+
+pub fun aliased(n: i32) i32 {
+    ret h(n);
+}
+"""
+
+
+def run_cross_module_references(server: Path, timeout: float) -> None:
+    """References and rename reach every module that imports the symbol (#246).
+
+    A `use`d binding carries its referent's origin but no declaration of its own,
+    so an identity test by declaration alone stopped the walk at the open buffer.
+    Asked from an importer, both requests must reach the declaring module, a
+    third module that imports the same function, and a module that imports it
+    under an alias - where rename rewrites the import path but not the alias.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-xrefs-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        other = main.parent / "other.mach"
+        alias = main.parent / "alias.mach"
+        alias.write_text(NAV_ALIAS, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            for doc, body in ((alias, NAV_ALIAS), (main, text)):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": doc.as_uri(), "languageId": "mach",
+                                      "version": 1, "text": body}},
+                )
+                session.diagnostics(doc.as_uri(), 1)
+
+            at_call = {"textDocument": {"uri": main.as_uri()},
+                       "position": nav_position(text, "ret helper(n) + helper(n + 1);", "helper")}
+
+            def lines_by_file(locations: list[dict[str, Any]]) -> dict[str, list[int]]:
+                found: dict[str, list[int]] = {}
+                for loc in locations:
+                    found.setdefault(Path(loc["uri"].removeprefix("file://")).name, []).append(
+                        loc["range"]["start"]["line"])
+                return {k: sorted(v) for k, v in found.items()}
+
+            refs = session.request("textDocument/references",
+                                   {**at_call, "context": {"includeDeclaration": True}})["result"]
+            by_file = lines_by_file(refs)
+            require(set(by_file) == {"main.mach", "defs.mach", "other.mach", "alias.mach"},
+                    f"references did not reach every importer: {by_file!r}")
+            require(by_file["defs.mach"] == [NAV_DEFS.splitlines().index(
+                        next(l for l in NAV_DEFS.splitlines() if l.startswith("pub fun helper")))],
+                    f"the declaration is missing: {by_file!r}")
+            require(by_file["other.mach"] == [0, 3],
+                    f"the third module's import and call are not both reported: {by_file!r}")
+            require(by_file["alias.mach"] == [0, 3],
+                    f"the aliased module's import and call are not both reported: {by_file!r}")
+
+            edit = session.request("textDocument/rename", {**at_call, "newName": "assist"})["result"]
+            changes = {Path(uri.removeprefix("file://")).name: sorted(e["range"]["start"]["line"] for e in edits)
+                       for uri, edits in edit.get("changes", {}).items()}
+            require(set(changes) == {"main.mach", "defs.mach", "other.mach", "alias.mach"},
+                    f"rename did not reach every importer: {changes!r}")
+            require(changes["other.mach"] == [0, 3],
+                    f"rename missed the third module's import or call: {changes!r}")
+            # the alias keeps its own name; only the path that names the function moves
+            require(changes["alias.mach"] == [0],
+                    f"rename rewrote the alias, or missed its import path: {changes!r}")
+            for e in edit["changes"][alias.as_uri()]:
+                require(e["newText"] == "assist" and e["range"]["start"]["character"] > len("use h: nav.defs"),
+                        f"the aliased import was not rewritten at its path leaf: {e!r}")
+
+            # asked through the alias, rename still renames the declaration and keeps
+            # the alias: the guard is the declared name, not the binding's own
+            via_alias = session.request("textDocument/rename", {
+                "textDocument": {"uri": alias.as_uri()},
+                "position": nav_position(NAV_ALIAS, "ret h(n);", "h"),
+                "newName": "assist"})["result"]
+            alias_changes = {Path(uri.removeprefix("file://")).name: sorted(e["range"]["start"]["line"] for e in edits)
+                             for uri, edits in via_alias.get("changes", {}).items()}
+            require(alias_changes == changes,
+                    f"rename through the alias differs from rename at a call: {alias_changes!r} vs {changes!r}")
+
+            # asked from the declaring module, the answer is the same set
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": NAV_DEFS}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            from_decl = session.request("textDocument/references", {
+                "textDocument": {"uri": defs.as_uri()},
+                "position": nav_position(NAV_DEFS, "pub fun helper", "helper"),
+                "context": {"includeDeclaration": True}})["result"]
+            require(lines_by_file(from_decl) == by_file,
+                    f"references from the declaration differ from references at a call: "
+                    f"{lines_by_file(from_decl)!r} vs {by_file!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_call_hierarchy(server: Path, timeout: float) -> None:
     """Call hierarchy resolves items by position, across modules, including
     calls whose target is not statically known.
@@ -4416,6 +4522,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_version(server, args.timeout)
+        run_cross_module_references(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)
