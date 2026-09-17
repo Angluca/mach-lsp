@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- fix(supervisor): `requestDeadlineMs` no longer ends the server when a project
+  load takes longer than the deadline (#284). The deadline now bounds only the
+  time the worker spends handling a request. A project load, and a request held
+  for a rebuild, do not count against it, and the worker tells the supervisor
+  when either is happening. Responses the client sends to the server's own
+  requests, such as progress token creation, are no longer taken for requests.
+  That mistake left a request marked outstanding that no reply would ever
+  close, so every replacement worker was ended within a fraction of a second
+  until the server exited. When the worker dies, every request it still owed is
+  now answered, including held requests and requests with string ids.
+
 ## [0.20.0] - 2026-09-17
 
 Configuration at `initialize`, project-level diagnostics on `mach.toml`,
