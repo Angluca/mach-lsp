@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles now. Projects are checked against the linked mach's version: one whose
   `[project].mach` excludes it is not loaded. The README's Compiler
   compatibility section describes this.
+- chore(project): mls states its own compiler range, `mach = "^5.3"`, and
+  builds only with mach 5.3 or later (#266).
 - chore(license): copyright is attributed to Briar Systems LLC, 2025-2026
   (#277). The MIT terms are unchanged.
 - docs: the README states the first-load time, rebuild times and resident
