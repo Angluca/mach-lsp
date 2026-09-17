@@ -242,30 +242,30 @@ fun record_close(m: *Mirror, params: *sj.Value) {
 # only turn one failure into several.
 # ---
 # m:   the mirror
-# fd:  the worker's input
+# to:  the worker's input
 # ret: true when the whole session was written
-pub fun replay(m: *Mirror, fd: i32) bool {
+pub fun replay(m: *Mirror, to: usize) bool {
     if (m.init_body == nil)                                               { ret true; }
-    if (!transport.write_frame_to(fd, m.init_body, str_len(m.init_body))) { ret false; }
+    if (!transport.write_frame_to(to, m.init_body, str_len(m.init_body))) { ret false; }
     if (m.ready_body != nil) {
-        if (!transport.write_frame_to(fd, m.ready_body, str_len(m.ready_body))) { ret false; }
+        if (!transport.write_frame_to(to, m.ready_body, str_len(m.ready_body))) { ret false; }
     }
     if (m.trace_body != nil) {
-        if (!transport.write_frame_to(fd, m.trace_body, str_len(m.trace_body))) { ret false; }
+        if (!transport.write_frame_to(to, m.trace_body, str_len(m.trace_body))) { ret false; }
     }
 
     var i: usize = 0;
     for (i < m.len) {
         val d: *Doc = ?m.docs[i];
         if (d.live && d.uri != nil && d.text != nil) {
-            if (!replay_open(m, fd, d)) { ret false; }
+            if (!replay_open(m, to, d)) { ret false; }
         }
         i = i + 1;
     }
     ret true;
 }
 
-fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
+fun replay_open(m: *Mirror, to: usize, d: *Doc) bool {
     var b: json.Buf = json.buf_init(m.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":");
     json.buf_push_quoted(?b, d.uri);
@@ -280,7 +280,7 @@ fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
 
     val msg: str  = json.buf_str(?b);
     var ok:  bool = false;
-    if (msg != nil) { ok = transport.write_frame_to(fd, msg, json.buf_len(?b)); }
+    if (msg != nil) { ok = transport.write_frame_to(to, msg, json.buf_len(?b)); }
     json.buf_dnit(?b);
     ret ok;
 }
