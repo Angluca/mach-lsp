@@ -99,7 +99,7 @@ less.
 | first semantic answer after opening a project | ~26 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
 | first rebuild after that load | ~26 s | a root keeps two sessions, and the second is cold until its first build (#252) |
 | every later rebuild | ~1.2-1.4 s | a rebuild still walks the whole project to find what an edit changed (#250) |
-| analysis worker memory | ~870 MiB after the first load, ~1.35 GiB once both sessions have built, ~1.7 GiB peak while the second builds for the first time; flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
+| analysis worker memory (resident plus swap) | ~860 MiB after the first load; ~1.7 GiB peak while the spare session builds for the first time; ~1.35 GiB steady once both sessions have built, flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
 
 While a rebuild runs, the edited buffer keeps answering from the snapshot it
 has (see above), so neither rebuild figure is time without answers. Syntax-only
@@ -188,20 +188,21 @@ setting has an environment variable behind it, and the order is: the
 | `initializationOptions` key | environment | value |
 | --- | --- | --- |
 | `trace` | `MLS_TRACE` | `"off"`, `"messages"` or `"bodies"` (see [Tracing](#tracing)) |
-| `traceFile` | `MLS_TRACE_FILE` | an absolute path the trace is appended to |
+| `traceFile` | `MLS_TRACE_FILE` | the file the trace is appended to |
 | `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
 
-An unusable value is ignored and noted in the trace, whether it came from an
-option or from the environment.
+A relative `traceFile` is under the workspace root: the first of
+`workspaceFolders`, else `rootUri`. With neither, it is ignored. A relative
+`MLS_TRACE_FILE` is under the directory the server was started in.
 
 ```json
 { "initializationOptions": { "trace": "messages", "traceFile": "/home/me/mls.log" } }
 ```
 
 A key the server does not know, and a value it cannot use, is ignored and noted
-in the trace. Configuration never fails `initialize`, so a client written for a
-newer server still gets a working one. `workspace/didChangeConfiguration` is
-ignored.
+in the trace, whether it came from an option or from the environment.
+Configuration never fails `initialize`, so a client written for a newer server
+still gets a working one. `workspace/didChangeConfiguration` is ignored.
 
 `requestDeadlineMs` is a tuning knob. It bounds how long the analysis worker may
 spend on any one message while a request waits for it. Past it, the server
@@ -256,7 +257,7 @@ the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.3.1`
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.4.0`
 and `v4.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 `dep/` are the pins; there is no lockfile. std is pinned to the release mach's
 own CI builds with, because the server and the compiler it links share one
