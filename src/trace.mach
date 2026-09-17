@@ -94,9 +94,12 @@ pub val LEVEL_OFF:      u8 = 0;
 pub val LEVEL_MESSAGES: u8 = 1;
 pub val LEVEL_BODIES:   u8 = 2;
 
+# the longest chosen trace path, with its terminator
+pub val MAX_PATH: usize = 512;
+
 # a trace file a client chose, and whether it chose one; used in place of the
 # environment's and the default when the log is next opened
-var CHOSEN_PATH: [512]u8;
+var CHOSEN_PATH: [MAX_PATH]u8;
 var PATH_CHOSEN: bool = false;
 
 # storage for the MLS_TRACE value; read once alongside the gate
@@ -173,7 +176,7 @@ pub fun start(level: opt[u8], lsp_level: opt[u8], file: str) {
     val env_on: bool = LOG_ENABLED;
     if (file != nil) {
         val n: usize = str_len(file);
-        if (n < 512) {
+        if (n < MAX_PATH) {
             var i: usize = 0;
             for (i < n) {
                 CHOSEN_PATH[i] = file[i];

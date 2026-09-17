@@ -24,6 +24,7 @@ use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
@@ -137,6 +138,11 @@ fun option_file(v: *sj.Value, alloc: *Allocator, report: bool) str {
     }
     if (!pathlib.is_abs(path)) {
         if (report) { trace.logf("settings: option `traceFile` `{}` is not absolute; ignored", path); }
+        json.free_str(path, alloc);
+        ret nil;
+    }
+    if (str_len(path) >= trace.MAX_PATH) {
+        if (report) { trace.logf("settings: option `traceFile` is longer than {} bytes; ignored", trace.MAX_PATH - 1); }
         json.free_str(path, alloc);
         ret nil;
     }

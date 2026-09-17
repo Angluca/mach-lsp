@@ -1543,6 +1543,13 @@ def run_settings(server: Path, timeout: float) -> None:
         run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
             {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: relative(s, d, envlog.parent))
 
+        # so does one too long to open
+        envlog.unlink(missing_ok=True)
+        run({"initializationOptions": {"trace": "messages", "traceFile": "/" + "x" * 600}},
+            {"MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("is longer than 511 bytes" in read(envlog),
+                                                    f"a long traceFile was not noted: {read(envlog)[:400]!r}")))
+
         # the LSP trace value turns tracing on when the environment does not
         envlog.unlink(missing_ok=True)
         run({"trace": "messages"}, {"MLS_TRACE_FILE": str(envlog)},
