@@ -74,6 +74,27 @@ The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols do not pay that cost; moving semantic work
 off the request path is tracked by #143.
 
+## Known limits
+
+These are the costs of the current design, not defects awaiting a fix. The
+figures are from this repository, which analyzes the whole compiler and
+standard library (`dep/mach`, `dep/std`): a release build on mach 5.2.1, on an
+8-core Ryzen 7 5800X3D. Smaller projects pay proportionally less.
+
+| cost | figure | why |
+| --- | --- | --- |
+| first semantic answer after opening a project | ~28-30 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
+| first rebuild after that load | ~30 s | a root keeps two sessions, and the second is cold until its first build (#252) |
+| every later rebuild | ~2 s | the compiler rebuilds the project, not only what an edit touched (#250) |
+| analysis worker memory | ~540 MiB after the first load, 0.9-1.0 GiB with both sessions built, ~1.15 GiB peak while rebuilding | the two sessions are the price of rebuilds that never block requests (#248) |
+
+While a rebuild runs, the edited buffer keeps answering from the snapshot it
+has (see above), so neither rebuild figure is time without answers. Syntax-only
+features never wait on analysis. What remains blocked is the first load.
+Semantic requests made during it wait for it to finish. The server keeps reading
+input throughout, so it never blocks the editor mid-write, and edits made
+meanwhile are coalesced into one analysis.
+
 ## Building
 
 The compiler and standard library are vendored under `dep/` as git submodules

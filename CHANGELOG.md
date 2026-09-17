@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- docs: the README states the first-load time, rebuild times and resident
+  memory as known limits, measured on this repository (#268).
 - docs: the README documents the public command line, `mls` and
   `mls --version`, and marks `mls --worker` private (#265). `--worker` is the
   supervisor's re-launch of itself, with no stability promise.
