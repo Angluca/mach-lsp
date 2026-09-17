@@ -95,6 +95,9 @@ Semantic requests made during it wait for it to finish. The server keeps reading
 input throughout, so it never blocks the editor mid-write, and edits made
 meanwhile are coalesced into one analysis.
 
+Positions are UTF-16 code units, as LSP defines by default. The server does not
+negotiate `positionEncoding` (#269).
+
 ## Building
 
 The compiler and standard library are vendored under `dep/` as git submodules
