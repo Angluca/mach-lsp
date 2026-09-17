@@ -36,9 +36,6 @@ pub val LSP_WARNING: i64 = 2;
 pub val LSP_INFO:    i64 = 3;
 pub val LSP_HINT:    i64 = 4;
 
-# the file id mach records a diagnostic that has no file against
-val NO_FILE: src.FileId = 0xFFFFFFFF;
-
 # the most notes one root carries; a load records a handful at most
 val MAX_NOTES: usize = 16;
 
@@ -75,7 +72,7 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
     var i: usize = 0;
     for (store != nil && i < store.items.len) {
         val d: *diag.Diagnostic = ?store.items.data[i];
-        if (d.loc.file_id == NO_FILE) { add(alloc, ?n, lsp_severity(d.severity), d.message); }
+        if (d.loc.file_id == src.FILE_NIL) { add(alloc, ?n, lsp_severity(d.severity), d.message); }
         i = i + 1;
     }
     ret n;
@@ -153,9 +150,9 @@ test "notes: capture keeps only the diagnostics with no file, in order" {
     var span:  mach_token.Span;
     span.offset = 0;
     span.len    = 0;
-    diag.record_warning(?store, NO_FILE, span, "no range");
+    diag.record_warning(?store, src.FILE_NIL, span, "no range");
     diag.record_warning(?store, 3::src.FileId, span, "in a file");
-    diag.record_error(?store, NO_FILE, span, "refused");
+    diag.record_error(?store, src.FILE_NIL, span, "refused");
     var n:    Notes = capture(?pa, ?store);
     var same: Notes = capture(?pa, ?store);
     var none: Notes = empty();
