@@ -12,6 +12,7 @@ name: Release
 # asset names are part of the contract editor extensions download by:
 #   mls-<version>-<target>.tar.gz   (linux, darwin)
 #   mls-<version>-<target>.zip      (windows)
+#   RELEASES.json                   every mls version and the mach it links
 #   SHA256SUMS
 
 on:
@@ -159,13 +160,34 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
       TAG: ${{ needs.verify.outputs.tag }}
     steps:
+      # every tag, for RELEASES.json
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
 
-      - name: checksums over the complete archive set
+      - name: RELEASES.json from the tags
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 dep/mach
+          python3 .github/release/releases.py "$VERSION" dist/RELEASES.json
+
+      - name: RELEASES.json names the mach this release links
+        run: |
+          set -euo pipefail
+          mach="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' dist/RELEASES.json "$VERSION")"
+          mkdir -p probe
+          tar -C probe -xzf "dist/mls-$VERSION-x86_64-linux.tar.gz" mls
+          want="mls $VERSION (mach $mach)"
+          got="$(probe/mls --version)"
+          [ "$got" = "$want" ] || { echo "::error::RELEASES.json says '$want', the binary says '$got'"; exit 1; }
+
+      - name: checksums over the complete asset set
         run: |
           set -euo pipefail
           cd dist
@@ -173,7 +195,7 @@ jobs:
             [ -f "mls-$VERSION-$t.tar.gz" ] || { echo "::error::release is missing mls-$VERSION-$t.tar.gz"; exit 1; }
           done
           [ -f "mls-$VERSION-x86_64-windows.zip" ] || { echo "::error::release is missing mls-$VERSION-x86_64-windows.zip"; exit 1; }
-          sha256sum mls-*.tar.gz mls-*.zip > SHA256SUMS
+          sha256sum mls-*.tar.gz mls-*.zip RELEASES.json > SHA256SUMS
           cat SHA256SUMS
 
       - id: draft
@@ -187,6 +209,7 @@ jobs:
           files: |
             dist/mls-*.tar.gz
             dist/mls-*.zip
+            dist/RELEASES.json
             dist/SHA256SUMS
 
       - name: every asset is on the draft
@@ -195,7 +218,7 @@ jobs:
         run: |
           set -euo pipefail
           names="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.assets[].name' | sort)"
-          want="$(cd dist && ls mls-*.tar.gz mls-*.zip SHA256SUMS | sort)"
+          want="$(cd dist && ls mls-*.tar.gz mls-*.zip RELEASES.json SHA256SUMS | sort)"
           echo "$names"
           [ "$names" = "$want" ] || { echo "::error::the draft's assets differ from the built set"; exit 1; }
 
