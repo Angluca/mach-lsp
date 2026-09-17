@@ -8,8 +8,13 @@
 # namespace. The supervisor consumes every one of them. A client never sees
 # them, which is why their shape is free to change in any release.
 #
+#   $/mls/next     {}                          the worker took up its next message
 #   $/mls/loading  {"loading": bool}           a project load started or ended
 #   $/mls/held     {"id": <id>, "held": bool}  a request was held or resumed
+#
+# The deadline bounds one message's handling while a request waits, so a
+# request queued behind other work is not charged for it, and a message stuck
+# in compiler code is still caught once a request waits behind it.
 #
 # A load is not bounded by the deadline. mach's front end reports no progress
 # while it analyses, so nothing outside it can tell a long load from a stuck
@@ -25,6 +30,7 @@ use std.allocator.Allocator;
 use mls.json;
 use mls.transport;
 
+pub val NEXT:    str = "$/mls/next";
 pub val LOADING: str = "$/mls/loading";
 pub val HELD:    str = "$/mls/held";
 
@@ -34,6 +40,15 @@ pub val PREFIX: str = "$/mls/";
 # whether a method belongs to the sideband
 pub fun owns(method: str) bool {
     ret method != nil && str_starts_with(method, PREFIX);
+}
+
+# tell the supervisor the worker took up its next piece of work
+pub fun next(alloc: *Allocator) {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+    json.buf_push(?b, NEXT);
+    json.buf_push(?b, "\"}");
+    send(?b, alloc);
 }
 
 # tell the supervisor a project load started or ended
