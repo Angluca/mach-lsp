@@ -749,6 +749,18 @@ fun handle_did_save(srv: *Server, params: *sj.Value) {
     if (uri == nil) { ret; }
     project.invalidate_uri(?srv.ws, uri);
     json.free_str(uri, srv.alloc);
+    after_disk_change(srv);
+}
+
+# act on a change on disk now rather than at the next message
+#
+# The client may send nothing more for a while, and a fixed manifest must not
+# keep its complaint until it does. A root that never loaded is loaded here, and
+# a rebuild for one that did is started; its result arrives through the build
+# worker's wake.
+fun after_disk_change(srv: *Server) {
+    if (project.retry_failed(?srv.ws)) { republish_all(srv); }
+    collect_rebuilds(srv);
 }
 
 # invalidate every project root whose tree contains a changed file, so the next
@@ -766,6 +778,7 @@ fun handle_did_change_watched_files(srv: *Server, params: *sj.Value) {
         }
         i = i + 1;
     }
+    after_disk_change(srv);
 }
 
 # acknowledge a shutdown request and enter the shutting-down phase

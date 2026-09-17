@@ -80,7 +80,7 @@ fun print_version() i64 {
 }
 
 fun put(s: str) bool {
-    ret os.write(os.STDOUT_FD, s::*u8, str_len(s)) >= 0;
+    ret os.write(os.stdout(), s::*u8, str_len(s)) >= 0;
 }
 
 # this executable's path, for re-spawning the worker

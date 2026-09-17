@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- feat(project): what a project load says about the project itself is shown on
+  the root's `mach.toml` (#266). mach 5.3 records some warnings against no source
+  file, such as the one for a manifest without `[project].mach`, and refuses a
+  load when the compiler is outside a range the closure states. Neither reached
+  the editor before. The server now publishes them as diagnostics on
+  `mach.toml`, and publishes the list again whenever it changes. A fixed
+  manifest therefore loses its complaint, whether the fix arrives as a watched
+  file change or is found by the next request. A root whose load failed is
+  retried as soon as a change is reported, and a rebuild for a loaded one starts
+  then too, rather than at the next message.
 - feat(settings): a configuration surface at `initialize` (#264). The
   `initializationOptions` keys `trace`, `traceFile` and `requestDeadlineMs`
   take precedence over `MLS_TRACE`, `MLS_TRACE_FILE` and
@@ -17,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
+- chore(dep): the server links mach 5.3.1, built against std 4.0.0, the std
+  mach's own CI proves (#266). std 4.0 passes descriptors as pointer-width
+  handles, so the transport, the supervisor's pipes and the trace log hold
+  handles now. Projects are checked against the linked mach's version: one whose
+  `[project].mach` excludes it is not loaded. The README's Compiler
+  compatibility section describes this.
+- chore(project): mls states its own compiler range, `mach = "^5.3"`, and
+  builds only with mach 5.3 or later (#266).
 - chore(license): copyright is attributed to Briar Systems LLC, 2025-2026
   (#277). The MIT terms are unchanged.
 - docs: the README states the first-load time, rebuild times and resident

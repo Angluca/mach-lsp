@@ -231,9 +231,28 @@ the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.2.1`
-and `v3.2.0`), and fetched by `mach dep pull .`. The committed gitlinks under
-`dep/` are the pins; there is no lockfile.
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.3.1`
+and `v4.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
+`dep/` are the pins; there is no lockfile. std is pinned to the release mach's
+own CI builds with, because the server and the compiler it links share one
+std.
+
+### Compiler compatibility
+
+The server does not run `mach`. It contains the compiler, linked from exactly
+one mach release, which `mls --version` and `serverInfo.mach` name. Every
+project it opens is checked against that release.
+
+A project states the compilers it builds with as `[project].mach` in its
+`mach.toml`, and its dependencies may state their own. When the linked release
+is outside any of those ranges, the project is not loaded. The server shows
+why, naming each unmet range and the dependency chain that states it, as an
+error on the root's `mach.toml` and in a message. A manifest without the key
+loads with a warning there that gives the line to add. Both clear when the
+manifest is fixed.
+
+So a project that requires a newer mach than the server links needs a newer
+server. The changelog names the mach release each mls release links.
 
 ## Architecture
 

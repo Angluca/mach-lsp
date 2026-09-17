@@ -124,7 +124,7 @@ val WATCH_TICK_NS: i64 = 200000000;
 rec Relay {
     alloc:       *Allocator;
     mu:          mutex.Mutex;
-    to_worker:   i32;
+    to_worker:   usize;
     mir:         mirror.Mirror;
     stop:        i64;
     last_id:     i64;
@@ -151,8 +151,8 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     # second time, and two processes appending to one log overwrite each other
     trace.mute_frames();
 
-    var to_worker:   [2]i32;
-    var from_worker: [2]i32;
+    var to_worker:   usize = os.INVALID_HANDLE;
+    var from_worker: usize = os.INVALID_HANDLE;
 
     RELAY.alloc       = alloc;
     RELAY.mu          = mutex.make();
@@ -170,20 +170,20 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     RELAY.deadline    = configured_deadline();
     mirror.init(?RELAY.mir, alloc);
 
-    var pid: i64 = start_worker(self, ?to_worker[0], ?from_worker[0]);
+    var pid: i64 = start_worker(self, ?to_worker, ?from_worker);
     if (pid < 0) {
         trace.log("supervisor: could not start the analysis worker\n");
         mirror.dnit(?RELAY.mir);
         ret 1;
     }
-    RELAY.to_worker = to_worker[1];
+    RELAY.to_worker = to_worker;
     atomic.store(?RELAY.pid, pid);
 
     var pump: thread.Thread;
     thread.spawn_with(pump_client, (?RELAY)::*u8, ?pump);
     if (pump.tid < 0) {
-        os.close(to_worker[1]);
-        os.close(from_worker[0]);
+        os.close(to_worker);
+        os.close(from_worker);
         trace.log("supervisor: could not start the client pump\n");
         mirror.dnit(?RELAY.mir);
         ret 1;
@@ -195,10 +195,10 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     var watch: thread.Thread;
     thread.spawn_with(watchdog, (?RELAY)::*u8, ?watch);
 
-    var code:     i64 = 0;
-    var restarts: i64 = 0;
-    var barren:   i64 = 0;
-    var reading:  i32 = from_worker[0];
+    var code:     i64   = 0;
+    var restarts: i64   = 0;
+    var barren:   i64   = 0;
+    var reading:  usize = from_worker;
 
     for (true) {
         var frames: i64  = 0;
@@ -262,12 +262,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
         os.close(reading);
         mutex.lock(?RELAY.mu);
         os.close(RELAY.to_worker);
-        RELAY.to_worker = -1;
+        RELAY.to_worker = os.INVALID_HANDLE;
         atomic.store(?RELAY.need_replay, 1);
-        pid = start_worker(self, ?to_worker[0], ?from_worker[0]);
+        pid = start_worker(self, ?to_worker, ?from_worker);
         if (pid >= 0) {
-            RELAY.to_worker = to_worker[1];
-            reading         = from_worker[0];
+            RELAY.to_worker = to_worker;
+            reading         = from_worker;
             atomic.store(?RELAY.swallow, 1);
             atomic.store(?RELAY.pid, pid);
         }
@@ -292,7 +292,7 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     os.close(reading);
     mutex.lock(?RELAY.mu);
     os.close(RELAY.to_worker);
-    RELAY.to_worker = -1;
+    RELAY.to_worker = os.INVALID_HANDLE;
     mutex.unlock(?RELAY.mu);
     mirror.dnit(?RELAY.mir);
     ret code;
@@ -300,14 +300,18 @@ pub fun run(alloc: *Allocator, self: str) i64 {
 
 # spawn a worker over fresh pipes, returning its pid or a negative value
 #
-# `to` and `from` receive the pipe pairs; the caller keeps `to[1]` and `from[0]`
-# and the child's ends are closed here, because holding them past the child's
-# exit would keep the pipes open and turn a crash into a hang.
-fun start_worker(self: str, to: *i32, from: *i32) i64 {
-    if (os.pipe(to) < 0) { ret -1; }
-    if (os.pipe(from) < 0) {
-        os.close(to[0]);
-        os.close(to[1]);
+# `to` and `from` receive the ends this process keeps: the worker's input and
+# its output. The child's ends are closed here, because holding them past the
+# child's exit would keep the pipes open and turn a crash into a hang.
+fun start_worker(self: str, to: *usize, from: *usize) i64 {
+    var child_in:  usize = os.INVALID_HANDLE;
+    var to_w:      usize = os.INVALID_HANDLE;
+    var from_r:    usize = os.INVALID_HANDLE;
+    var child_out: usize = os.INVALID_HANDLE;
+    if (os.pipe(?child_in, ?to_w) < 0) { ret -1; }
+    if (os.pipe(?from_r, ?child_out) < 0) {
+        os.close(child_in);
+        os.close(to_w);
         ret -1;
     }
 
@@ -321,18 +325,20 @@ fun start_worker(self: str, to: *i32, from: *i32) i64 {
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
     #
-    # the worker's stderr is inherited, and -1 is how std spells that. passing 2
-    # asks for dup3(2, 2), which aarch64 and riscv64 reject, and the child then
-    # dies before exec
+    # the worker's stderr is inherited, which std spells INVALID_HANDLE. passing
+    # stderr asks for dup3(2, 2), which aarch64 and riscv64 reject, and the child
+    # then dies before exec
     val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
-        to[0], from[1], -1);
-    os.close(to[0]);
-    os.close(from[1]);
+        child_in, child_out, os.INVALID_HANDLE);
+    os.close(child_in);
+    os.close(child_out);
     if (pid < 0) {
-        os.close(to[1]);
-        os.close(from[0]);
+        os.close(to_w);
+        os.close(from_r);
         ret -1;
     }
+    to[0]   = to_w;
+    from[0] = from_r;
     ret pid;
 }
 
@@ -465,7 +471,7 @@ fun pump_client(arg: *u8) {
         # write would leave the next worker holding a session it was never told
         # about, which is worse than not restarting at all: it would answer
         # confidently about documents it has never seen.
-        if (r.to_worker >= 0 && atomic.load(?r.need_replay) != 0) {
+        if (r.to_worker != os.INVALID_HANDLE && atomic.load(?r.need_replay) != 0) {
             if (mirror.replay(?r.mir, r.to_worker)) { atomic.store(?r.need_replay, 0); }
         }
 
@@ -475,7 +481,7 @@ fun pump_client(arg: *u8) {
         mirror.record(?r.mir, msg.body, msg.body_len);
         apply_settings(r, msg.body, msg.body_len);
 
-        if (r.to_worker >= 0 && atomic.load(?r.need_replay) == 0) {
+        if (r.to_worker != os.INVALID_HANDLE && atomic.load(?r.need_replay) == 0) {
             # a write that fails is a worker that has died, which the main
             # thread is already reaping. It is NOT the end of the client
             # connection, and treating it as one would end the session on
@@ -491,8 +497,8 @@ fun pump_client(arg: *u8) {
 
     # closing the worker's input is how it learns the client is gone
     mutex.lock(?r.mu);
-    if (r.to_worker >= 0) { os.close(r.to_worker); }
-    r.to_worker = -1;
+    if (r.to_worker != os.INVALID_HANDLE) { os.close(r.to_worker); }
+    r.to_worker = os.INVALID_HANDLE;
     mutex.unlock(?r.mu);
     atomic.store(?r.stop, 1);
 }
@@ -639,13 +645,13 @@ fun parse_id(token: str) i64 {
 # particular request.
 # ---
 # alloc:  the relay allocator
-# fd:     the worker's output
+# from:   the worker's output
 # frames: receives the number of frames relayed
 # ret:    whether the stream ended on a frame boundary
-fun pump_worker(alloc: *Allocator, fd: i32, frames: *i64) bool {
+fun pump_worker(alloc: *Allocator, from: usize, frames: *i64) bool {
     for (true) {
         var msg: transport.Message;
-        val st:  transport.ReadStatus = transport.read_message_from(fd, ?msg, alloc);
+        val st:  transport.ReadStatus = transport.read_message_from(from, ?msg, alloc);
         if (st == transport.READ_EOF) { ret true; }
         if (st != transport.READ_OK)  { ret false; }
         @frames = @frames + 1;
