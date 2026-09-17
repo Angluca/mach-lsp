@@ -69,6 +69,7 @@ rec Doc {
 # init_body:  owned verbatim `initialize` request frame
 # init_id:    owned id token of that request
 # ready_body: owned verbatim `initialized` notification frame, nil until seen
+# trace_body: owned verbatim last `$/setTrace` frame, nil until seen
 # docs:       open-document slots
 # len:        number of slots
 pub rec Mirror {
@@ -76,6 +77,7 @@ pub rec Mirror {
     init_body:  str;
     init_id:    str;
     ready_body: str;
+    trace_body: str;
     docs:       *Doc;
     len:        usize;
 }
@@ -86,6 +88,7 @@ pub fun init(m: *Mirror, alloc: *Allocator) {
     m.init_body  = nil;
     m.init_id    = nil;
     m.ready_body = nil;
+    m.trace_body = nil;
     m.docs       = nil;
     m.len        = 0;
 }
@@ -103,6 +106,7 @@ pub fun dnit(m: *Mirror) {
     free_field(m, ?m.init_body);
     free_field(m, ?m.init_id);
     free_field(m, ?m.ready_body);
+    free_field(m, ?m.trace_body);
     m.docs = nil;
     m.len  = 0;
 }
@@ -148,6 +152,11 @@ pub fun record(m: *Mirror, body: str, len: usize) {
         or (json.text_equals(method, "initialized", m.alloc)) {
             free_field(m, ?m.ready_body);
             m.ready_body = json.dup(body, m.alloc);
+        }
+        or (json.text_equals(method, "$/setTrace", m.alloc)) {
+            # only the latest level matters to a replacement worker
+            free_field(m, ?m.trace_body);
+            m.trace_body = json.dup(body, m.alloc);
         }
         or (json.text_equals(method, "textDocument/didOpen", m.alloc)) {
             record_open(m, params);
@@ -233,27 +242,30 @@ fun record_close(m: *Mirror, params: *sj.Value) {
 # only turn one failure into several.
 # ---
 # m:   the mirror
-# fd:  the worker's input
+# to:  the worker's input
 # ret: true when the whole session was written
-pub fun replay(m: *Mirror, fd: i32) bool {
+pub fun replay(m: *Mirror, to: usize) bool {
     if (m.init_body == nil)                                               { ret true; }
-    if (!transport.write_frame_to(fd, m.init_body, str_len(m.init_body))) { ret false; }
+    if (!transport.write_frame_to(to, m.init_body, str_len(m.init_body))) { ret false; }
     if (m.ready_body != nil) {
-        if (!transport.write_frame_to(fd, m.ready_body, str_len(m.ready_body))) { ret false; }
+        if (!transport.write_frame_to(to, m.ready_body, str_len(m.ready_body))) { ret false; }
+    }
+    if (m.trace_body != nil) {
+        if (!transport.write_frame_to(to, m.trace_body, str_len(m.trace_body))) { ret false; }
     }
 
     var i: usize = 0;
     for (i < m.len) {
         val d: *Doc = ?m.docs[i];
         if (d.live && d.uri != nil && d.text != nil) {
-            if (!replay_open(m, fd, d)) { ret false; }
+            if (!replay_open(m, to, d)) { ret false; }
         }
         i = i + 1;
     }
     ret true;
 }
 
-fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
+fun replay_open(m: *Mirror, to: usize, d: *Doc) bool {
     var b: json.Buf = json.buf_init(m.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":");
     json.buf_push_quoted(?b, d.uri);
@@ -268,7 +280,7 @@ fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
 
     val msg: str  = json.buf_str(?b);
     var ok:  bool = false;
-    if (msg != nil) { ok = transport.write_frame_to(fd, msg, json.buf_len(?b)); }
+    if (msg != nil) { ok = transport.write_frame_to(to, msg, json.buf_len(?b)); }
     json.buf_dnit(?b);
     ret ok;
 }

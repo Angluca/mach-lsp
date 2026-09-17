@@ -30,17 +30,12 @@ use src: mach.lang.source;
 
 use mls.documents;
 use mls.json;
+use mls.notes;
 use mls.positions;
 use mls.project;
 use mls.render;
 use mls.trace;
 use mls.transport;
-
-# LSP diagnostic severities (1 = Error ... 4 = Hint)
-val LSP_ERROR:   i64 = 1;
-val LSP_WARNING: i64 = 2;
-val LSP_INFO:    i64 = 3;
-val LSP_HINT:    i64 = 4;
 
 # cap on diagnostics published per document, to bound message size
 val MAX_DIAGNOSTICS: usize = 200;
@@ -227,7 +222,7 @@ fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocato
     json.buf_push(b, "{\"range\":");
     render.range(b, r);
     json.buf_push(b, ",\"severity\":");
-    json.buf_push_i64(b, map_severity(d.severity));
+    json.buf_push_i64(b, notes.lsp_severity(d.severity));
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     push_message(b, d);
     push_related(b, at, d, alloc);
@@ -312,14 +307,6 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
         r = r + 1;
     }
     if (written > 0) { json.buf_push_byte(b, ']'); }
-}
-
-# translate a compiler Severity to the LSP severity scale
-fun map_severity(sev: diag.Severity) i64 {
-    if (sev == diag.SEVERITY_ERROR)   { ret LSP_ERROR; }
-    if (sev == diag.SEVERITY_WARNING) { ret LSP_WARNING; }
-    if (sev == diag.SEVERITY_INFO)    { ret LSP_INFO; }
-    ret LSP_HINT;
 }
 
 # --- shaping ---

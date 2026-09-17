@@ -69,13 +69,18 @@ fun has_flag(argc: i64, argv: **u8, flag: str) bool {
     ret false;
 }
 
-# write `mls <version>` to stdout
+# write `mls <version> (mach <compiler version>)` to stdout
 fun print_version() i64 {
-    val name: str = "mls ";
-    if (os.write(os.STDOUT_FD, name::*u8, str_len(name)) < 0)                       { ret 1; }
-    if (os.write(os.STDOUT_FD, version.VERSION::*u8, str_len(version.VERSION)) < 0) { ret 1; }
-    if (os.write(os.STDOUT_FD, "\n"::*u8, 1) < 0)                                   { ret 1; }
+    if (!put("mls "))          { ret 1; }
+    if (!put(version.VERSION)) { ret 1; }
+    if (!put(" (mach "))       { ret 1; }
+    if (!put(version.MACH))    { ret 1; }
+    if (!put(")\n"))           { ret 1; }
     ret 0;
+}
+
+fun put(s: str) bool {
+    ret os.write(os.stdout(), s::*u8, str_len(s)) >= 0;
 }
 
 # this executable's path, for re-spawning the worker

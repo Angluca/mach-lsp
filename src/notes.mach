@@ -1,0 +1,175 @@
+# what a project says about itself rather than about one of its files (#266)
+#
+# A load records some diagnostics against no source file: the warning for a
+# manifest that states no compiler range is one. A load can also be refused
+# outright, as when the compiler is outside a range the closure states. Neither
+# belongs to a document the client has open, so the per-document publish never
+# carries them. The server shows them on the root's `mach.toml` instead, and
+# publishes that list again whenever it changes, including to empty, so a fixed
+# manifest never keeps an old complaint.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.allocator;
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use strutil: std.text.string;
+
+use diag: mach.lang.diagnostic;
+use src:  mach.lang.source;
+
+use mls.json;
+use mls.transport;
+
+# the LSP severity scale
+pub val LSP_ERROR:   i64 = 1;
+pub val LSP_WARNING: i64 = 2;
+pub val LSP_INFO:    i64 = 3;
+pub val LSP_HINT:    i64 = 4;
+
+# the most notes one root carries; a load records a handful at most
+val MAX_NOTES: usize = 16;
+
+# one note: an LSP severity and owned text
+pub rec Note {
+    severity: i64;
+    text:     str;
+}
+
+# a root's notes, owned
+# ---
+# items: MAX_NOTES slots, or nil when empty
+# len:   live entries in items
+pub rec Notes {
+    items: *Note;
+    len:   usize;
+}
+
+# the compiler severity on the LSP scale
+pub fun lsp_severity(sev: diag.Severity) i64 {
+    if (sev == diag.SEVERITY_ERROR)   { ret LSP_ERROR; }
+    if (sev == diag.SEVERITY_WARNING) { ret LSP_WARNING; }
+    if (sev == diag.SEVERITY_INFO)    { ret LSP_INFO; }
+    ret LSP_HINT;
+}
+
+pub fun empty() Notes {
+    ret Notes{items: nil, len: 0};
+}
+
+# the diagnostics `store` holds against no file
+pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
+    var n: Notes = empty();
+    var i: usize = 0;
+    for (store != nil && i < store.items.len) {
+        val d: *diag.Diagnostic = ?store.items.data[i];
+        if (d.loc.file_id == src.FILE_NIL) { add(alloc, ?n, lsp_severity(d.severity), d.message); }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# one error: the reason a load was refused
+pub fun refusal(alloc: *Allocator, text: str) Notes {
+    var n: Notes = empty();
+    add(alloc, ?n, LSP_ERROR, text);
+    ret n;
+}
+
+fun add(alloc: *Allocator, n: *Notes, severity: i64, text: str) {
+    if (text == nil || n.len >= MAX_NOTES) { ret; }
+    if (n.items == nil) {
+        val r: res[*Note, allocator.Error] = allocate[Note](alloc, MAX_NOTES);
+        if (sel r.err) { ret; }
+        n.items = r.ok;
+    }
+    val dr: res[str, allocator.Error] = strutil.str_dup(alloc, text);
+    if (sel dr.err) { ret; }
+    n.items[n.len] = Note{severity: severity, text: dr.ok};
+    n.len          = n.len + 1;
+}
+
+pub fun equal(a: *Notes, b: *Notes) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.items[i].severity != b.items[i].severity)    { ret false; }
+        if (!str_equals(a.items[i].text, b.items[i].text)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun dnit(alloc: *Allocator, n: *Notes) {
+    var i: usize = 0;
+    for (i < n.len) {
+        strutil.str_free(alloc, n.items[i].text);
+        i = i + 1;
+    }
+    if (n.items != nil) { deallocate[Note](alloc, n.items, MAX_NOTES); }
+    @n = empty();
+}
+
+# publish `n` as the diagnostics of `uri`, the root's manifest, replacing
+# whatever was published there before
+pub fun publish(alloc: *Allocator, uri: str, n: *Notes) {
+    if (uri == nil) { ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    json.buf_push_quoted(?b, uri);
+    json.buf_push(?b, ",\"diagnostics\":[");
+    var i: usize = 0;
+    for (i < n.len) {
+        if (i > 0) { json.buf_push_byte(?b, ','); }
+        json.buf_push(?b, "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":");
+        json.buf_push_i64(?b, n.items[i].severity);
+        json.buf_push(?b, ",\"source\":\"mach\",\"message\":");
+        json.buf_push_quoted(?b, n.items[i].text);
+        json.buf_push_byte(?b, '}');
+        i = i + 1;
+    }
+    json.buf_push(?b, "]}}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(?b);
+}
+
+test "notes: capture keeps only the diagnostics with no file, in order" {
+    var pa: Allocator;
+    page.make(?pa);
+    var store: diag.DiagnosticStore = diag.store_init(?pa);
+    var span:  mach_token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diag.record_warning(?store, src.FILE_NIL, span, "no range");
+    diag.record_warning(?store, 3::src.FileId, span, "in a file");
+    diag.record_error(?store, src.FILE_NIL, span, "refused");
+    var n:    Notes = capture(?pa, ?store);
+    var same: Notes = capture(?pa, ?store);
+    var none: Notes = empty();
+    var fail: bool  = false;
+    if (n.len != 2)                               { fail = true; }
+    or (n.items[0].severity != LSP_WARNING)       { fail = true; }
+    or (!str_equals(n.items[0].text, "no range")) { fail = true; }
+    or (n.items[1].severity != LSP_ERROR)         { fail = true; }
+    or (!str_equals(n.items[1].text, "refused"))  { fail = true; }
+    if (!equal(?n, ?same))                        { fail = true; }
+    if (equal(?n, ?none))                         { fail = true; }
+    dnit(?pa, ?n);
+    dnit(?pa, ?same);
+    diag.store_dnit(?store);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+use mach_token: mach.lang.fe.token;
+use std.allocator.page;

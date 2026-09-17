@@ -118,8 +118,10 @@ jobs:
         run: |
           set -euo pipefail
           exe=; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          compiler="$(sed -n 's/^version = "\(.*\)"$/\1/p' dep/mach/mach.toml | head -1)"
+          want="mls $VERSION (mach $compiler)"
           got="$("out/$TARGET/release/bin/mls$exe" --version | tr -d '\r')"
-          [ "$got" = "mls $VERSION" ] || { echo "::error::out/$TARGET/release/bin/mls$exe --version printed '$got', expected 'mls $VERSION'"; exit 1; }
+          [ "$got" = "$want" ] || { echo "::error::out/$TARGET/release/bin/mls$exe --version printed '$got', expected '$want'"; exit 1; }
 
       - name: package
         shell: bash

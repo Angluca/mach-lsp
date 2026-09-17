@@ -64,6 +64,7 @@ use std.collections.vector;
 use mls.build;
 use mls.documents;
 use mls.json;
+use mls.notes;
 use mls.positions;
 use mls.progress;
 use mls.textdiff;
@@ -128,6 +129,7 @@ rec SourceFingerprint {
 # snapshot_revision: input revision captured by p
 # attempted_revision:last input revision analyzed, including a failed attempt
 # dirty:             explicit watcher/save invalidation requiring one attempt
+# manifest_notes:    what the client was last shown on this root's mach.toml
 # last_disk_scan_ns: last fallback fingerprint scan time
 # wins:              per module, where the snapshot's text differs from the open
 #                    buffer holding that module; valid for `wins_rev`, released
@@ -154,6 +156,7 @@ pub rec Root {
     snapshot_revision:  u64;
     attempted_revision: u64;
     dirty:              bool;
+    manifest_notes:     notes.Notes;
     last_disk_scan_ns:  i64;
     wins:               *textdiff.Windows;
     wins_rev:           *u64;
@@ -642,6 +645,7 @@ fun reset_slot(r: *Root) {
     r.snapshot_revision  = 0;
     r.attempted_revision = 0;
     r.dirty              = false;
+    r.manifest_notes     = notes.empty();
     r.last_disk_scan_ns  = 0;
     r.wins               = nil;
     r.wins_rev           = nil;
@@ -738,6 +742,7 @@ rec BuildInput {
 # lock_mtime:       lockfile mtime observed at build start
 # revision:         the input revision this build covered
 # message:          owned failure text, nil on success
+# manifest_notes:   what this build says about the project rather than a file
 rec BuildOutput {
     alloc:            *Allocator;
     ok:               bool;
@@ -750,6 +755,7 @@ rec BuildOutput {
     lock_mtime:       i64;
     revision:         u64;
     message:          str;
+    manifest_notes:   notes.Notes;
 }
 
 # an owned copy of `text`, or nil
@@ -855,6 +861,7 @@ pub fun free_build_output(o: *BuildOutput) {
     if (o.ok)               { driver.dnit_project(?o.p); }
     if (o.mod_paths != nil) { free_path_snapshot(alloc, o.mod_paths, o.mod_fingerprints, o.mod_path_count, o.mod_path_count); }
     if (o.message != nil)   { strutil.str_free(alloc, o.message); }
+    notes.dnit(alloc, ?o.manifest_notes);
     deallocate[BuildOutput](alloc, o, 1);
 }
 
@@ -886,6 +893,7 @@ fun run_build(arg: ptr) ptr {
     o.lock_mtime       = 0;
     o.revision         = in.revision;
     o.message          = nil;
+    o.manifest_notes   = notes.empty();
 
     if (o.s == nil) {
         o.message = dup_str(alloc, "project: no session to build into");
@@ -929,7 +937,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     val mr: res[manifest.Manifest, outcome.Fail] = driver.load_manifest(sn, in.root_path);
     if (sel mr.err) {
         var mf: outcome.Fail = mr.err;
-        o.message = dup_str(alloc, fail_message(?mf));
+        refuse(o, ?mf);
         ret;
     }
     var m: manifest.Manifest = mr.ok;
@@ -943,7 +951,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     val psr: err[outcome.Fail] = manifest.select_primary_artifact(alloc, ?sn.interner, ?m, ?selection);
     if (sel psr.err) {
         var pf: outcome.Fail = psr.err;
-        o.message = dup_str(alloc, fail_message(?pf));
+        refuse(o, ?pf);
         manifest.dnit(?m, sn.build_alloc);
         ret;
     }
@@ -964,7 +972,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
         alloc, ?sn.interner, ?m, ?cli, in.root_path, request.GOAL_OBJECTS, ?selection);
     if (sel rr.err) {
         var f: outcome.Fail = rr.err;
-        o.message = dup_str(alloc, fail_message(?f));
+        refuse(o, ?f);
         manifest.dnit(?m, sn.build_alloc);
         ret;
     }
@@ -989,11 +997,12 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     manifest.dnit(?m, sn.build_alloc);
     if (sel pr.err) {
         var f: outcome.Fail = pr.err;
-        o.message = dup_str(alloc, fail_message(?f));
+        refuse(o, ?f);
         ret;
     }
 
-    o.p = pr.ok;
+    o.p              = pr.ok;
+    o.manifest_notes = notes.capture(alloc, ?o.p.diags);
     val bpr: res[bool, str] = snapshot_mod_paths(alloc, sn, ?o.p, o);
     if (sel bpr.err) {
         driver.dnit_project(?o.p);
@@ -1001,6 +1010,13 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
         ret;
     }
     o.ok = true;
+}
+
+# record why a load was refused: the text the server reports, and, unless the
+# detail already went to located diagnostics, a note for the manifest
+fun refuse(o: *BuildOutput, f: *outcome.Fail) {
+    o.message = dup_str(o.alloc, fail_message(f));
+    if (!outcome.is_reported(@f)) { o.manifest_notes = notes.refusal(o.alloc, o.message); }
 }
 
 # install a finished build as `r`'s serving snapshot, releasing the old one
@@ -1014,6 +1030,7 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     r.attempted_revision = o.revision;
     r.man_mtime          = o.man_mtime;
     r.lock_mtime         = o.lock_mtime;
+    show_notes(w, r, o);
 
     if (!o.ok) {
         # the previous snapshot keeps serving; only the attempt is recorded
@@ -1053,6 +1070,26 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     o.mod_paths = nil;
     deallocate[BuildOutput](w.alloc, o, 1);
     ret true;
+}
+
+# publish what a build says about the manifest when it differs from what the
+# client already has, moving it into `r`. a list that went empty is published
+# too, which is what takes a fixed manifest's complaint away
+fun show_notes(w: *Workspace, r: *Root, o: *BuildOutput) {
+    if (notes.equal(?r.manifest_notes, ?o.manifest_notes)) {
+        notes.dnit(w.alloc, ?o.manifest_notes);
+        ret;
+    }
+    val jr: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, r.path, "mach.toml");
+    if (sel jr.ok) {
+        val uri: str = uri_of_path(w.alloc, jr.ok);
+        notes.publish(w.alloc, uri, ?o.manifest_notes);
+        if (uri != nil) { strutil.str_free(w.alloc, uri); }
+        strutil.str_free(w.alloc, jr.ok);
+    }
+    notes.dnit(w.alloc, ?r.manifest_notes);
+    r.manifest_notes = o.manifest_notes;
+    o.manifest_notes = notes.empty();
 }
 
 # build `r`'s first snapshot on this thread
@@ -1305,7 +1342,7 @@ fun collect_extra_roots(in: *BuildInput, sn: *sess.Session, m: *manifest.Manifes
 fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[intern.StrId, str] {
     val prefix: usize = str_len(src_dir);
     val plen:   usize = str_len(path);
-    if (plen <= prefix + 6 || path[prefix] != '/') { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
+    if (plen <= prefix + 6 || !pathlib.is_separator(path[prefix])) { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
     if (path[plen - 5] != '.' || path[plen - 4] != 'm' || path[plen - 3] != 'a'
         || path[plen - 2] != 'c' || path[plen - 1] != 'h') { ret res[intern.StrId, str].err{"project: document is not a Mach source file"}; }
     val rel_len: usize                     = plen - prefix - 1 - 5;
@@ -1322,9 +1359,10 @@ fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[i
     buf[id_len] = '.';
     var j: usize = 0;
     for (j < rel_len) {
+        # module path segments, whichever separator the platform spells them with
         val c: u8 = path[prefix + 1 + j];
-        if (c == '/') { buf[id_len + 1 + j] = '.'; }
-        or            { buf[id_len + 1 + j] = c; }
+        if (pathlib.is_separator(c)) { buf[id_len + 1 + j] = '.'; }
+        or                           { buf[id_len + 1 + j] = c; }
         j = j + 1;
     }
     val ir: res[intern.StrId, allocator.Error] = intern.intern_bytes(?sn.interner, buf::str, total);
@@ -1421,6 +1459,26 @@ fun maybe_reload(w: *Workspace, r: *Root) {
     }
     if (!changed) { ret; }
     r.dirty = true;
+}
+
+# load every root whose last load failed and whose files have changed since
+#
+# A root with a snapshot is rebuilt by `pump` once a change marks it dirty. A
+# root without one is otherwise retried only when a request reaches it, so a
+# manifest fixed outside the editor would keep showing its refusal until then.
+# ---
+# ret: whether any root loaded
+pub fun retry_failed(w: *Workspace) bool {
+    var any: bool = false;
+    var i:   u32  = 0;
+    for (i < w.root_cap) {
+        val r: *Root = ?w.roots[i];
+        if (r.path != nil && r.s != nil && !r.loaded && r.dirty) {
+            if (try_load(w, r)) { any = true; }
+        }
+        i = i + 1;
+    }
+    ret any;
 }
 
 # bring `r`'s snapshot up to date with its input
@@ -1529,7 +1587,7 @@ fun is_under(file: str, dir: str) bool {
     val fl: usize = str_len(file);
     if (fl < dl || !str_starts_with(file, dir)) { ret false; }
     if (fl == dl)                               { ret true; }
-    ret file[dl] == '/';
+    ret pathlib.is_separator(file[dl]);
 }
 
 fun document_own_root(w: *Workspace, r: *Root, path: str) bool {
@@ -1589,6 +1647,7 @@ fun free_root(w: *Workspace, r: *Root) {
     r.s     = nil;
     r.spare = nil;
     if (r.path != nil) { strutil.str_free(w.alloc, r.path); }
+    notes.dnit(w.alloc, ?r.manifest_notes);
     reset_slot(r);
 }
 
@@ -1739,6 +1798,20 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
     s.sym   = local;
     s.owned = true;
     ret opt[Site].some{s};
+}
+
+# the declaration-bearing symbol `sym` names within `root`: `sym` itself when it
+# carries its declaration, otherwise the defining module's own symbol, or nil
+# when that module is not loaded
+# ---
+# root: the root the symbol was resolved under, or nil
+# sym:  any symbol, including a `use` or `fwd` binding
+# ret:  the defining symbol, or nil
+pub fun defining_symbol_in(root: *Root, sym: *rslv.Symbol) *rslv.Symbol {
+    if (sym.decl != id.DECL_NIL) { ret sym; }
+    val m: *driver.ModuleEntry = module_entry(root, sym.origin);
+    if (m == nil) { ret nil; }
+    ret defining_symbol(m.resolve_result, sym);
 }
 
 # the defining module's own symbol for `sym`. a `use` or `fwd` binding names
@@ -3060,6 +3133,24 @@ test "project: uri and path round-trip" {
         or {
             if (!str_equals(u2, "file:///C:/src/main.mach")) { fail = true; }
         }
+    }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# an open document is found under its source directory whichever separator the
+# platform spells paths with (#273): windows paths come back from `clean` with
+# backslashes
+test "project: a document is under its source directory with native separators" {
+    var fail: bool = false;
+    if (!is_under("/p/src/m.mach", "/p/src")) { fail = true; }
+    if (is_under("/p/srcx/m.mach", "/p/src")) { fail = true; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!is_under("C:\\p\\src\\m.mach", "C:\\p\\src")) { fail = true; }
+        if (is_under("C:\\p\\srcx\\m.mach", "C:\\p\\src")) { fail = true; }
+    }
+    $or {
+        if (is_under("/p/src\\m.mach", "/p/src")) { fail = true; }
     }
     if (fail) { ret 1; }
     ret 0;

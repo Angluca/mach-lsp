@@ -11,6 +11,9 @@
 # descriptor is reused for the life of the process, so each enabled call
 # costs a single write.
 #
+# a client may set both at `initialize` and move the level with `$/setTrace`
+# (`settings`, #264); `start` and `set_level` apply those over the environment.
+#
 # what a trace may contain is a separate decision from whether it is on. A
 # message body is the user's source code: every `didOpen` carries a whole file
 # and every `didChange` carries whatever they just typed. Writing that to a
@@ -86,6 +89,19 @@ pub fun mute_frames() {
     FRAMES = false;
 }
 
+# how much a trace records: nothing, what each message is, or its body too
+pub val LEVEL_OFF:      u8 = 0;
+pub val LEVEL_MESSAGES: u8 = 1;
+pub val LEVEL_BODIES:   u8 = 2;
+
+# the longest chosen trace path, with its terminator
+pub val MAX_PATH: usize = 512;
+
+# a trace file a client chose, and whether it chose one; used in place of the
+# environment's and the default when the log is next opened
+var CHOSEN_PATH: [MAX_PATH]u8;
+var PATH_CHOSEN: bool = false;
+
 # storage for the MLS_TRACE value; read once alongside the gate
 var GATE_BUF: [32]u8;
 
@@ -95,10 +111,10 @@ var LOG_CHECKED: bool = false;
 # cached MLS_TRACE gate; writes happen only when true
 var LOG_ENABLED: bool = false;
 
-# trace log descriptor, opened lazily once tracing is enabled. -1
-# until opened, and left at -1 when the open fails so logging stays a silent
-# no-op (best-effort)
-var LOG_FD: i64 = -1;
+# trace log handle, opened lazily once tracing is enabled. invalid until
+# opened, and left invalid when the open fails so logging stays a silent no-op
+# (best-effort)
+var LOG_FD: usize = os.INVALID_HANDLE;
 
 # report whether the MLS_TRACE variable is set
 # ---
@@ -117,20 +133,82 @@ fun trace_enabled() bool {
 
 # open the trace log for appending
 # ---
-# ret: a live descriptor, or a negative value on failure
-fun trace_open() i64 {
-    val flags: i32                           = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
-    val r:     res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
+# ret: a live handle, or os.INVALID_HANDLE on failure
+fun trace_open() usize {
+    if (PATH_CHOSEN) { ret open_append(?CHOSEN_PATH[0]); }
+    val r: res[opt[usize], env.EnvError] = env.get(PATH_VAR, ?PATH_BUF[0], 511);
     if (sel r.ok) {
         val n: opt[usize] = r.ok;
         if (sel n.some) {
             if (n.some > 0) {
                 PATH_BUF[n.some] = 0;
-                ret os.open(os.AT_FDCWD, ?PATH_BUF[0], flags, 420);
+                ret open_append(?PATH_BUF[0]);
             }
         }
     }
-    ret os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
+    ret open_append(LOG_PATH::*u8);
+}
+
+fun open_append(path: *u8) usize {
+    var h:  usize = os.INVALID_HANDLE;
+    val rc: i64   = os.open(os.working_dir(), path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 420, ?h);
+    if (rc < 0) { ret os.INVALID_HANDLE; }
+    ret h;
+}
+
+# evaluate the environment gate once and open the log when it is on
+fun ensure_checked() {
+    if (LOG_CHECKED) { ret; }
+    LOG_CHECKED = true;
+    LOG_ENABLED = trace_enabled();
+    if (LOG_ENABLED) { LOG_FD = trace_open(); }
+}
+
+# apply what a client configured at `initialize`
+#
+# The level is the client's option when it gave one, else the environment's
+# when MLS_TRACE is set, else the LSP `initialize.trace` value, else off: an
+# editor's default `trace: "off"` does not silence a trace the user turned on
+# in the environment, and an explicit option does. A chosen file replaces the
+# environment's and the default. The descriptor already open is left open
+# rather than closed, because another thread may be writing to it, and a closed
+# number can be reused by an unrelated open.
+# ---
+# level:     the `trace` option, or none
+# lsp_level: the LSP `initialize.trace` value, or none
+# file:      the `traceFile` option, or nil
+pub fun start(level: opt[u8], lsp_level: opt[u8], file: str) {
+    ensure_checked();
+    val env_on: bool = LOG_ENABLED;
+    if (file != nil) {
+        val n: usize = str_len(file);
+        if (n < MAX_PATH) {
+            var i: usize = 0;
+            for (i < n) {
+                CHOSEN_PATH[i] = file[i];
+                i              = i + 1;
+            }
+            CHOSEN_PATH[n] = 0;
+            PATH_CHOSEN    = true;
+            LOG_FD         = os.INVALID_HANDLE;
+        }
+    }
+    if (sel level.some)     { set_level(level.some); }
+    or (env_on)             { set_level_keeping(); }
+    or (sel lsp_level.some) { set_level(lsp_level.some); }
+}
+
+# move the level, as `$/setTrace` does. it overrides whatever `start` chose
+pub fun set_level(level: u8) {
+    ensure_checked();
+    LOG_ENABLED    = level != LEVEL_OFF;
+    BODIES_ENABLED = level == LEVEL_BODIES;
+    if (LOG_ENABLED && LOG_FD == os.INVALID_HANDLE) { LOG_FD = trace_open(); }
+}
+
+# keep the environment's level, reopening at a newly chosen file
+fun set_level_keeping() {
+    if (LOG_ENABLED && LOG_FD == os.INVALID_HANDLE) { LOG_FD = trace_open(); }
 }
 
 # append a message to the trace log, best-effort
@@ -140,31 +218,23 @@ fun trace_open() i64 {
 # ---
 # msg: null-terminated message to append; nil / empty is a no-op
 pub fun log(msg: str) {
-    if (!LOG_CHECKED) {
-        LOG_CHECKED = true;
-        LOG_ENABLED = trace_enabled();
-        if (LOG_ENABLED) { LOG_FD = trace_open(); }
-    }
+    ensure_checked();
 
-    if (!LOG_ENABLED) { ret; }
-    if (LOG_FD < 0)   { ret; }
-    if (msg == nil)   { ret; }
+    if (!LOG_ENABLED)                { ret; }
+    if (LOG_FD == os.INVALID_HANDLE) { ret; }
+    if (msg == nil)                  { ret; }
     val len: usize = str_len(msg);
     if (len == 0) { ret; }
 
-    os.write(LOG_FD::i32, msg::*u8, len);
+    os.write(LOG_FD, msg::*u8, len);
 }
 
 # whether tracing is on, so a caller can skip building a message it would drop
 # ---
 # ret: true when MLS_TRACE is set and the log is open
 pub fun enabled() bool {
-    if (!LOG_CHECKED) {
-        LOG_CHECKED = true;
-        LOG_ENABLED = trace_enabled();
-        if (LOG_ENABLED) { LOG_FD = trace_open(); }
-    }
-    ret LOG_ENABLED && LOG_FD >= 0;
+    ensure_checked();
+    ret LOG_ENABLED && LOG_FD != os.INVALID_HANDLE;
 }
 
 # whether message bodies may be written to the log
@@ -208,8 +278,8 @@ pub fun frame(label: str, body: str, len: usize) {
 
 # append the first `n` bytes of `s` verbatim
 fun write_prefix(s: str, n: usize) {
-    if (LOG_FD < 0 || s == nil) { ret; }
-    os.write(LOG_FD::i32, s::*u8, n);
+    if (LOG_FD == os.INVALID_HANDLE || s == nil) { ret; }
+    os.write(LOG_FD, s::*u8, n);
 }
 
 # monotonic nanoseconds, for span timing
@@ -223,7 +293,7 @@ pub fun now_ns() i64 {
 
 # writer sink appending straight to the open trace descriptor
 fun trace_sink(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
-    os.write(LOG_FD::i32, p, len);
+    os.write(LOG_FD, p, len);
     ret res[usize, writer.WriteError].ok{len};
 }
 
@@ -237,5 +307,5 @@ pub fun logf(fmt: str, va: ...) {
     w.ctx     = nil;
     w.f_write = trace_sink;
     fmtstr.vformat(?w, fmt, va...);
-    os.write(LOG_FD::i32, "\n"::*u8, 1);
+    os.write(LOG_FD, "\n"::*u8, 1);
 }

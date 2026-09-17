@@ -1,8 +1,9 @@
 [project]
 id = "mls"
-version = "0.19.0"
+version = "0.20.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
+mach = "^5.3"
 
 [target.linux-x86_64]
 default = true
@@ -60,8 +61,8 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v3.2.0"
+ref = "tag/v4.0.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.2.1"
+ref = "tag/v5.4.0"

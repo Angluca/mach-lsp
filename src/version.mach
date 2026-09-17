@@ -1,7 +1,12 @@
 # the server's own version, taken from `[project].version` when it is compiled,
 # so a release binary cannot report a version other than the one it was tagged
-# with
+# with, and the version of the compiler it links, which decides what it
+# understands
 
 use std.types.string.str;
 
+use machver: mach.lang.version;
+
 pub val VERSION: str = $project.version;
+
+pub val MACH: str = machver.MACH_VERSION;

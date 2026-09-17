@@ -16,6 +16,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
@@ -26,6 +28,25 @@ ANY_VERSION = object()
 
 class ProtocolError(RuntimeError):
     """Raised when the live protocol session violates an asserted contract."""
+
+
+def uri_file(uri: str) -> str:
+    """The file a `file://` URI names, spelled so two URIs for it compare equal.
+
+    The server percent-encodes what a client may leave bare, such as a Windows
+    drive's colon, so URIs it builds are compared as the paths they name.
+    """
+    path = urllib.request.url2pathname(urllib.parse.unquote(urllib.parse.urlparse(uri).path))
+    return os.path.normcase(os.path.normpath(path))
+
+
+def manifest_of(uri: str) -> str | None:
+    """The `mach.toml` of the nearest project enclosing a document, as `uri_file` spells it."""
+    directory = Path(uri_file(uri)).parent
+    for candidate in (directory, *directory.parents):
+        if (candidate / "mach.toml").is_file():
+            return uri_file((candidate / "mach.toml").as_uri())
+    return None
 
 
 class LspSession:
@@ -59,6 +80,9 @@ class LspSession:
         self.next_id = 1
         self.message_count = 0
         self.timings: list[tuple[str, float]] = []
+        # the manifests of the projects this session opened documents in. a load
+        # publishes what it says about the project on exactly these (#266)
+        self.manifests: set[str] = set()
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
         self.reader.start()
@@ -102,6 +126,10 @@ class LspSession:
             self.stderr_chunks.append(chunk)
 
     def _send(self, message: dict[str, Any]) -> None:
+        if message.get("method") == "textDocument/didOpen":
+            manifest = manifest_of(message["params"]["textDocument"]["uri"])
+            if manifest is not None:
+                self.manifests.add(manifest)
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
         frame = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
         try:
@@ -258,6 +286,18 @@ class LspSession:
             f"diagnostics for {uri}",
         )
 
+    def source_diagnostics(self, item: dict[str, Any]) -> bool:
+        """Whether a message publishes diagnostics for anything but an opened project's manifest.
+
+        A load inside a request publishes what it says about the project on that
+        project's `mach.toml` (#266). Only those exact files are set aside: any
+        other publish during a request is still one too many.
+        """
+        if item.get("method") != "textDocument/publishDiagnostics":
+            return False
+        uri = (item.get("params") or {}).get("uri", "")
+        return uri_file(uri) not in self.manifests
+
     def quiet_diagnostics(self, settle: float = 0.4) -> list[dict[str, Any]]:
         """Return any diagnostics published since the last wait.
 
@@ -266,10 +306,8 @@ class LspSession:
         (the request's own reply drained the inbox past it); `settle` also
         catches a publish still in flight behind that reply.
         """
-        found = [m for m in self.pending
-                 if m.get("method") == "textDocument/publishDiagnostics"]
-        self.pending = [m for m in self.pending
-                        if m.get("method") != "textDocument/publishDiagnostics"]
+        found = [m for m in self.pending if self.source_diagnostics(m)]
+        self.pending = [m for m in self.pending if not self.source_diagnostics(m)]
         deadline = time.monotonic() + settle
         while True:
             remaining = deadline - time.monotonic()
@@ -282,7 +320,7 @@ class LspSession:
             if item is None or isinstance(item, BaseException):
                 return found
             self.message_count += 1
-            if item.get("method") == "textDocument/publishDiagnostics":
+            if self.source_diagnostics(item):
                 found.append(item)
             else:
                 self.pending.append(item)
@@ -1428,32 +1466,312 @@ def run_stale_diagnostics(server: Path, timeout: float) -> None:
 def run_version(server: Path, timeout: float) -> None:
     """The binary reports the version it was built from, and starts nothing to do so.
 
-    A release asset is checked against its tag by this flag, and a client learns
-    the same value from `initialize`; both come from `[project].version`.
+    `mls --version` names the server and the compiler it links; `initialize`
+    reports them as separate keys, so `serverInfo.version` stays exactly the
+    server's own. Both come from the manifests the binary was built from.
     """
-    manifest = Path(__file__).resolve().parents[1] / "mach.toml"
-    match = re.search(r'^version = "([^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
-    require(match is not None, "mach.toml has no project version")
-    expected = match.group(1)
+    repo = Path(__file__).resolve().parents[1]
+
+    def manifest_version(path: Path) -> str:
+        match = re.search(r'^version = "([^"]+)"', path.read_text(encoding="utf-8"), re.M)
+        require(match is not None, f"{path} has no project version")
+        return match.group(1)
+
+    expected = manifest_version(repo / "mach.toml")
+    compiler = manifest_version(repo / "dep" / "mach" / "mach.toml")
 
     done = subprocess.run([str(server), "--version"], stdin=subprocess.DEVNULL,
                           capture_output=True, timeout=timeout)
     require(done.returncode == 0, f"--version exited {done.returncode}: {done.stderr!r}")
-    require(done.stdout.decode().strip() == f"mls {expected}",
-            f"--version printed {done.stdout!r}, expected mls {expected}")
+    require(done.stdout.decode().strip() == f"mls {expected} (mach {compiler})",
+            f"--version printed {done.stdout!r}, expected mls {expected} (mach {compiler})")
 
     with tempfile.TemporaryDirectory(prefix="mls-version-") as directory:
         session = LspSession(server, Path(directory), timeout)
         finished = False
         try:
             info = session.request("initialize", {"capabilities": {}})["result"].get("serverInfo", {})
-            require(info == {"name": "mach-lsp", "version": expected},
-                    f"initialize reported {info!r}, expected version {expected}")
+            require(info == {"name": "mach-lsp", "version": expected, "mach": compiler},
+                    f"initialize reported {info!r}")
             session.finish()
             finished = True
         finally:
             if not finished:
                 session.abort()
+
+
+def run_manifest_notes(server: Path, timeout: float) -> None:
+    """What a load says about the project itself shows on its mach.toml (#266).
+
+    A manifest without `[project].mach` loads with a warning that belongs to no
+    source file, and a compiler outside a stated range refuses the load. Both are
+    published on the root's `mach.toml`, and cleared when the manifest is fixed:
+    through `workspace/didChangeWatchedFiles`, through the next request when the
+    client sends no such notification, and for a root that never loaded as well
+    as one that did. A stale complaint on a fixed file is the failure this
+    guards.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    compiler = re.search(r'^version = "([^"]+)"',
+                         (repo / "dep" / "mach" / "mach.toml").read_text(encoding="utf-8"), re.M)
+    require(compiler is not None, "dep/mach/mach.toml has no version")
+    major, minor = compiler.group(1).split(".")[:2]
+    admitted = f'mach = "^{major}.{minor}"'
+    refused = 'mach = "^99"'
+
+    def notes_for(session: LspSession, uri: str, want: Callable[[list[dict[str, Any]]], bool],
+                  what: str) -> list[dict[str, Any]]:
+        message = session.wait_for(
+            lambda item: (item.get("method") == "textDocument/publishDiagnostics"
+                          and uri_file(item.get("params", {}).get("uri", "")) == uri_file(uri)
+                          and want(item["params"].get("diagnostics", []))),
+            what)
+        return message["params"]["diagnostics"]
+
+    def one(severity: int, text: str) -> Callable[[list[dict[str, Any]]], bool]:
+        return lambda found: (len(found) == 1 and found[0].get("severity") == severity
+                              and text in found[0].get("message", ""))
+
+    def cleared(found: list[dict[str, Any]]) -> bool:
+        return found == []
+
+    def changed(session: LspSession, uri: str) -> None:
+        session.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": uri, "type": 2}]})
+
+    def open_doc(session: LspSession, root: Path, main: Path, text: str) -> None:
+        session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+        session.notify("initialized", {})
+        session.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+
+    with tempfile.TemporaryDirectory(prefix="mls-notes-") as directory:
+        main, _, text = write_project(Path(directory).resolve(), "notes", 3)
+        root = Path(directory).resolve() / "notes"
+        manifest = root / "mach.toml"
+        uri = manifest.as_uri()
+        base = manifest.read_text(encoding="utf-8")
+        require(base.startswith("[project]\n") and "mach =" not in base,
+                "write_project's manifest changed shape")
+
+        def set_range(line: str | None) -> None:
+            manifest.write_text(base if line is None else base.replace("[project]\n", f"[project]\n{line}\n", 1),
+                                encoding="utf-8")
+
+        # a loaded root
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            open_doc(session, root, main, text)
+            found = notes_for(session, uri, one(2, "states no compiler range"),
+                              "the missing-range warning on mach.toml")
+            require(admitted in found[0]["message"],
+                    f"the warning does not name the line to add: {found[0]!r}")
+            session.diagnostics(main.as_uri(), 1)
+
+            set_range(admitted)
+            changed(session, uri)
+            notes_for(session, uri, cleared, "the warning cleared once the range was added")
+
+            set_range(refused)
+            changed(session, uri)
+            notes_for(session, uri, one(1, "does not accept it"),
+                      "the refusal on mach.toml")
+
+            # no watcher notification: the next request finds the new manifest
+            time.sleep(0.4)
+            set_range(admitted)
+            time.sleep(0.4)
+            # a semantic request is what consults the project, and with it the disk
+            session.request("textDocument/hover", {"textDocument": {"uri": main.as_uri()},
+                                                   "position": {"line": 0, "character": 0}})
+            notes_for(session, uri, cleared, "the refusal cleared by a request after an unannounced fix")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+        # a root that never loaded
+        set_range(refused)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            open_doc(session, root, main, text)
+            notes_for(session, uri, one(1, "does not accept it"),
+                      "the refusal of a first load on mach.toml")
+            session.wait_for(lambda item: (item.get("method") == "window/showMessage"
+                                           and "failed to load project" in item["params"].get("message", "")),
+                             "the load failure message")
+
+            set_range(admitted)
+            changed(session, uri)
+            notes_for(session, uri, cleared, "the refusal cleared once the root loaded")
+            symbols = session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(symbols.get("result"), f"the fixed root does not answer: {symbols!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_settings(server: Path, timeout: float) -> None:
+    """What a client configures at `initialize`, and how it combines (#264).
+
+    The option wins over the environment, the environment over the LSP
+    `initialize.trace`, and `$/setTrace` moves the level afterwards. A key the
+    server does not know, or a value it cannot use, is noted and ignored; it
+    never fails `initialize`.
+    """
+    SAMPLE = "pub fun sample(n: i32) i32 {\n    ret n;\n}\n"
+
+    def session_with(directory: Path, params: dict[str, Any], env: dict[str, str]) -> tuple[LspSession, Path]:
+        doc = directory / "sample.mach"
+        doc.write_text(SAMPLE, encoding="utf-8")
+        session = LspSession(server, directory, timeout, env)
+        answer = session.request("initialize", {"capabilities": {}, **params})
+        require("result" in answer, f"initialize failed under {params!r}: {answer!r}")
+        session.notify("initialized", {})
+        session.notify("textDocument/didOpen", {"textDocument": {
+            "uri": doc.as_uri(), "languageId": "mach", "version": 1, "text": SAMPLE}})
+        session.diagnostics(doc.as_uri(), 1)
+        return session, doc
+
+    def symbols(session: LspSession, doc: Path) -> None:
+        session.request("textDocument/documentSymbol", {"textDocument": {"uri": doc.as_uri()}})
+
+    def read(path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+    def run(params: dict[str, Any], env: dict[str, str], body: Callable[[LspSession, Path, Path], None]) -> None:
+        with tempfile.TemporaryDirectory(prefix="mls-settings-") as name:
+            directory = Path(name).resolve()
+            session, doc = session_with(directory, params, env)
+            finished = False
+            try:
+                body(session, doc, directory)
+                session.finish()
+                finished = True
+            finally:
+                if not finished:
+                    session.abort()
+
+    # the options alone turn tracing on, choose the file, and note what they ignore
+    def options(session: LspSession, doc: Path, directory: Path) -> None:
+        log = directory / "chosen.log"
+        symbols(session, doc)
+        text = read(log)
+        require("method textDocument/documentSymbol" in text,
+                f"the trace option did not trace into traceFile: {text[:400]!r}")
+        require('"method":"textDocument/documentSymbol"' not in text,
+                "messages level wrote a message body")
+        require("unknown option `colour` ignored" in text, f"an unknown key was not noted: {text[:600]!r}")
+        require("requestDeadlineMs` 10 is below 1000" in text, f"a short deadline was not noted: {text[:600]!r}")
+
+        # $/setTrace moves the level either way
+        session.notify("$/setTrace", {"value": "verbose"})
+        symbols(session, doc)
+        require('"method":"textDocument/documentSymbol"' in read(log), "verbose did not add message bodies")
+        session.notify("$/setTrace", {"value": "off"})
+        quiet = read(log).count("method textDocument/documentSymbol")
+        symbols(session, doc)
+        require(read(log).count("method textDocument/documentSymbol") == quiet,
+                "$/setTrace off still traced the next request")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-log-") as logdir:
+        chosen = Path(logdir).resolve() / "chosen.log"
+        run({"initializationOptions": {"trace": "messages", "traceFile": str(chosen),
+                                       "colour": "blue", "requestDeadlineMs": 10}},
+            {}, lambda s, d, _: options(s, d, chosen.parent))
+
+    # an unusable traceFile falls back to the environment's, with a note there
+    def relative(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        text = read(directory / "env.log")
+        require("method textDocument/documentSymbol" in text, "a relative traceFile did not fall back")
+        require("is not absolute" in text, f"the relative traceFile was not noted: {text[:600]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-env-") as logdir:
+        envlog = Path(logdir).resolve() / "env.log"
+        run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
+            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: relative(s, d, envlog.parent))
+
+        # so does one too long to open
+        envlog.unlink(missing_ok=True)
+        run({"initializationOptions": {"trace": "messages", "traceFile": "/" + "x" * 600}},
+            {"MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("is longer than 511 bytes" in read(envlog),
+                                                    f"a long traceFile was not noted: {read(envlog)[:400]!r}")))
+
+        # the LSP trace value turns tracing on when the environment does not
+        envlog.unlink(missing_ok=True)
+        run({"trace": "messages"}, {"MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
+                                                    "initialize.trace messages did not trace")))
+
+        # but an editor's default `trace: "off"` does not silence the environment
+        envlog.unlink(missing_ok=True)
+        run({"trace": "off"}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
+                                                    "initialize.trace off silenced MLS_TRACE")))
+
+        # while the option does
+        envlog.unlink(missing_ok=True)
+        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" not in read(envlog),
+                                                    "the trace option did not override MLS_TRACE")))
+
+
+def run_option_deadline(server: Path, timeout: float) -> None:
+    """`requestDeadlineMs` bounds a wedged request with no environment at all.
+
+    The default is two minutes, so an ignored option shows as this test timing
+    out. POSIX only, like `run_hung_worker`, whose wedge it reuses.
+    """
+    if os.name != "posix":
+        print("  option deadline: skipped (needs pgrep and SIGSTOP)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-optdeadline-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "optdeadline", 7)
+        session = LspSession(server, root, timeout)
+        wedged = None
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {},
+                                           "initializationOptions": {"requestDeadlineMs": 1200}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+            for _ in range(200):
+                children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                          capture_output=True, text=True).stdout.split()
+                if children:
+                    wedged = int(children[0])
+                    break
+                time.sleep(0.02)
+            require(wedged is not None, "no analysis worker to wedge")
+            os.kill(wedged, signal.SIGSTOP)
+            pending = session.next_id
+            session.next_id += 1
+            session._send({"jsonrpc": "2.0", "id": pending, "method": "textDocument/documentSymbol",
+                           "params": {"textDocument": {"uri": main.as_uri()}}})
+            answer = session.wait_for(lambda item: item.get("id") == pending, "the wedged request's answer")
+            require((answer.get("error") or {}).get("code") == -32802,
+                    f"the option deadline did not end the wedged request: {answer!r}")
+            # the replacement worker was given the same options, and answers
+            symbols = session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+            require(symbols.get("result"), f"the session did not recover: {symbols!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+            if wedged is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(wedged, signal.SIGKILL)
 
 
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
@@ -1500,8 +1818,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                     f"a request during a rebuild was not answered: {symbols!r}")
             # nothing republished while that request was outstanding, so the
             # rebuild had not finished when it was answered
-            early = [item for item in session.pending
-                     if item.get("method") == "textDocument/publishDiagnostics"]
+            early = [item for item in session.pending if session.source_diagnostics(item)]
             require(not early,
                     f"the rebuild finished before the request was answered: {early!r}")
 
@@ -1772,6 +2089,112 @@ def nav_ranges(text: str, within: str, needle: str) -> list[dict[str, Any]]:
         found.append({"start": {"line": line, "character": at},
                       "end": {"line": line, "character": at + len(needle)}})
         start = at + len(needle)
+
+
+NAV_ALIAS = """use h: nav.defs.helper;
+
+pub fun aliased(n: i32) i32 {
+    ret h(n);
+}
+"""
+
+
+def run_cross_module_references(server: Path, timeout: float) -> None:
+    """References and rename reach every module that imports the symbol (#246).
+
+    A `use`d binding carries its referent's origin but no declaration of its own,
+    so an identity test by declaration alone stopped the walk at the open buffer.
+    Asked from an importer, both requests must reach the declaring module, a
+    third module that imports the same function, and a module that imports it
+    under an alias - where rename rewrites the import path but not the alias.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-xrefs-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        other = main.parent / "other.mach"
+        alias = main.parent / "alias.mach"
+        alias.write_text(NAV_ALIAS, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            for doc, body in ((alias, NAV_ALIAS), (main, text)):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": doc.as_uri(), "languageId": "mach",
+                                      "version": 1, "text": body}},
+                )
+                session.diagnostics(doc.as_uri(), 1)
+
+            at_call = {"textDocument": {"uri": main.as_uri()},
+                       "position": nav_position(text, "ret helper(n) + helper(n + 1);", "helper")}
+
+            def lines_by_file(locations: list[dict[str, Any]]) -> dict[str, list[int]]:
+                found: dict[str, list[int]] = {}
+                for loc in locations:
+                    found.setdefault(Path(loc["uri"].removeprefix("file://")).name, []).append(
+                        loc["range"]["start"]["line"])
+                return {k: sorted(v) for k, v in found.items()}
+
+            refs = session.request("textDocument/references",
+                                   {**at_call, "context": {"includeDeclaration": True}})["result"]
+            by_file = lines_by_file(refs)
+            require(set(by_file) == {"main.mach", "defs.mach", "other.mach", "alias.mach"},
+                    f"references did not reach every importer: {by_file!r}")
+            require(by_file["defs.mach"] == [NAV_DEFS.splitlines().index(
+                        next(l for l in NAV_DEFS.splitlines() if l.startswith("pub fun helper")))],
+                    f"the declaration is missing: {by_file!r}")
+            require(by_file["other.mach"] == [0, 3],
+                    f"the third module's import and call are not both reported: {by_file!r}")
+            require(by_file["alias.mach"] == [0, 3],
+                    f"the aliased module's import and call are not both reported: {by_file!r}")
+
+            edit = session.request("textDocument/rename", {**at_call, "newName": "assist"})["result"]
+            changes = {Path(uri.removeprefix("file://")).name: sorted(e["range"]["start"]["line"] for e in edits)
+                       for uri, edits in edit.get("changes", {}).items()}
+            require(set(changes) == {"main.mach", "defs.mach", "other.mach", "alias.mach"},
+                    f"rename did not reach every importer: {changes!r}")
+            require(changes["other.mach"] == [0, 3],
+                    f"rename missed the third module's import or call: {changes!r}")
+            # the alias keeps its own name; only the path that names the function moves
+            require(changes["alias.mach"] == [0],
+                    f"rename rewrote the alias, or missed its import path: {changes!r}")
+            for e in edit["changes"][alias.as_uri()]:
+                require(e["newText"] == "assist" and e["range"]["start"]["character"] > len("use h: nav.defs"),
+                        f"the aliased import was not rewritten at its path leaf: {e!r}")
+
+            # asked through the alias, rename still renames the declaration and keeps
+            # the alias: the guard is the declared name, not the binding's own
+            via_alias = session.request("textDocument/rename", {
+                "textDocument": {"uri": alias.as_uri()},
+                "position": nav_position(NAV_ALIAS, "ret h(n);", "h"),
+                "newName": "assist"})["result"]
+            alias_changes = {Path(uri.removeprefix("file://")).name: sorted(e["range"]["start"]["line"] for e in edits)
+                             for uri, edits in via_alias.get("changes", {}).items()}
+            require(alias_changes == changes,
+                    f"rename through the alias differs from rename at a call: {alias_changes!r} vs {changes!r}")
+
+            # asked from the declaring module, the answer is the same set
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": NAV_DEFS}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            from_decl = session.request("textDocument/references", {
+                "textDocument": {"uri": defs.as_uri()},
+                "position": nav_position(NAV_DEFS, "pub fun helper", "helper"),
+                "context": {"includeDeclaration": True}})["result"]
+            require(lines_by_file(from_decl) == by_file,
+                    f"references from the declaration differ from references at a call: "
+                    f"{lines_by_file(from_decl)!r} vs {by_file!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_call_hierarchy(server: Path, timeout: float) -> None:
@@ -2089,16 +2512,27 @@ def run_document_symbol_kinds(server: Path, timeout: float) -> None:
             require(isinstance(symbols, list) and symbols,
                     f"documentSymbol returned nothing: {symbols!r}")
             kinds = {entry["name"]: entry["kind"] for entry in symbols}
-            expected = {"R": 23, "U": 10, "D": 26, "V": 14, "W": 13, "f": 12}
+            expected = {"R": 23, "U": 10, "T": 10, "D": 26, "V": 14, "W": 13, "f": 12}
             for name, kind in expected.items():
                 require(kinds.get(name) == kind,
                         f"{name} is SymbolKind {kinds.get(name)!r}, expected {kind}")
 
-            # `tag` has no arm in `features.decl_name_span`, so it never reaches
-            # the outline at all - #249. Asserted rather than described: fixing
-            # that issue turns this red, which is the prompt to add "T": 10 above.
-            require("T" not in kinds,
-                    "a tag now reaches documentSymbol - #249 is fixed, so assert its kind")
+            # a tag's cases are its members (#249)
+            tag = next(entry for entry in symbols if entry["name"] == "T")
+            cases = [(child["name"], child["kind"]) for child in tag.get("children", [])]
+            require(cases == [("one", 22), ("two", 22)],
+                    f"the tag's cases are not its enum members: {cases!r}")
+
+            # definition on a tag's own name lands on that name
+            lines = KIND_BUFFER.splitlines()
+            tag_line = next(i for i, value in enumerate(lines) if value.startswith("pub tag T"))
+            column = lines[tag_line].index("T:")
+            found = session.request("textDocument/definition", {
+                "textDocument": {"uri": buffer.as_uri()},
+                "position": {"line": tag_line, "character": column}})["result"]
+            require(isinstance(found, dict) and found.get("range", {}).get("start")
+                    == {"line": tag_line, "character": column},
+                    f"definition on a tag's name did not land on it: {found!r}")
 
             session.finish()
             finished = True
@@ -4416,6 +4850,10 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_version(server, args.timeout)
+        run_settings(server, args.timeout)
+        run_manifest_notes(server, args.timeout)
+        run_option_deadline(server, args.timeout)
+        run_cross_module_references(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)

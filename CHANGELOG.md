@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-17
+
+Configuration at `initialize`, project-level diagnostics on `mach.toml`,
+cross-module references and rename, and the move to mach's compiler ranges.
+This is the release the 1.0 surface ships in first (#270).
+
+**The linked mach moves from v5.2.1 to v5.4.0**, and std from v3.2.0 to v4.0.0.
+Projects are now checked against mach 5.4.0: one whose `[project].mach`, or a
+dependency's, excludes 5.4.0 is not loaded, and the reason is shown on its
+`mach.toml`. Building mls itself needs mach 5.3 or later.
+
+### Added
+- feat(project): what a project load says about the project itself is shown on
+  the root's `mach.toml` (#266). mach 5.3 records some warnings against no source
+  file, such as the one for a manifest without `[project].mach`, and refuses a
+  load when the compiler is outside a range the closure states. Neither reached
+  the editor before. The server now publishes them as diagnostics on
+  `mach.toml`, and publishes the list again whenever it changes. A fixed
+  manifest therefore loses its complaint, whether the fix arrives as a watched
+  file change or is found by the next request. A root whose load failed is
+  retried as soon as a change is reported, and a rebuild for a loaded one starts
+  then too, rather than at the next message.
+- feat(settings): a configuration surface at `initialize` (#264). The
+  `initializationOptions` keys `trace`, `traceFile` and `requestDeadlineMs`
+  take precedence over `MLS_TRACE`, `MLS_TRACE_FILE` and
+  `MLS_REQUEST_DEADLINE_MS`. Unknown keys and unusable values are noted in the
+  trace and ignored. `initialize.trace` sets the level when neither the option
+  nor the environment does, and `$/setTrace` moves it afterwards. The settings
+  carry over to a replaced worker. See the README's Configuration section.
+
+### Changed
+- docs(readme): the status and deferred lists match what the server
+  advertises: incremental sync, workspace symbols, member completion and the
+  other features added since they were written (#280).
+- docs(readme): the known limits are measured again on mach 5.4.0 and std 4.0.0
+  (#280): about 26 s to the first semantic answer and to the first rebuild,
+  1.2-1.4 s for later rebuilds, and 870 MiB to 1.35 GiB of worker memory with a
+  1.7 GiB peak.
+- chore(dep): the server links mach 5.4.0, built against std 4.0.0, the std
+  mach's own CI proves (#266, #280). 5.4.0 carries the fix for mach#3536,
+  without which a rebuild with std 4.0 took 16-25 s on this repository. std 4.0 passes descriptors as pointer-width
+  handles, so the transport, the supervisor's pipes and the trace log hold
+  handles now. Projects are checked against the linked mach's version: one whose
+  `[project].mach` excludes it is not loaded. The README's Compiler
+  compatibility section describes this.
+- chore(project): mls states its own compiler range, `mach = "^5.3"`, and
+  builds only with mach 5.3 or later (#266).
+- chore(license): copyright is attributed to Briar Systems LLC, 2025-2026
+  (#277). The MIT terms are unchanged.
+- docs: the README states the first-load time, rebuild times and resident
+  memory as known limits, measured on this repository (#268).
+- feat(version): `mls --version` prints `mls <version> (mach <version>)`, and
+  `initialize` reports the compiler version as `serverInfo.mach`.
+  `serverInfo.version` is unchanged.
+- docs: the README documents the public command line, `mls` and
+  `mls --version`, and marks `mls --worker` private (#265). `--worker` is the
+  supervisor's re-launch of itself, with no stability promise.
+
+### Fixed
+- fix(features): `tag` declarations have a name span (#249). The outline
+  listed no tag, and definition, references, rename and highlight could not
+  start from a tag's name. The outline also lists a tag's cases as enum members,
+  with a payload type as the detail.
+- fix(references): references and rename reach every module that imports the
+  symbol (#246). The walk identified its target by DeclId, which a `use`d
+  binding does not carry, so asked from an importer it never left the open
+  buffer, and a rename rewrote one file of a cross-module symbol. The target is
+  now the defining symbol. Every module contributes each binding that denotes
+  it, by declaration or by canonical name and kind. Rename keeps an import
+  alias's spelling and rewrites its path.
+- fix(project): on windows, an open document that no module imports is
+  analyzed (#273). Open documents join the load when they lie under the source
+  directory, and that test only accepted `/`, while windows paths are spelled
+  with `\`. Such a document was never loaded, and definition, workspace symbols
+  and references all skipped it.
+
 ## [0.19.0] - 2026-09-16
 
 Navigation, answers while the project rebuilds, off-thread rebuilds, and the

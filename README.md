@@ -6,8 +6,11 @@ editor APIs.
 
 ## Status
 
-mach-lsp implements lifecycle, full-text synchronization, diagnostics, hover,
-definition, references, rename/prepareRename, document symbols, and completion.
+mach-lsp implements lifecycle, incremental text synchronization, diagnostics
+(including a project's own, on its `mach.toml`), hover, definition, type
+definition, references, rename and prepareRename, document highlight, document
+symbols, workspace symbols, call hierarchy, semantic tokens, inlay hints,
+signature help, quick-fix code actions, and completion.
 
 Project documents are analyzed by the compiler's retained frontend API. Each
 manifest root owns a stable long-lived compiler Session and one current Project
@@ -67,12 +70,38 @@ the edits.
 
 Cross-module references and rename walk the retained graph. Rename is restricted
 to project-owned declarations, so vendored dependency sources remain read-only.
-Completion is currently a flat list of module names, import aliases, and primitive
-types rather than a lexical scope view.
+Completion offers, by prefix, every name the document's resolve table binds,
+whether or not it is in scope at the cursor. After a `.` it offers a module
+alias's public symbols, or the fields of the record or union the receiver has.
 
 The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols do not pay that cost; moving semantic work
 off the request path is tracked by #143.
+
+## Known limits
+
+These are the costs of the current design, not defects awaiting a fix. The
+figures are from this repository, which analyzes the whole compiler and
+standard library (`dep/mach`, `dep/std`): a release build on mach 5.4.0 with
+std 4.0.0, on an 8-core Ryzen 7 5800X3D. Smaller projects pay proportionally
+less.
+
+| cost | figure | why |
+| --- | --- | --- |
+| first semantic answer after opening a project | ~26 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
+| first rebuild after that load | ~26 s | a root keeps two sessions, and the second is cold until its first build (#252) |
+| every later rebuild | ~1.2-1.4 s | a rebuild still walks the whole project to find what an edit changed (#250) |
+| analysis worker memory | ~870 MiB after the first load, ~1.35 GiB once both sessions have built, ~1.7 GiB peak while the second builds for the first time; flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
+
+While a rebuild runs, the edited buffer keeps answering from the snapshot it
+has (see above), so neither rebuild figure is time without answers. Syntax-only
+features never wait on analysis. What remains blocked is the first load.
+Semantic requests made during it wait for it to finish. The server keeps reading
+input throughout, so it never blocks the editor mid-write, and edits made
+meanwhile are coalesced into one analysis.
+
+Positions are UTF-16 code units, as LSP defines by default. The server does not
+negotiate `positionEncoding` (#269).
 
 ## Building
 
@@ -94,7 +123,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.19.0 t=x86_64-linux
+v=0.20.0 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -118,44 +147,120 @@ The names are a contract: editor extensions download by them.
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
 | `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
 
-`<version>` has no leading `v`. `mls --version` prints `mls <version>`, and
-`initialize` reports the same value as `serverInfo.version`. Every shipped
+`<version>` has no leading `v`. `mls --version` prints
+`mls <version> (mach <compiler version>)`. `initialize` reports the same
+`<version>` as `serverInfo.version`, and the compiler version as
+`serverInfo.mach`. Every shipped
 platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
 target without a native runner and is not shipped.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
 
+## Command line
+
+The public interface is two invocations:
+
+| invocation | behaviour |
+| --- | --- |
+| `mls` | the language server, speaking LSP over stdin/stdout |
+| `mls --version` | prints `mls <version> (mach <compiler version>)` and exits |
+
+`mls --worker` is **private**. The server re-launches itself with it to run the
+analysis in a supervised child process, so a compiler fault is a child exit the
+editor never sees. It is not a stable interface: its name, its arguments and
+its behaviour may change in any release. Editors and scripts must not pass it.
+
+## Configuration
+
+The server reads its configuration once, from the `initialize` request. Every
+setting has an environment variable behind it, and the order is: the
+`initializationOptions` key, then the environment variable, then the default.
+
+| `initializationOptions` key | environment | value |
+| --- | --- | --- |
+| `trace` | `MLS_TRACE` | `"off"`, `"messages"` or `"bodies"` (see [Tracing](#tracing)) |
+| `traceFile` | `MLS_TRACE_FILE` | an absolute path the trace is appended to |
+| `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
+
+```json
+{ "initializationOptions": { "trace": "messages", "traceFile": "/home/me/mls.log" } }
+```
+
+A key the server does not know, and a value it cannot use, is ignored and noted
+in the trace. Configuration never fails `initialize`, so a client written for a
+newer server still gets a working one. `workspace/didChangeConfiguration` is
+ignored.
+
+`requestDeadlineMs` is a tuning knob. It bounds how long a request may wait on
+the analysis worker before the server answers it with an error and replaces the
+worker. Its default is not part of the interface and may change.
+
 ## Tracing
 
-The server speaks JSON-RPC on stdout, so it cannot log there. Set the
-`MLS_TRACE` environment variable (to any value) to append a trace to
-`/tmp/mach-lsp.log`; leave it unset — the default — and the server performs no
-logging.
+The server speaks JSON-RPC on stdout, so it cannot log there. A trace is
+appended to `traceFile`, else `MLS_TRACE_FILE`, else `/tmp/mach-lsp.log`. With
+nothing configured, the default, the server performs no logging.
 
 What a trace contains is a separate decision from whether it is on. A message
 body is your source code: every `didOpen` carries a whole file and every
 `didChange` carries what you just typed. Tracing is normally turned on to see
-which requests arrived in what order, which does not need any of that, so by
-default the log records only what each message *is* — direction, method, id,
-size, timing — and no bodies.
+which requests arrived in what order, which does not need any of that, so the
+`messages` level records only what each message *is* (direction, method, id,
+size, timing) and no bodies.
 
-| variable | effect |
-|---|---|
-| `MLS_TRACE` | enables tracing (any value) |
-| `MLS_TRACE=bodies` | also records message bodies, truncated at 512 bytes each |
-| `MLS_TRACE_FILE` | appends to this path instead of `/tmp/mach-lsp.log` |
+| level | effect |
+| --- | --- |
+| `off` | no trace |
+| `messages` | one line per message, and the server's own notes |
+| `bodies` | also message bodies, truncated at 512 bytes each |
 
-Use `MLS_TRACE=bodies` only when you need the contents of a message, and be
-aware that the log will then contain fragments of whatever you have open.
+`MLS_TRACE` set to `bodies` means `bodies`, and set to any other value means
+`messages`. The LSP trace setting names the same levels `off`, `messages` and
+`verbose`.
+
+The level at startup is the first of these that is given:
+
+1. the `trace` option
+2. `MLS_TRACE`
+3. `initialize.trace`
+
+So `MLS_TRACE` is not silenced by an editor that sends `trace: "off"` by
+default, but the `trace` option does silence it. After startup, `$/setTrace`
+moves the level for the rest of the session, whatever set it.
+
+Use `bodies` only when you need the contents of a message, and be aware that
+the log will then contain fragments of whatever you have open.
 
 ## How the compiler dependency is wired
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.2.1`
-and `v3.2.0`), and fetched by `mach dep pull .`. The committed gitlinks under
-`dep/` are the pins; there is no lockfile.
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.3.1`
+and `v4.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
+`dep/` are the pins; there is no lockfile. std is pinned to the release mach's
+own CI builds with, because the server and the compiler it links share one
+std.
+
+### Compiler compatibility
+
+The server does not run `mach`. It contains the compiler, linked from exactly
+one mach release, which `mls --version` and `serverInfo.mach` name. Every
+project it opens is checked against that release.
+
+A project states the compilers it builds with as `[project].mach` in its
+`mach.toml`, and its dependencies may state their own. When the linked release
+is outside any of those ranges, the project is not loaded. The server shows
+why, naming each unmet range and the dependency chain that states it, as an
+error on the root's `mach.toml` and in a message. A manifest without the key
+loads with a warning there that gives the line to add. Both clear when the
+manifest is fixed.
+
+So a project that requires a newer mach than the server links needs a newer
+server. A release that moves the linked mach says so in the changelog, naming
+the old and new version. Moving to a new mach minor is at least an mls minor
+release, an mls patch release moves only mach's patch, and a new mach major is
+a new mls major.
 
 ## Architecture
 
@@ -178,7 +283,7 @@ and `v3.2.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 
 ## Deferred
 
-- workspace symbol search;
-- scope-aware completion (member access after `.`, lexically scoped locals)
-  — the resolver's scope chain is internal to the resolve pass and not
-  exposed by the side tables.
+- scope-aware completion (only the names in scope at the cursor): the
+  resolver's scope chain is internal to the resolve pass and not exposed by
+  its side tables;
+- `utf-8` position encoding (#269).
