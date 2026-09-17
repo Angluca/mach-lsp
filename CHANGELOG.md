@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- fix(references): references and rename reach every module that imports the
+  symbol (#246). The walk identified its target by DeclId, which a `use`d
+  binding does not carry, so asked from an importer it never left the open
+  buffer, and a rename rewrote one file of a cross-module symbol. The target is
+  now the defining symbol. Every module contributes each binding that denotes
+  it, by declaration or by canonical name and kind. Rename keeps an import
+  alias's spelling and rewrites its path.
+
 ## [0.19.0] - 2026-09-16
 
 Navigation, answers while the project rebuilds, off-thread rebuilds, and the

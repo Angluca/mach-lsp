@@ -1752,9 +1752,10 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched
-    # the guard is the DECLARED name: a binding imported under an alias carries
-    # the alias as its own name, and only occurrences spelled as declared are
-    # rewritten
+    # the guard is the DECLARED name, read from the defining symbol: only
+    # occurrences spelled as declared are rewritten, so an alias keeps its own
+    # spelling. a `use` binding happens to carry the declared name already, but a
+    # symbol's own name is not that promise
     val decl_sym: *rslv.Symbol = project.defining_symbol_in(an.root, sym);
     if (decl_sym == nil) {
         render.reply_empty_edit(alloc, id_raw);
