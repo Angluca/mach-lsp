@@ -153,14 +153,29 @@ The names are a contract: editor extensions download by them.
 | --- | --- |
 | `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
-| `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
+| `RELEASES.json` | every mls release and the mach version it links |
+| `SHA256SUMS` | the SHA-256 of every other asset, in `sha256sum` format |
 
 `<version>` has no leading `v`. `mls --version` prints
 `mls <version> (mach <compiler version>)`. `initialize` reports the same
 `<version>` as `serverInfo.version`, and the compiler version as
-`serverInfo.mach`. Every shipped
-platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
-target without a native runner and is not shipped.
+`serverInfo.mach`. Every shipped platform runs the full protocol suite natively
+in CI. `riscv64-linux` is a build target without a native runner and is not
+shipped.
+
+`RELEASES.json` is one JSON object, newest release first, mapping each mls
+version to the mach version that release links:
+
+```json
+{"0.20.1": "5.4.0", "0.20.0": "5.4.0", "0.19.0": "5.2.1"}
+```
+
+A server refuses a project whose `[project].mach` range excludes its mach, so
+an installer that cannot list releases reads the newest release's
+`RELEASES.json` to find the newest mls a project accepts. Every release
+carries the complete map. It is generated from the release tags when a release
+is cut, and the release fails if its own entry disagrees with its binary. The
+format does not change from 1.0 on.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.

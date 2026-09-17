@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat(settings): a relative `traceFile` is resolved against the workspace
   root, the first of `workspaceFolders`, else `rootUri` (#287). With neither it
   is ignored with a note, as before.
+- feat(release): each release publishes `RELEASES.json`, mapping every mls
+  version to the mach version it links, so an editor extension can pick the
+  newest mls a project's `[project].mach` range accepts (#288). It is generated
+  from the tags when the release is cut, covered by `SHA256SUMS`, and checked
+  against the release's own binary. Its format is frozen at 1.0.
 
 ### Fixed
 - fix(rename): a rename that would break the project, or change what it means,
