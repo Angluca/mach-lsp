@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listed no tag, and definition, references, rename and highlight could not
   start from a tag's name. The outline also lists a tag's cases as enum members,
   with a payload type as the detail.
+- fix(references): references and rename reach every module that imports the
+  symbol (#246). The walk identified its target by DeclId, which a `use`d
+  binding does not carry, so asked from an importer it never left the open
+  buffer, and a rename rewrote one file of a cross-module symbol. The target is
+  now the defining symbol. Every module contributes each binding that denotes
+  it, by declaration or by canonical name and kind. Rename keeps an import
+  alias's spelling and rewrites its path.
+- fix(project): on windows, an open document that no module imports is
+  analyzed (#273). Open documents join the load when they lie under the source
+  directory, and that test only accepted `/`, while windows paths are spelled
+  with `\`. Such a document was never loaded, and definition, workspace symbols
+  and references all skipped it.
 
 ## [0.19.0] - 2026-09-16
 
