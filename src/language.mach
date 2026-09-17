@@ -2494,6 +2494,8 @@ fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: 
 fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl, alloc: *Allocator) {
     var fields_start: u32 = 0;
     var fields_len:   u32 = 0;
+    var cases_start:  u32 = 0;
+    var cases_len:    u32 = 0;
     var gen_start:    u32 = 0;
     var gen_len:      u32 = 0;
     var member_kind:  i64 = LSP_SYMBOL_FIELD;
@@ -2511,6 +2513,12 @@ fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl,
         gen_len      = d.data.uni_.generics_len;
         member_kind  = LSP_SYMBOL_ENUM_MEMBER;
     }
+    or (d.kind == decl.DECL_KIND_TAG) {
+        cases_start = d.data.tag_.cases_start;
+        cases_len   = d.data.tag_.cases_len;
+        gen_start   = d.data.tag_.generics_start;
+        gen_len     = d.data.tag_.generics_len;
+    }
     or (d.kind == decl.DECL_KIND_FUN) {
         fields_start = d.data.fun_.params_start;
         fields_len   = d.data.fun_.params_len;
@@ -2520,7 +2528,7 @@ fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl,
     }
     or { ret; }
 
-    if (fields_len == 0 && gen_len == 0) { ret; }
+    if (fields_len == 0 && cases_len == 0 && gen_len == 0) { ret; }
 
     json.buf_push(b, ",\"children\":[");
     var emitted: u32 = 0;
@@ -2543,6 +2551,17 @@ fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl,
             }
         }
         f = f + 1;
+    }
+    # a tag's cases are its members; a payload type rides as the detail
+    var c: u32 = 0;
+    for (c < cases_len) {
+        if (an.a.tag_cases != nil) {
+            val tc: *decl.TagCase = ?an.a.tag_cases[(cases_start + c)::usize];
+            if (push_member_symbol(b, an, tc.name, tc.payload, LSP_SYMBOL_ENUM_MEMBER, emitted > 0, alloc)) {
+                emitted = emitted + 1;
+            }
+        }
+        c = c + 1;
     }
     json.buf_push_byte(b, ']');
 }
