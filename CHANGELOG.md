@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(settings): a configuration surface at `initialize` (#264). The
+  `initializationOptions` keys `trace`, `traceFile` and `requestDeadlineMs`
+  take precedence over `MLS_TRACE`, `MLS_TRACE_FILE` and
+  `MLS_REQUEST_DEADLINE_MS`. Unknown keys and unusable values are noted in the
+  trace and ignored. `initialize.trace` sets the level when neither the option
+  nor the environment does, and `$/setTrace` moves it afterwards. The settings
+  carry over to a replaced worker. See the README's Configuration section.
+
 ### Changed
 - docs: the README states the first-load time, rebuild times and resident
   memory as known limits, measured on this repository (#268).
+- feat(version): `mls --version` prints `mls <version> (mach <version>)`, and
+  `initialize` reports the compiler version as `serverInfo.mach`.
+  `serverInfo.version` is unchanged.
 - docs: the README documents the public command line, `mls` and
   `mls --version`, and marks `mls --worker` private (#265). `--worker` is the
   supervisor's re-launch of itself, with no stability promise.
