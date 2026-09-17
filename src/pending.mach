@@ -1,0 +1,181 @@
+# the client requests the worker still owes an answer, as the supervisor sees them
+#
+# The supervisor answers these itself when the worker dies, and bounds the ones
+# being handled with the request deadline (#284). Both need every outstanding
+# request, not the newest: a client sends a request while another waits, and an
+# id may be a string, which is answered by echoing its token back unchanged.
+#
+# A held request (#251) is waiting for a build, not being handled, so it is
+# kept but does not count as active until the worker says it resumed.
+#
+# Not thread-safe: the supervisor guards it with its own lock.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.allocator;
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use mls.json;
+
+# one outstanding request
+# ---
+# id:   its id token as it appeared on the wire, owned
+# held: the worker is holding it for a build
+pub rec Request {
+    id:   str;
+    held: bool;
+}
+
+# the outstanding requests, oldest first
+pub rec Ledger {
+    alloc: *Allocator;
+    items: *Request;
+    len:   usize;
+    cap:   usize;
+}
+
+pub fun init(alloc: *Allocator) Ledger {
+    ret Ledger{alloc: alloc, items: nil, len: 0, cap: 0};
+}
+
+pub fun dnit(l: *Ledger) {
+    var i: usize = 0;
+    for (i < l.len) {
+        json.free_str(l.items[i].id, l.alloc);
+        i = i + 1;
+    }
+    if (l.items != nil) { deallocate[Request](l.alloc, l.items, l.cap); }
+    l.items = nil;
+    l.len   = 0;
+    l.cap   = 0;
+}
+
+# record a request the client sent
+# ---
+# ret: false when it could not be recorded, so a crash will not answer it
+pub fun open(l: *Ledger, id: str) bool {
+    if (id == nil) { ret false; }
+    if (l.len == l.cap) {
+        var cap: usize = l.cap * 2;
+        if (cap == 0) { cap = 4; }
+        if (l.items == nil) {
+            val r: res[*Request, allocator.Error] = allocate[Request](l.alloc, cap);
+            if (sel r.err) { ret false; }
+            l.items = r.ok;
+        }
+        or {
+            val r: res[*Request, allocator.Error] = reallocate[Request](l.alloc, l.items, l.cap, cap);
+            if (sel r.err) { ret false; }
+            l.items = r.ok;
+        }
+        l.cap = cap;
+    }
+    val copy: str = json.dup(id, l.alloc);
+    if (copy == nil) { ret false; }
+    l.items[l.len] = Request{id: copy, held: false};
+    l.len          = l.len + 1;
+    ret true;
+}
+
+# forget a request the worker answered
+# ---
+# ret: whether it was outstanding
+pub fun close(l: *Ledger, id: str) bool {
+    val i: usize = find(l, id);
+    if (i == l.len) { ret false; }
+    json.free_str(l.items[i].id, l.alloc);
+    var j: usize = i + 1;
+    for (j < l.len) {
+        l.items[j - 1] = l.items[j];
+        j              = j + 1;
+    }
+    l.len = l.len - 1;
+    ret true;
+}
+
+# mark a request held for a build, or resumed from one
+pub fun hold(l: *Ledger, id: str, held: bool) {
+    val i: usize = find(l, id);
+    if (i < l.len) { l.items[i].held = held; }
+}
+
+# whether any request is being handled rather than held
+pub fun active(l: *Ledger) bool {
+    var i: usize = 0;
+    for (i < l.len) {
+        if (!l.items[i].held) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# move every request out, leaving `l` empty
+pub fun take(l: *Ledger) Ledger {
+    val out: Ledger = @l;
+    l.items = nil;
+    l.len   = 0;
+    l.cap   = 0;
+    ret out;
+}
+
+fun find(l: *Ledger, id: str) usize {
+    var i: usize = 0;
+    if (id == nil) { ret l.len; }
+    for (i < l.len) {
+        if (str_equals(l.items[i].id, id)) { ret i; }
+        i = i + 1;
+    }
+    ret l.len;
+}
+
+use std.allocator.page;
+
+test "pending: requests close by id token, in any order, numeric or string" {
+    var pa: Allocator;
+    page.make(?pa);
+    var l:    Ledger = init(?pa);
+    var fail: bool   = false;
+    if (!open(?l, "1") || !open(?l, "\"a\"") || !open(?l, "3")) { fail = true; }
+    if (!open(?l, "4") || !open(?l, "5"))                        { fail = true; }
+    if (l.len != 5)                                              { fail = true; }
+    if (!close(?l, "\"a\""))                                     { fail = true; }
+    if (close(?l, "a"))                                          { fail = true; }
+    if (close(?l, "\"a\""))                                      { fail = true; }
+    if (!close(?l, "1"))                                         { fail = true; }
+    if (l.len != 3 || !str_equals(l.items[0].id, "3"))           { fail = true; }
+    dnit(?l);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "pending: only a request that is not held is active" {
+    var pa: Allocator;
+    page.make(?pa);
+    var l:    Ledger = init(?pa);
+    var fail: bool   = false;
+    if (active(?l)) { fail = true; }
+    open(?l, "7");
+    if (!active(?l)) { fail = true; }
+    hold(?l, "7", true);
+    if (active(?l)) { fail = true; }
+    open(?l, "8");
+    if (!active(?l)) { fail = true; }
+    close(?l, "8");
+    hold(?l, "7", false);
+    if (!active(?l)) { fail = true; }
+    var all: Ledger = take(?l);
+    if (l.len != 0 || all.len != 1 || active(?l)) { fail = true; }
+    dnit(?all);
+    dnit(?l);
+    if (fail) { ret 1; }
+    ret 0;
+}

@@ -2,10 +2,8 @@
 #
 # A cold project load is seconds during which the server answers nothing and
 # says nothing. From the outside that is indistinguishable from a server that
-# has hung - and it is now MORE important to distinguish them, because the
-# supervisor deliberately waits two minutes before it will call analysis stuck.
-# A progress report is what makes the difference visible without making the
-# deadline shorter.
+# has hung, and the request deadline does not bound a load (`sideband`), so a
+# progress report is what tells the person it is working.
 #
 # Only the cold load reports. A revalidation is a few hundred milliseconds, and
 # a spinner that appears and vanishes on every keystroke is worse than none: it
