@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry over to a replaced worker. See the README's Configuration section.
 
 ### Changed
+- chore(dep): the server links mach 5.3.0, built against std 4.0.0, the std
+  mach's own CI proves (#266). std 4.0 passes descriptors as pointer-width
+  handles, so the transport, the supervisor's pipes and the trace log hold
+  handles now. Projects are checked against the linked mach's version: one whose
+  `[project].mach` excludes it is not loaded. The README's Compiler
+  compatibility section describes this.
 - chore(license): copyright is attributed to Briar Systems LLC, 2025-2026
   (#277). The MIT terms are unchanged.
 - docs: the README states the first-load time, rebuild times and resident
