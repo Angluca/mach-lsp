@@ -1737,6 +1737,24 @@ def run_settings(server: Path, timeout: float) -> None:
         run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
             {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: unrooted(s, d, envlog.parent))
 
+        # a relative path means a path under the root: one that climbs out is
+        # refused the same way, and nothing is written beside the root (#300)
+        def escaping(session: LspSession, doc: Path, root: Path) -> None:
+            symbols(session, doc)
+            text = read(envlog)
+            require("method textDocument/documentSymbol" in text, "an escaping traceFile did not fall back")
+            require("resolves outside the workspace root" in text,
+                    f"the escaping traceFile was not noted: {text[:600]!r}")
+            require(not (root.parent / "escape.log").exists(), "an escaping traceFile was written beside the root")
+
+        envlog.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="mls-settings-escape-") as outer:
+            root = Path(outer).resolve() / "root"
+            root.mkdir()
+            run({"rootUri": root.as_uri(),
+                 "initializationOptions": {"trace": "messages", "traceFile": "../escape.log"}},
+                {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: escaping(s, d, root))
+
         # so does one too long to open
         envlog.unlink(missing_ok=True)
         run({"initializationOptions": {"trace": "messages", "traceFile": "/" + "x" * 600}},

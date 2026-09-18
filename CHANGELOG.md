@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full asset set, so every entry can be installed (#299). Tags without a
   release, and releases without their archives, are left out. The release
   fails if a listed version lacks its assets.
+- fix(settings): a relative `traceFile` that resolves outside the workspace
+  root, such as `../escape.log`, is ignored with a note instead of written
+  beside the project (#300).
 
 ## [0.21.0] - 2026-09-17
 

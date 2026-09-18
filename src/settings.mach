@@ -324,9 +324,12 @@ fun option_file(v: *sj.Value, alloc: *Allocator, report: bool) str {
 
 # the `traceFile` option as the absolute path it names
 #
-# A relative path is relative to the workspace root: the first workspace folder,
-# else `rootUri`. A client that sends neither has no root to resolve against, so
-# the option is ignored rather than aimed at wherever the server was started.
+# A relative path is a path under the workspace root: the first workspace
+# folder, else `rootUri`. A client that sends neither has no root to resolve
+# against, so the option is ignored rather than aimed at wherever the server
+# was started. One that resolves outside the root is ignored too: a project
+# setting shared through version control must not write beside the project,
+# and an absolute path is there for anyone who means to write elsewhere.
 # ---
 # path:   the option as given, owned; consumed
 # params: the `initialize` params, for the workspace root
@@ -345,6 +348,11 @@ fun resolve_file(path: str, params: *sj.Value, alloc: *Allocator, report: bool) 
             if (sel jr.ok) {
                 out = uris.normalize(alloc, jr.ok);
                 strutil.str_free(alloc, jr.ok);
+            }
+            if (out != nil && !uris.is_under(out, root)) {
+                if (report) { trace.logf("settings: option `traceFile` `{}` resolves outside the workspace root; ignored", path); }
+                strutil.str_free(alloc, out);
+                out = nil;
             }
             strutil.str_free(alloc, root);
         }
