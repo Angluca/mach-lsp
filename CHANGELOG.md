@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-18
+
+A latency fix on a 1.0 surface. No contract change: same asset set, CLI,
+options and behaviour as 1.0.1.
+
 **The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
 
 ### Changed
