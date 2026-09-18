@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(#269): the server negotiates the LSP position encoding. utf-16 is the
+  base-protocol default and stays the promise for any client that advertises
+  none, so existing behaviour is unchanged. A client that offers `utf-8` in
+  `general.positionEncodings` gets it (its columns are byte offsets, matching
+  the compiler's own with no conversion), or `utf-32` (codepoint columns); the
+  chosen encoding is echoed back in `ServerCapabilities.positionEncoding`. Every
+  column conversion runs through the single point in `positions`, so the
+  negotiated units apply uniformly to inbound positions and outbound ranges.
+
 ## [1.1.0] - 2026-09-18
 
 The #297 crash fix becomes structural. No LSP contract change: same asset set,
