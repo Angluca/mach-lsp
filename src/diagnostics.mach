@@ -25,6 +25,7 @@ use std.allocator.page;
 use mach.lang.build.outcome;
 use diag: mach.lang.diagnostic;
 use mach.lang.editor;
+use ferr: mach.lang.fail;
 use mach.lang.fe.token;
 use src: mach.lang.source;
 
@@ -404,7 +405,7 @@ test "diagnostics: no secondary locations emits no relatedInformation key" {
     page.make(?pa);
     var b:  json.Buf        = json.buf_init(?pa);
     var d:  diag.Diagnostic = stub_diag("duplicate definition");
-    var m:  src.SourceMap   = stub_map(nil, 0);
+    var m:  src.SourceMap   = src.init(?pa);
     var at: Locator         = Locator{w: nil, root: nil, sources: ?m};
     push_related(?b, ?at, ?d, ?pa);
 
@@ -421,22 +422,14 @@ test "diagnostics: a secondary location renders as a located relatedInformation 
     var pa: Allocator;
     page.make(?pa);
 
-    # `src.position` indexes `line_starts` unconditionally, so a stub file needs
-    # a real line index: "ab\ncd" starts lines at 0 and 3
-    var starts: [2]usize;
-    starts[0] = 0;
-    starts[1] = 3;
-
-    # slot 0 is FILE_NIL and never resolves, so the real file sits at id 1
-    var files: [2]src.SourceFile;
-    files[1].path        = "file:///w/a.mach";
-    files[1].text        = "ab\ncd";
-    files[1].line_starts = ?starts[0];
-    files[1].line_len    = 2;
-    var m: src.SourceMap = stub_map(?files[0], 2);
+    # add builds the line index and issues the first FileId as 1, since slot 0 is
+    # the FILE_NIL sentinel
+    var m:     src.SourceMap              = src.init(?pa);
+    val added: res[src.FileId, ferr.Fail] = src.add(?m, "file:///w/a.mach", "ab\ncd");
+    if (sel added.err) { ret 1; }
 
     var rels: [1]diag.Related;
-    rels[0].loc.file_id     = 1::src.FileId;
+    rels[0].loc.file_id     = added.ok;
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 2;
     rels[0].label           = "previous definition here";
@@ -461,7 +454,7 @@ test "diagnostics: a secondary location renders as a located relatedInformation 
 test "diagnostics: a secondary location with an unresolvable file is skipped" {
     var pa: Allocator;
     page.make(?pa);
-    var m: src.SourceMap = stub_map(nil, 0);
+    var m: src.SourceMap = src.init(?pa);
 
     var rels: [1]diag.Related;
     rels[0].loc.file_id     = 9::src.FileId;
@@ -481,15 +474,4 @@ test "diagnostics: a secondary location with an unresolvable file is skipped" {
     json.buf_dnit(?b);
     if (fail) { ret 1; }
     ret 0;
-}
-
-# a SourceMap over a caller-owned files array. `src.get` reads only `files` and
-# `len`, so the path index stays unbuilt - a lookup by path would not answer
-fun stub_map(files: *src.SourceFile, len: usize) src.SourceMap {
-    var m: src.SourceMap;
-    m.a     = nil;
-    m.files = files;
-    m.len   = len;
-    m.cap   = len;
-    ret m;
 }
