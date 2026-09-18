@@ -209,8 +209,9 @@ setting has an environment variable behind it, and the order is: the
 | `traceFile` | `MLS_TRACE_FILE` | the file the trace is appended to |
 | `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
 
-A relative `traceFile` is under the workspace root: the first of
-`workspaceFolders`, else `rootUri`. With neither, it is ignored. A relative
+A relative `traceFile` is a path under the workspace root: the first of
+`workspaceFolders`, else `rootUri`. With neither, or when the path climbs out
+of the root, it is ignored. Use an absolute path to write elsewhere. A relative
 `MLS_TRACE_FILE` is under the directory the server was started in.
 
 ```json
