@@ -1519,6 +1519,126 @@ def run_version(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_position_encoding(server: Path, timeout: float) -> None:
+    """The server negotiates `positionEncoding` and honours it at the boundary.
+
+    utf-16 is the base-protocol default and 1.0's promise, so a client that
+    advertises nothing still gets it. Offered utf-8 (mach's own byte offsets)
+    or utf-32, the server picks it and echoes it in ServerCapabilities. The
+    choice then decides what a `character` column counts: the same reference,
+    after a non-BMP codepoint where the encodings disagree, sits at a different
+    column in each, and every one must still resolve to the same definition
+    through the single conversion point in `positions`.
+    """
+    manifest = """[project]
+id = "penc"
+version = "0.1.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+"""
+    glyph = "\U0001F600"  # U+1F600, a non-BMP codepoint: 2 utf-16 units, 4 utf-8 bytes, 1 utf-32
+    source = (
+        "pub fun target() i32 { ret 0; }\n"
+        "\n"
+        'pub fun main() i32 { val e: str = "' + glyph + '"; ret target(); }\n'
+    )
+    lines = source.splitlines()
+    ref_line = next(i for i, v in enumerate(lines) if "ret target()" in v)
+    idx = lines[ref_line].index("target(")  # codepoint index of the reference
+    prefix = lines[ref_line][:idx]
+    columns = {
+        "utf-16": len(prefix.encode("utf-16-le")) // 2,
+        "utf-8": len(prefix.encode("utf-8")),
+        "utf-32": len(prefix),
+    }
+    # the three columns must genuinely differ, or the buffer proves nothing
+    require(len(set(columns.values())) == 3,
+            f"the non-BMP buffer did not separate the encodings: {columns!r}")
+
+    def negotiated(offered: object) -> tuple[LspSession, Path, str]:
+        directory = tempfile.mkdtemp(prefix="mls-penc-")
+        root = Path(directory).resolve()
+        src = root / "src"
+        src.mkdir(parents=True)
+        (root / "mach.toml").write_text(manifest, encoding="utf-8")
+        main = src / "main.mach"
+        main.write_text(source, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        general = {} if offered is None else {"positionEncodings": offered}
+        answer = session.request(
+            "initialize", {"rootUri": root.as_uri(), "capabilities": {"general": general}})
+        echoed = answer["result"].get("capabilities", {}).get("positionEncoding")
+        return session, main, echoed
+
+    def resolves(session: LspSession, main: Path, character: int) -> None:
+        session.notify("initialized", {})
+        session.notify("textDocument/didOpen", {"textDocument": {
+            "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": source}})
+        session.diagnostics(main.as_uri(), 1)
+        result = eventually(
+            lambda: session.request("textDocument/definition", {
+                "textDocument": {"uri": main.as_uri()},
+                "position": {"line": ref_line, "character": character}}).get("result"),
+            lambda r: isinstance(r, dict), "definition of `target`")
+        require(isinstance(result, dict) and result.get("uri") == main.as_uri(),
+                f"definition did not resolve to the source file: {result!r}")
+        # the definition sits on the first line, not the reference line
+        start = (result.get("range") or {}).get("start") or {}
+        require(start.get("line") == 0,
+                f"definition resolved to the wrong line: {result!r}")
+
+    # a client that advertises nothing still gets exactly what 1.0 promised
+    session, main, echoed = negotiated(None)
+    finished = False
+    try:
+        require(echoed == "utf-16",
+                f"no advertisement should default to utf-16, got {echoed!r}")
+        resolves(session, main, columns["utf-16"] + 1)
+        session.finish()
+        finished = True
+    finally:
+        if not finished:
+            session.abort()
+
+    # what the client offers is honoured, and the column is read in those units
+    for offered, want in (
+        (["utf-8", "utf-16"], "utf-8"),      # utf-8 wins even when utf-16 is also offered
+        (["utf-32"], "utf-32"),               # utf-32 alone
+        (["utf-16"], "utf-16"),               # utf-16 alone
+    ):
+        session, main, echoed = negotiated(offered)
+        finished = False
+        try:
+            require(echoed == want,
+                    f"offered {offered!r}, server chose {echoed!r}, expected {want!r}")
+            resolves(session, main, columns[want] + 1)
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_manifest_notes(server: Path, timeout: float) -> None:
     """What a load says about the project itself shows on its mach.toml (#266).
 
@@ -5501,6 +5621,7 @@ def main() -> int:
         run_version(server, args.timeout)
         run_settings(server, args.timeout)
         run_manifest_notes(server, args.timeout)
+        run_position_encoding(server, args.timeout)
         run_option_deadline(server, args.timeout)
         run_deadline_spares_load(server, args.timeout)
         run_spare_warmup_after_idle(server, args.timeout)
