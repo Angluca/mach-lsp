@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-18
+
+The stability promise (#270). Same code as 0.21.1: this release changes the
+version and nothing else. mach-zed 0.9.0 runs on it clean.
+
+**The linked mach is v5.4.0**, and std v4.0.0.
+
+From this release on, these do not change without a major version: the
+release asset names `mls-<version>-<platform>.tar.gz` and `.zip` for the five
+shipped platforms, with `SHA256SUMS` over every other asset; `RELEASES.json`,
+one object mapping each mls version to the mach it links, newest first,
+listing only versions whose release carries the full asset set; the CLI, `mls`
+and `mls --version` printing `mls <version> (mach <compiler version>)`; the
+`initializationOptions` keys `trace`, `traceFile` and `requestDeadlineMs`
+with their environment variables `MLS_TRACE`, `MLS_TRACE_FILE` and
+`MLS_REQUEST_DEADLINE_MS`, the precedence option, environment, default, and
+an unknown key or unusable value ignored with a note rather than failing
+`initialize`; and a relative `traceFile` resolving under the workspace root
+only, never outside it. The LSP capabilities and behaviour the README lists
+are the surface this promise covers. Positions are UTF-16 (#269).
+
 ## [0.21.1] - 2026-09-18
 
 Fixes found by mach-zed's re-run against 0.21.0 and by an outside report,
