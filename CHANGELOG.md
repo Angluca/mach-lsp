@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-09-18
+
+Fixes found by mach-zed's re-run against 0.21.0 and by an outside report,
+all on surfaces 1.0 freezes (#270).
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
 ### Fixed
 - fix(release): `RELEASES.json` lists only versions whose release carries the
   full asset set, so every entry can be installed (#299). Tags without a
