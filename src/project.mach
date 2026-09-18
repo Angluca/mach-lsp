@@ -2484,6 +2484,29 @@ pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
     ret o.some;
 }
 
+# the loaded module in `root` called `fqn`, or none
+#
+# A name is the one identity that can cross from a different session into this
+# root's snapshot: an isolated editor analysis cannot resolve a `use`, but the
+# path it names is text, and this finds what that text means here.
+# ---
+# w:    the workspace
+# root: the root to search, or nil
+# fqn:  a module path as written, `std.print`
+# ret:  some(ModuleId), or none when no loaded module has that name
+pub fun module_by_fqn(w: *Workspace, root: *Root, fqn: str) opt[sess.ModuleId] {
+    if (root == nil || !root.loaded || fqn == nil) { ret opt[sess.ModuleId].none{}; }
+    var i: u32 = 0;
+    for (i < root.p.module_len) {
+        val o: opt[str] = intern.lookup(?root.s.interner, root.p.modules[i].fqn);
+        if (sel o.some) {
+            if (str_equals(o.some, fqn)) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
+        }
+        i = i + 1;
+    }
+    ret opt[sess.ModuleId].none{};
+}
+
 # the loaded module in `root` whose source file is the document
 # at `uri` (matched on the normalized filesystem path), or none. This is the
 # canonical document-to-ModuleEntry identity used for routing and views.

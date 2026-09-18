@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fix(settings): a relative `traceFile` that resolves outside the workspace
   root, such as `../escape.log`, is ignored with a note instead of written
   beside the project (#300).
+- fix(completion): completion after a module alias's `.` lists the module's
+  public names while the buffer is ahead of the project snapshot, which is
+  every keystroke while typing (#297). It used to be empty until a rebuild
+  landed, because the isolated single-file analysis that answers then cannot
+  resolve a `use`. The alias's module is now found in the last snapshot by
+  the name the `use` writes. A `use` of a module that snapshot has not seen
+  still offers nothing until the rebuild lands.
 
 ## [0.21.0] - 2026-09-17
 
