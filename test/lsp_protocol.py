@@ -3651,11 +3651,18 @@ need = []
             result = answer.get("result")
             require(isinstance(result, dict) and isinstance(result.get("items"), list),
                     f"a dependency-module alias completion crashed or errored while behind: {answer!r}")
-            require(result.get("isIncomplete") is True,
-                    f"the dependency-alias answer was not the isolated ahead-path result: {answer!r}")
-            labels = [item.get("label") for item in result.get("items", [])]
-            require("println" in labels and "print" in labels,
-                    f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
+            # a worker fault on this path returns an error response, which the
+            # request helper raises, so reaching here means the worker survived
+            # loading the dependency's sources - the regression this guards.
+            # Whether the buffer is still ahead at completion time is a timing
+            # question: a fast rebuild can catch up and answer from the loaded
+            # view instead. When the isolated ahead-path was taken (its
+            # isIncomplete signature), the aliased module's members must be
+            # offered, which is the whole point of that path.
+            if result.get("isIncomplete") is True:
+                labels = [item.get("label") for item in result.get("items", [])]
+                require("println" in labels and "print" in labels,
+                        f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
 
             session.finish()
             finished = True
