@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-18
+
+A crash fix on a surface 1.0 froze. No contract change: same asset set, CLI,
+options and behaviour as 1.0.0.
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
+### Fixed
+- fix(#297): completion no longer crashes the analysis worker after a
+  dependency-module alias's `.` while the buffer is ahead of the snapshot.
+  The isolated editor analysis loads the aliased dependency's own sources,
+  which grows the session source map and moves its backing array; the handler
+  then read the buffer through the now-stale pointer, faulting on macOS where
+  the freed page is unmapped. A local module never triggered it because its
+  source is already resident. The pointer is refetched after the analysis.
+
 ## [1.0.0] - 2026-09-18
 
 The stability promise (#270). Same code as 0.21.1: this release changes the
