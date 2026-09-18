@@ -153,7 +153,7 @@ The names are a contract: editor extensions download by them.
 | --- | --- |
 | `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
-| `RELEASES.json` | every mls release and the mach version it links |
+| `RELEASES.json` | every installable mls release and the mach version it links |
 | `SHA256SUMS` | the SHA-256 of every other asset, in `sha256sum` format |
 
 `<version>` has no leading `v`. `mls --version` prints
@@ -172,10 +172,13 @@ version to the mach version that release links:
 
 A server refuses a project whose `[project].mach` range excludes its mach, so
 an installer that cannot list releases reads the newest release's
-`RELEASES.json` to find the newest mls a project accepts. Every release
-carries the complete map. It is generated from the release tags when a release
-is cut, and the release fails if its own entry disagrees with its binary. The
-format does not change from 1.0 on.
+`RELEASES.json` to find the newest mls a project accepts. A listed version is
+an installable one: its release carries every archive above and `SHA256SUMS`.
+A tag with no release, or a release missing an archive, is not listed, so a
+prebuilt server exists for every entry. Every release carries the complete
+map. It is generated from the release tags when a release is cut, and the
+release fails if a listed version lacks its assets or if its own entry
+disagrees with its binary. The format does not change from 1.0 on.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
