@@ -1,0 +1,314 @@
+# whether a rename's new name keeps each file it touches meaning the same (#286)
+#
+# A rename changes the spelling of some identifiers and nothing else. Two things
+# can make that untrue, and each is checked on its own terms:
+#
+#   - the new name is not one identifier, or is a word the grammar reads as
+#     something else where it now stands (`foo(1);` renamed to `ret` is a
+#     return). Mach's keywords are contextual, so no list of reserved words
+#     answers this. Each edited file is parsed again instead, and must produce
+#     the same tree, node for node, as before;
+#   - the new name is already bound where the renamed symbol is declared or
+#     used. That is a question for the resolver's symbol tables, which the
+#     caller answers (`language`).
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use std.allocator;
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+
+use mem: std.memory;
+
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use mach.lang.fe.lexer;
+use mach.lang.fe.parser;
+use mach.lang.fe.parser.state;
+use mach.lang.fe.token;
+use src: mach.lang.source;
+
+# the spans one file's rename rewrites, in the order they were found
+pub rec Spans {
+    alloc: *Allocator;
+    items: *token.Span;
+    len:   usize;
+    cap:   usize;
+}
+
+pub fun spans_init(alloc: *Allocator) Spans {
+    ret Spans{alloc: alloc, items: nil, len: 0, cap: 0};
+}
+
+pub fun spans_dnit(s: *Spans) {
+    if (s.items != nil) { deallocate[token.Span](s.alloc, s.items, s.cap); }
+    s.items = nil;
+    s.len   = 0;
+    s.cap   = 0;
+}
+
+# forget the spans, keeping the storage
+pub fun spans_clear(s: *Spans) {
+    s.len = 0;
+}
+
+# ret: false when memory ran out
+pub fun spans_push(s: *Spans, span: token.Span) bool {
+    if (s.len == s.cap) {
+        var cap: usize = s.cap * 2;
+        if (cap == 0) { cap = 16; }
+        if (s.items == nil) {
+            val r: res[*token.Span, allocator.Error] = allocate[token.Span](s.alloc, cap);
+            if (sel r.err) { ret false; }
+            s.items = r.ok;
+        }
+        or {
+            val r: res[*token.Span, allocator.Error] = reallocate[token.Span](s.alloc, s.items, s.cap, cap);
+            if (sel r.err) { ret false; }
+            s.items = r.ok;
+        }
+        s.cap = cap;
+    }
+    s.items[s.len] = span;
+    s.len          = s.len + 1;
+    ret true;
+}
+
+# whether `name` is exactly one identifier token
+pub fun identifier(alloc: *Allocator, name: str) bool {
+    if (name == nil) { ret false; }
+    val n: usize = str_len(name);
+    if (n == 0) { ret false; }
+    val lexed: res[lexer.TokenStream, fail.Fail] = lexer.tokenize(name, alloc, src.FILE_NIL);
+    if (sel lexed.err) { ret false; }
+    var stream: lexer.TokenStream = lexed.ok;
+    var ok:     bool              = stream.error_len == 0 && stream.len >= 1;
+    if (ok) {
+        val t: token.Token = stream.tokens[0];
+        ok = t.kind == token.KIND_IDENT && t.span.offset == 0 && t.span.len == n;
+    }
+    if (ok && stream.len > 1) { ok = stream.tokens[1].kind == token.KIND_EOF; }
+    lexer.dnit(?stream, alloc);
+    ret ok;
+}
+
+# `text` with every span replaced by `name`, owned, or nil when memory ran out.
+# the spans are sorted and a repeated span is applied once. release with
+# `applied_free`
+pub fun apply(alloc: *Allocator, text: str, spans: *Spans, name: str) str {
+    sort(spans);
+    val n:    usize = str_len(text);
+    val repl: usize = str_len(name);
+    var size: usize = 1;
+    var from: usize = 0;
+    var i:    usize = 0;
+    for (i < spans.len) {
+        val s: token.Span = spans.items[i];
+        if (s.offset >= from && s.offset + s.len <= n) {
+            size = size + (s.offset - from) + repl;
+            from = s.offset + s.len;
+        }
+        i = i + 1;
+    }
+    size = size + (n - from);
+    val r: res[*u8, allocator.Error] = allocate[u8](alloc, size);
+    if (sel r.err) { ret nil; }
+    val out: *u8 = r.ok;
+
+    var at: usize = 0;
+    from = 0;
+    i    = 0;
+    for (i < spans.len) {
+        val s: token.Span = spans.items[i];
+        if (s.offset >= from && s.offset + s.len <= n) {
+            copy(out, ?at, text, from, s.offset - from);
+            copy(out, ?at, name, 0, repl);
+            from = s.offset + s.len;
+        }
+        i = i + 1;
+    }
+    copy(out, ?at, text, from, n - from);
+    out[at] = 0;
+    ret out::str;
+}
+
+# release a string from `apply`
+pub fun applied_free(alloc: *Allocator, text: str) {
+    if (text == nil) { ret; }
+    deallocate[u8](alloc, text::*u8, str_len(text) + 1);
+}
+
+fun copy(out: *u8, at: *usize, from: str, offset: usize, len: usize) {
+    if (len == 0) { ret; }
+    mem.raw_copy((?out[@at])::ptr, (?from[offset])::ptr, len);
+    @at = @at + len;
+}
+
+fun sort(s: *Spans) {
+    var i: usize = 1;
+    for (i < s.len) {
+        val cur: token.Span = s.items[i];
+        var j:   usize      = i;
+        for (j > 0 && s.items[j - 1].offset > cur.offset) {
+            s.items[j] = s.items[j - 1];
+            j          = j - 1;
+        }
+        s.items[j] = cur;
+        i          = i + 1;
+    }
+}
+
+# what re-parsing an edited file found
+pub val SHAPE_SAME:      u8 = 0;
+pub val SHAPE_CHANGED:   u8 = 1;
+pub val SHAPE_UNCHECKED: u8 = 2;
+
+# whether `after` parses to the same tree as `before`, node for node, with no
+# more errors. a file that does not lex or parse before cannot be checked
+pub fun shape(alloc: *Allocator, before: str, after: str) u8 {
+    var bd:  diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    var ad:  diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    var b:   Parse                      = parse(alloc, before, ?bd);
+    var a:   Parse                      = parse(alloc, after, ?ad);
+    var out: u8                         = SHAPE_UNCHECKED;
+    if (b.ok) {
+        out = SHAPE_CHANGED;
+        if (a.ok && diagnostic.error_count(?ad) <= diagnostic.error_count(?bd)
+            && (a.accepted || !b.accepted) && same_nodes(?b.tree, ?a.tree)) {
+            out = SHAPE_SAME;
+        }
+    }
+    parse_dnit(alloc, ?b);
+    parse_dnit(alloc, ?a);
+    diagnostic.store_dnit(?bd);
+    diagnostic.store_dnit(?ad);
+    ret out;
+}
+
+rec Parse {
+    ok:       bool;
+    accepted: bool;
+    stream:   lexer.TokenStream;
+    tree:     ast.Ast;
+}
+
+fun parse(alloc: *Allocator, text: str, diags: *diagnostic.DiagnosticStore) Parse {
+    var p: Parse;
+    p.ok       = false;
+    p.accepted = false;
+    val lexed: res[lexer.TokenStream, fail.Fail] = lexer.tokenize(text, alloc, src.FILE_NIL);
+    if (sel lexed.err) { ret p; }
+    p.stream = lexed.ok;
+    if (p.stream.error_len != 0) {
+        lexer.dnit(?p.stream, alloc);
+        ret p;
+    }
+    p.tree = ast.init(alloc, src.FILE_NIL);
+    val checked: res[fail.PhaseStatus, state.ParseFail] = parser.parse(?p.stream, ?p.tree, diags);
+    if (sel checked.err) {
+        ast.dnit(?p.tree);
+        lexer.dnit(?p.stream, alloc);
+        ret p;
+    }
+    p.ok       = true;
+    p.accepted = fail.is_accepted(checked.ok);
+    ret p;
+}
+
+fun parse_dnit(alloc: *Allocator, p: *Parse) {
+    if (!p.ok) { ret; }
+    ast.dnit(?p.tree);
+    lexer.dnit(?p.stream, alloc);
+    p.ok = false;
+}
+
+fun same_nodes(x: *ast.Ast, y: *ast.Ast) bool {
+    if (x.expr_len != y.expr_len || x.stmt_len != y.stmt_len || x.decl_len != y.decl_len
+        || x.type_len != y.type_len || x.module_len != y.module_len
+        || x.typed_name_len != y.typed_name_len || x.tag_case_len != y.tag_case_len
+        || x.field_init_len != y.field_init_len || x.generic_name_len != y.generic_name_len) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < x.expr_len) {
+        if (x.exprs[i].kind != y.exprs[i].kind) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.stmt_len) {
+        if (x.stmts[i].kind != y.stmts[i].kind) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.decl_len) {
+        if (x.decls[i].kind != y.decls[i].kind || x.decls[i].flags != y.decls[i].flags) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.type_len) {
+        if (x.types[i].kind != y.types[i].kind) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+use std.allocator.page;
+use std.types.string.str_equals;
+
+test "names: an identifier is one identifier token and nothing else" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    if (!identifier(?pa, "renamed_1")) { fail = true; }
+    if (!identifier(?pa, "_x"))        { fail = true; }
+    if (identifier(?pa, ""))           { fail = true; }
+    if (identifier(?pa, "has space"))  { fail = true; }
+    if (identifier(?pa, "x.y"))        { fail = true; }
+    if (identifier(?pa, "1bad"))       { fail = true; }
+    if (identifier(?pa, "a-b"))        { fail = true; }
+    if (identifier(?pa, "x # note"))   { fail = true; }
+    if (identifier(?pa, "\"s\""))      { fail = true; }
+    if (fail)                          { ret 1; }
+    ret 0;
+}
+
+test "names: spans apply in order, once each" {
+    var pa: Allocator;
+    page.make(?pa);
+    var s: Spans = spans_init(?pa);
+    spans_push(?s, token.Span{offset: 8, len: 3});
+    spans_push(?s, token.Span{offset: 0, len: 3});
+    spans_push(?s, token.Span{offset: 8, len: 3});
+    val out:  str  = apply(?pa, "foo(); (foo);", ?s, "barbaz");
+    var fail: bool = out == nil || !str_equals(out, "barbaz(); (barbaz);");
+    applied_free(?pa, out);
+    spans_dnit(?s);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "names: a rename that changes what the grammar reads is refused" {
+    var pa: Allocator;
+    page.make(?pa);
+    var fail: bool = false;
+    val base: str  = "fun foo(n: i32) i32 { ret n; }\nfun main() i32 { foo(1); val a: i32 = foo(2); ret a; }\n";
+    if (shape(?pa, base, "fun bar(n: i32) i32 { ret n; }\nfun main() i32 { bar(1); val a: i32 = bar(2); ret a; }\n") != SHAPE_SAME)    { fail = true; }
+    if (shape(?pa, base, "fun ret(n: i32) i32 { ret n; }\nfun main() i32 { ret(1); val a: i32 = ret(2); ret a; }\n") != SHAPE_CHANGED) { fail = true; }
+    if (shape(?pa, base, "fun if(n: i32) i32 { ret n; }\nfun main() i32 { if(1); val a: i32 = if(2); ret a; }\n") != SHAPE_CHANGED)    { fail = true; }
+    # where the grammar reads a contextual keyword as a name, the rename stands
+    if (shape(?pa, base, "fun fun(n: i32) i32 { ret n; }\nfun main() i32 { fun(1); val a: i32 = fun(2); ret a; }\n") != SHAPE_SAME) { fail = true; }
+    if (shape(?pa, "fun f(x: i32) i32 { ret x; }\n", "fun f(ret: i32) i32 { ret ret; }\n") != SHAPE_SAME)                           { fail = true; }
+    if (shape(?pa, "fun f() i32 { ret \"open; }\n", "fun g() i32 { ret \"open; }\n") != SHAPE_UNCHECKED)                            { fail = true; }
+    if (fail)                                                                                                                       { ret 1; }
+    ret 0;
+}

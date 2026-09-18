@@ -36,6 +36,7 @@ use mls.project;
 use mls.render;
 use mls.trace;
 use mls.transport;
+use mls.uris;
 
 # cap on diagnostics published per document, to bound message size
 val MAX_DIAGNOSTICS: usize = 200;
@@ -289,7 +290,7 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
         val t:   positions.Text = text_for(at, rel.loc.file_id);
         var rng: positions.LspRange;
         if (t.file != nil && range_for(t, rel.loc.span, ?rng)) {
-            val u: str = project.uri_of_path(alloc, t.file.path);
+            val u: str = uris.of_path(alloc, t.file.path);
             if (u != nil) {
                 if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
                 or                { json.buf_push_byte(b, ','); }

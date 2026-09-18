@@ -53,7 +53,7 @@ class LspSession:
     """Drive one language-server process using LSP stdio framing."""
 
     def __init__(self, server: Path, cwd: Path, timeout: float,
-                 env_extra: dict[str, str] | None = None) -> None:
+                 env_extra: dict[str, str] | None = None, answer_progress: bool = False) -> None:
         env = os.environ.copy()
         # tracing is stripped so an operator's own MLS_TRACE cannot change what
         # the tests exercise; a test that is ABOUT tracing asks for it back
@@ -83,6 +83,10 @@ class LspSession:
         # the manifests of the projects this session opened documents in. a load
         # publishes what it says about the project on exactly these (#266)
         self.manifests: set[str] = set()
+        # answer the server's progress token requests as they arrive, as an
+        # editor does, so the client's own responses are on the wire too
+        self.answer_progress = answer_progress
+        self.send_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
         self.reader.start()
@@ -112,6 +116,8 @@ class LspSession:
                 message = json.loads(body)
                 if not isinstance(message, dict):
                     raise ProtocolError(f"JSON-RPC message is not an object: {message!r}")
+                if self.answer_progress and message.get("method") == "window/workDoneProgress/create":
+                    self.respond_result(message)
                 self.inbox.put(message)
         except BaseException as error:
             self.inbox.put(error)
@@ -133,8 +139,9 @@ class LspSession:
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
         frame = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
         try:
-            self.proc.stdin.write(frame)
-            self.proc.stdin.flush()
+            with self.send_lock:
+                self.proc.stdin.write(frame)
+                self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as error:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
@@ -160,6 +167,16 @@ class LspSession:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
 
+    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a request and return its response, error or not."""
+        request_id = self.next_id
+        self.next_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        self._send(message)
+        return self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
+
     def request_after_notifications(
         self,
         notifications: list[tuple[str, dict[str, Any]]],
@@ -184,8 +201,9 @@ class LspSession:
             frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
         started = time.perf_counter()
         try:
-            self.proc.stdin.write(b"".join(frames))
-            self.proc.stdin.flush()
+            with self.send_lock:
+                self.proc.stdin.write(b"".join(frames))
+                self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as error:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
@@ -202,8 +220,9 @@ class LspSession:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
             frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
         try:
-            self.proc.stdin.write(b"".join(frames))
-            self.proc.stdin.flush()
+            with self.send_lock:
+                self.proc.stdin.write(b"".join(frames))
+                self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as error:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
@@ -923,13 +942,13 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             )
             require("i64" in json.dumps(vendor_hover.get("result")),
                     f"vendored overlay did not participate in sema: {vendor_hover!r}")
-            vendor_rename = session.request(
+            vendor_rename = session.call(
                 "textDocument/rename",
                 {"textDocument": {"uri": vendor_main.as_uri()},
                  "position": {"line": vendor_line, "character": vendor_char}, "newName": "changed"},
             )
-            changes = vendor_rename.get("result", {}).get("changes")
-            require(changes == {}, f"vendored dependency rename was writable: {vendor_rename!r}")
+            require((vendor_rename.get("error") or {}).get("code") == -32803,
+                    f"vendored dependency rename was not refused: {vendor_rename!r}")
             session.notify("textDocument/didClose", {"textDocument": {"uri": vendor_main.as_uri()}})
             session.notify("textDocument/didClose", {"textDocument": {"uri": vendor_dep.as_uri()}})
 
@@ -1621,8 +1640,9 @@ def run_settings(server: Path, timeout: float) -> None:
 
     The option wins over the environment, the environment over the LSP
     `initialize.trace`, and `$/setTrace` moves the level afterwards. A key the
-    server does not know, or a value it cannot use, is noted and ignored; it
-    never fails `initialize`.
+    server does not know, or a value it cannot use, from an option or the
+    environment, is noted and ignored; it never fails `initialize`. Nothing is
+    traced before `initialize` has decided where the trace goes (#285).
     """
     SAMPLE = "pub fun sample(n: i32) i32 {\n    ret n;\n}\n"
 
@@ -1685,17 +1705,37 @@ def run_settings(server: Path, timeout: float) -> None:
                                        "colour": "blue", "requestDeadlineMs": 10}},
             {}, lambda s, d, _: options(s, d, chosen.parent))
 
-    # an unusable traceFile falls back to the environment's, with a note there
-    def relative(session: LspSession, doc: Path, directory: Path) -> None:
+    # a relative traceFile is under the workspace root: the first folder, else rootUri
+    def rooted(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        text = read(directory / "relative.log")
+        require("method textDocument/documentSymbol" in text,
+                f"a relative traceFile was not resolved against the workspace root: {sorted(directory.iterdir())!r}")
+        require("to " + str(directory / "relative.log") + " (option)" in text,
+                f"the resolved traceFile was not traced: {text[:600]!r}")
+
+    for params in (
+        lambda root: {"rootUri": root.as_uri()},
+        lambda root: {"rootUri": "file:///nonexistent-root",
+                      "workspaceFolders": [{"uri": root.as_uri(), "name": "w"}]},
+    ):
+        with tempfile.TemporaryDirectory(prefix="mls-settings-root-") as rootdir:
+            root = Path(rootdir).resolve()
+            run({**params(root), "initializationOptions": {"trace": "messages", "traceFile": "logs/../relative.log"}},
+                {}, lambda s, d, _: rooted(s, d, root))
+
+    # with no root, it falls back to the environment's, with a note there
+    def unrooted(session: LspSession, doc: Path, directory: Path) -> None:
         symbols(session, doc)
         text = read(directory / "env.log")
         require("method textDocument/documentSymbol" in text, "a relative traceFile did not fall back")
-        require("is not absolute" in text, f"the relative traceFile was not noted: {text[:600]!r}")
+        require("is relative and there is no workspace root" in text,
+                f"the unrooted traceFile was not noted: {text[:600]!r}")
 
     with tempfile.TemporaryDirectory(prefix="mls-settings-env-") as logdir:
         envlog = Path(logdir).resolve() / "env.log"
         run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
-            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: relative(s, d, envlog.parent))
+            {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: unrooted(s, d, envlog.parent))
 
         # so does one too long to open
         envlog.unlink(missing_ok=True)
@@ -1716,11 +1756,249 @@ def run_settings(server: Path, timeout: float) -> None:
             lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" in read(envlog),
                                                     "initialize.trace off silenced MLS_TRACE")))
 
-        # while the option does
+        # while the option does, entirely: nothing from before `initialize`
+        # reaches the environment's file either, bodies included (#285)
         envlog.unlink(missing_ok=True)
-        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog)},
-            lambda s, d, _: (symbols(s, d), require("method textDocument/documentSymbol" not in read(envlog),
-                                                    "the trace option did not override MLS_TRACE")))
+        run({"initializationOptions": {"trace": "off"}}, {"MLS_TRACE": "bodies", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: (symbols(s, d), require(read(envlog) == "",
+                                                    f"the trace option did not silence MLS_TRACE: {read(envlog)[:400]!r}")))
+
+        # a chosen file takes the whole session, its start included, and the
+        # environment's file is never written
+        envlog.unlink(missing_ok=True)
+        chosen = envlog.parent / "chosen.log"
+        run({"initializationOptions": {"traceFile": str(chosen)}},
+            {"MLS_TRACE": "bodies", "MLS_TRACE_FILE": str(envlog)},
+            lambda s, d, _: symbols(s, d))
+        require(read(envlog) == "", f"a chosen traceFile left lines in MLS_TRACE_FILE: {read(envlog)[:400]!r}")
+        text = read(chosen)
+        require("=== mach-lsp started ===" in text and "method initialize" in text,
+                f"the lines from before initialize did not reach the chosen file: {text[:400]!r}")
+        require(re.search(r"recv: \d+ bytes\n", text) and '"method":"initialize"' not in text,
+                f"a line from before initialize carried a body: {text[:600]!r}")
+        require('"method":"textDocument/documentSymbol"' in text, "MLS_TRACE=bodies stopped applying after initialize")
+        require(f"settings: trace bodies (environment), to {chosen} (option), request deadline 120000ms (default)" in text,
+                f"the effective settings were not traced: {text[:800]!r}")
+
+        # MLS_TRACE=off is off, and unusable environment values are noted
+        envlog.unlink(missing_ok=True)
+        run({}, {"MLS_TRACE": "off", "MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: symbols(s, d))
+        require(read(envlog) == "", f"MLS_TRACE=off traced: {read(envlog)[:400]!r}")
+        for value, note in (("soon", "MLS_REQUEST_DEADLINE_MS `soon` is not an integer; ignored"),
+                            ("10", "MLS_REQUEST_DEADLINE_MS 10 is below 1000; ignored")):
+            envlog.unlink(missing_ok=True)
+            run({}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog), "MLS_REQUEST_DEADLINE_MS": value},
+                lambda s, d, _: symbols(s, d))
+            require(note in read(envlog), f"an unusable environment deadline was not noted: {read(envlog)[:600]!r}")
+        envlog.unlink(missing_ok=True)
+        run({}, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(envlog), "MLS_REQUEST_DEADLINE_MS": "4000"},
+            lambda s, d, _: symbols(s, d))
+        require("request deadline 4000ms (environment)" in read(envlog),
+                f"the environment's deadline was not traced: {read(envlog)[:600]!r}")
+
+    # with no file named, the trace goes to stderr, where an editor collects it
+    def to_stderr(session: LspSession, doc: Path, directory: Path) -> None:
+        symbols(session, doc)
+        session.finish()
+        session.stderr_reader.join(timeout=timeout)
+        err = session.stderr_text()
+        require("method textDocument/documentSymbol" in err, f"the trace did not go to stderr: {err[:400]!r}")
+        require("to stderr (default)" in err, f"stderr was not named as the destination: {err[:600]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="mls-settings-stderr-") as name:
+        directory = Path(name).resolve()
+        session, doc = session_with(directory, {}, {"MLS_TRACE": "1"})
+        try:
+            to_stderr(session, doc, directory)
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+
+    # a session that ends before `initialize` still writes what it kept
+    with tempfile.TemporaryDirectory(prefix="mls-settings-early-") as name:
+        directory = Path(name).resolve()
+        early = directory / "early.log"
+        session = LspSession(server, directory, timeout, {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(early)})
+        try:
+            session.proc.stdin.close()
+            code = session.proc.wait(timeout=timeout)
+            require(code == 1, f"input closing before initialize exited {code}, want 1")
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
+        require("=== mach-lsp started ===" in read(early) and "input closed" in read(early),
+                f"a session with no initialize lost its trace: {read(early)[:400]!r}")
+
+
+def worker_pid(session: "LspSession") -> int:
+    """The analysis worker's pid: the supervisor's only child."""
+    for _ in range(200):
+        children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                  capture_output=True, text=True).stdout.split()
+        if children:
+            return int(children[0])
+        time.sleep(0.02)
+    raise AssertionError("no analysis worker")
+
+
+class SlowProject(NamedTuple):
+    main: Path
+    text: str
+
+
+def slow_project(parent: Path, project_id: str, value: int) -> SlowProject:
+    """A project whose load, and whose first rebuild, last long enough to stop
+    the worker inside them. The bulk is in its own module, so the entry module,
+    and every message about it, stays small."""
+    main, _, text = write_project(parent, project_id, value)
+    bulk = main.parent / "bulk.mach"
+    bulk_text = "".join(f"pub fun bulk_{i}(a: i32, b: i32) i32 {{ ret a + b + {i}; }}\n"
+                        for i in range(20000))
+    bulk.write_text(bulk_text, encoding="utf-8")
+    text = f"use {project_id}.bulk;\n" + text
+    main.write_text(text, encoding="utf-8")
+    return SlowProject(main, text)
+
+
+def run_deadline_spares_load(server: Path, timeout: float) -> None:
+    """`requestDeadlineMs` bounds a request being handled, never a project load (#284).
+
+    A load is the worker doing the work a request waits on. Holding the load to
+    the request deadline ended every worker a deadline shorter than the load
+    reached, and the replacement reloaded, so it was ended too, until the server
+    gave up. The client here behaves as an editor does: it advertises progress
+    and answers the server's token requests, which are responses on the client
+    stream and must never be taken for requests.
+
+    The worker is stopped inside its cold load for well past the deadline, then
+    resumed: the request waiting on the load is answered with a result, by the
+    same worker. A rename held for a rebuild is answered the same way after the
+    worker is stopped past the deadline while holding it. A request that really
+    wedges is still ended, and the replacement, which loads again under the same
+    deadline, serves.
+    """
+    if os.name != "posix":
+        print("  deadline spares load: skipped (needs pgrep and SIGSTOP)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-deadload-") as directory:
+        root = Path(directory).resolve()
+        slow = slow_project(root, "deadload", 3)
+        main, body = slow.main, slow.text
+        trace_log = root / "trace.log"
+        session = LspSession(server, root, timeout, answer_progress=True)
+        stopped = None
+        finished = False
+        try:
+            session.request("initialize", {
+                "rootUri": root.as_uri(),
+                "capabilities": {"window": {"workDoneProgress": True}},
+                "initializationOptions": {"requestDeadlineMs": 1000, "trace": "messages",
+                                          "traceFile": str(trace_log)}})
+            session.notify("initialized", {})
+            worker = worker_pid(session)
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": body}})
+            begin = session.wait_for(
+                lambda item: (item.get("method") == "$/progress"
+                              and item["params"]["value"]["kind"] == "begin"),
+                "the cold load's progress report")
+            os.kill(worker, signal.SIGSTOP)
+            stopped = worker
+            token = begin["params"]["token"]
+
+            line = next(i for i, l in enumerate(body.split("\n")) if "ret take[i32](b)" in l)
+            column = body.split("\n")[line].index("take") + 1
+            waiting = session.next_id
+            session.next_id += 1
+            session._send({"jsonrpc": "2.0", "id": waiting, "method": "textDocument/hover",
+                           "params": {"textDocument": {"uri": main.as_uri()},
+                                      "position": {"line": line, "character": column}}})
+            session.assert_no_message(
+                lambda item: (item.get("id") == waiting
+                              or item.get("method") == "window/showMessage"
+                              or (item.get("method") == "$/progress"
+                                  and item["params"]["value"]["kind"] == "end")),
+                "an answer, a crash report, or the load ending while the worker is stopped",
+                settle=2.5)
+            os.kill(worker, signal.SIGCONT)
+            stopped = None
+
+            # the load's end restarts the waiting request's clock: stopped again
+            # for less than the deadline, it is still not ended, although it
+            # arrived long before
+            session.wait_for(lambda item: (item.get("method") == "$/progress"
+                                           and item["params"].get("token") == token
+                                           and item["params"]["value"]["kind"] == "end"),
+                             "the load's own progress end")
+            os.kill(worker, signal.SIGSTOP)
+            stopped = worker
+            time.sleep(0.6)
+            os.kill(worker, signal.SIGCONT)
+            stopped = None
+            answer = session.wait_for(lambda item: item.get("id") == waiting, "the hover that waited on the load")
+            require("result" in answer and answer["result"],
+                    f"a request waiting on the load was not answered by it: {answer!r}")
+            require(worker_pid(session) == worker, "the worker was replaced during its load")
+
+            # a rename held for the rebuild an edit starts waits past the deadline
+            # too, and is answered from the rebuilt snapshot. how long a rebuild
+            # takes depends on the machine, so the worker is stopped once it
+            # reports the hold, for longer than the deadline
+            holding = "server: holding a request until its snapshot catches up"
+            holds = trace_log.read_text(encoding="utf-8", errors="replace").count(holding)
+            session.notify("textDocument/didChange", {
+                "textDocument": {"uri": main.as_uri(), "version": 2},
+                "contentChanges": [{"text": body + "\n# edited\n"}]})
+            renaming = session.next_id
+            session.next_id += 1
+            session._send({"jsonrpc": "2.0", "id": renaming, "method": "textDocument/rename",
+                           "params": {"textDocument": {"uri": main.as_uri()},
+                                      "position": {"line": line, "character": column}, "newName": "take_all"}})
+            deadline = time.monotonic() + timeout
+            while trace_log.read_text(encoding="utf-8", errors="replace").count(holding) == holds:
+                require(time.monotonic() < deadline, "the rename was never held")
+                session.assert_no_message(lambda item: item.get("id") == renaming,
+                                          "rename answer before it was held, which proves nothing",
+                                          settle=0.02)
+            # the hold's sideband is written before its trace line; let the supervisor read it
+            time.sleep(0.2)
+            os.kill(worker, signal.SIGSTOP)
+            stopped = worker
+            time.sleep(1.8)
+            stopped = None
+            try:
+                os.kill(worker, signal.SIGCONT)
+            except ProcessLookupError as error:
+                raise ProtocolError("the worker was ended while it held the rename for a rebuild") from error
+            renamed = session.wait_for(lambda item: item.get("id") == renaming, "the held rename's answer")
+            edits = (renamed.get("result") or {}).get("changes") or {}
+            require(edits, f"a rename held past the deadline was not answered with edits: {renamed!r}")
+            require(worker_pid(session) == worker, "the worker was replaced while a request was held")
+
+            # a request that wedges is still ended, and the reloading replacement serves
+            os.kill(worker, signal.SIGSTOP)
+            stopped = worker
+            # a string id, which the crash answer must echo as sent
+            wedged = "wedge-1"
+            session._send({"jsonrpc": "2.0", "id": wedged, "method": "textDocument/documentSymbol",
+                           "params": {"textDocument": {"uri": main.as_uri()}}})
+            ended = session.wait_for(lambda item: item.get("id") == wedged, "the wedged request's answer")
+            require((ended.get("error") or {}).get("code") == -32802,
+                    f"a wedged request was not ended by the deadline: {ended!r}")
+            hover = session.request("textDocument/hover", {
+                "textDocument": {"uri": main.as_uri()}, "position": {"line": line, "character": column}})
+            require(hover.get("result"), f"the replacement did not serve after reloading: {hover!r}")
+            notes = [m for m in session.pending if m.get("method") == "window/showMessage"]
+            require(len(notes) == 1 and notes[0]["params"]["type"] == 2,
+                    f"want one recovered-hang message, got: {notes!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+            if stopped is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(stopped, signal.SIGKILL)
 
 
 def run_option_deadline(server: Path, timeout: float) -> None:
@@ -2097,6 +2375,127 @@ pub fun aliased(n: i32) i32 {
     ret h(n);
 }
 """
+
+
+def apply_workspace_edit(changes: dict[str, list[dict[str, Any]]]) -> None:
+    """Write a WorkspaceEdit's `changes` to disk. Positions are UTF-16, and the
+    fixtures are ASCII, so a column is a character index."""
+    for uri, edits in changes.items():
+        path = Path(uri_file(uri))
+        lines = path.read_text(encoding="utf-8").split("\n")
+        for e in sorted(edits, key=lambda e: (e["range"]["start"]["line"], e["range"]["start"]["character"]),
+                        reverse=True):
+            start, end = e["range"]["start"], e["range"]["end"]
+            require(start["line"] == end["line"], f"a rename edit spans lines: {e!r}")
+            line = lines[start["line"]]
+            lines[start["line"]] = line[:start["character"]] + e["newText"] + line[end["character"]:]
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_rename_validation(server: Path, timeout: float) -> None:
+    """A rename is refused when it would break the project or change what it means (#286).
+
+    The property is checked end to end: every rename the server answers with
+    edits is applied to a copy of the project, and the compiler must accept the
+    result. The names that must be refused are refused with RequestFailed:
+    names that are not identifiers, a word the grammar reads as something else
+    where it would stand, and a name already bound where the symbol is declared
+    or used, whether a module-level name, a built-in type or a local. A
+    contextual keyword the grammar accepts in every place the rename writes it
+    is allowed, and compiles. A field cannot take the name of another field of
+    its record.
+    """
+    compiler = os.environ.get("MACH_COMPILER") or shutil.which("mach")
+    with tempfile.TemporaryDirectory(prefix="mls-renames-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_nav_project(root)
+        # a call standing as a statement, where `if` and `ret` read as keywords
+        (main.parent / "stmt.mach").write_text(
+            "use nav.defs.helper;\n\npub fun twice(n: i32) i32 {\n    helper(n);\n    ret helper(n);\n}\n",
+            encoding="utf-8")
+        text = "use nav.stmt;\n" + text
+        main.write_text(text, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+
+            def rename(position: dict[str, Any], new_name: str) -> dict[str, Any]:
+                return session.call("textDocument/rename", {
+                    "textDocument": {"uri": main.as_uri()}, "position": position, "newName": new_name})
+
+            def compiles_after(changes: dict[str, list[dict[str, Any]]]) -> str | None:
+                if compiler is None:
+                    return None
+                copy = Path(directory) / "copy"
+                if copy.exists():
+                    shutil.rmtree(copy)
+                shutil.copytree(root / "nav", copy)
+                moved = {uri.replace((root / "nav").as_uri(), copy.as_uri(), 1): e for uri, e in changes.items()}
+                apply_workspace_edit(moved)
+                done = subprocess.run([compiler, "check", str(copy)], capture_output=True, text=True, timeout=timeout)
+                return None if done.returncode == 0 else (done.stdout + done.stderr)[:600]
+
+            at_call = nav_position(text, "ret helper(n) + helper(n + 1);", "helper")
+            at_param = nav_position(text, "pub fun local(n: i32) i32 {", "(n")
+            at_c = nav_position(text, "val c: Color = make();", "c")
+            refused = {
+                (json.dumps(at_call), ""): "is not a mach identifier",
+                (json.dumps(at_call), "has space"): "is not a mach identifier",
+                (json.dumps(at_call), "x.y"): "is not a mach identifier",
+                (json.dumps(at_call), "1bad"): "is not a mach identifier",
+                (json.dumps(at_call), "if"): "would change what the code means where it is written (stmt.mach)",
+                (json.dumps(at_call), "ret"): "would change what the code means where it is written (stmt.mach)",
+                (json.dumps(at_call), "local"): "is already bound in this module",
+                (json.dumps(at_call), "Box"): "is already bound in this module",
+                (json.dumps(at_call), "i32"): "names a built-in type",
+                (json.dumps(at_call), "n"): "is already bound in a declaration the rename touches",
+                (json.dumps(at_param), "helper"): "is already bound in this module",
+                (json.dumps(at_c), "n"): "is already bound in a declaration the rename touches",
+                (json.dumps(at_c), "b"): "is already bound in a declaration the rename touches",
+            }
+            for (where, new_name), why in refused.items():
+                answer = rename(json.loads(where), new_name)
+                error = answer.get("error") or {}
+                require(error.get("code") == -32803 and why in error.get("message", ""),
+                        f"rename to {new_name!r} was not refused with {why!r}: {answer!r}")
+
+            # allowed: a fresh name, and contextual keywords wherever the grammar
+            # takes them. whatever is allowed must compile
+            for where, new_name in ((at_call, "assist"), (at_call, "fun"),
+                                    (at_param, "count"), (at_param, "ret"), (at_c, "shade")):
+                answer = rename(where, new_name)
+                if "error" in answer:
+                    require(new_name in ("ret", "fun") and answer["error"].get("code") == -32803,
+                            f"rename to {new_name!r} was refused: {answer!r}")
+                    continue
+                changes = (answer.get("result") or {}).get("changes") or {}
+                require(changes, f"rename to {new_name!r} produced no edits: {answer!r}")
+                broken = compiles_after(changes)
+                require(broken is None, f"rename to {new_name!r} was allowed but breaks the project: {broken}")
+
+            # a field cannot take another field's name
+            at_field = nav_position(text, "val n: i32   = b.v + b.inner.w;", ".v")
+            answer = rename(at_field, "inner")
+            require((answer.get("error") or {}).get("code") == -32803
+                    and "already a field" in answer["error"].get("message", ""),
+                    f"a field rename onto another field was not refused: {answer!r}")
+            answer = rename(at_field, "value")
+            changes = (answer.get("result") or {}).get("changes") or {}
+            require(changes, f"a field rename produced no edits: {answer!r}")
+            broken = compiles_after(changes)
+            require(broken is None, f"a field rename was allowed but breaks the project: {broken}")
+            if compiler is None:
+                print("  rename validation: compile check skipped (no mach compiler)")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_cross_module_references(server: Path, timeout: float) -> None:
@@ -4591,83 +4990,50 @@ def run_progress_reporting(server: Path, timeout: float) -> None:
 
     # a report whose worker dies is still closed
     if os.name != "posix":
-        print("  progress: orphan close skipped (needs pgrep and SIGSTOP)")
+        print("  progress: orphan close skipped (needs pgrep and SIGKILL)")
         return
 
-    previous = os.environ.get("MLS_REQUEST_DEADLINE_MS")
-    os.environ["MLS_REQUEST_DEADLINE_MS"] = "800"
-    try:
-        with tempfile.TemporaryDirectory(prefix="mls-prog-orphan-") as directory:
-            root = Path(directory).resolve()
-            main, _, text = write_project(root, "progorphan", 5)
-            # a load slow enough to be interrupted part-way. The window scales
-            # with how loaded the machine is, and so does the time to stop the
-            # worker, so this does not get tighter under CI contention.
-            bulk = "".join(f"pub fun bulk_{i}(a: usize, b: usize) usize {{ ret a + b + {i}; }}\n"
-                           for i in range(20000))
-            body = "use std.types.size.usize;\n" + bulk + text
-            main.write_text(body, encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="mls-prog-orphan-") as directory:
+        root = Path(directory).resolve()
+        # a load slow enough to be interrupted part-way. The window scales with
+        # how loaded the machine is, and so does the time to end the worker, so
+        # this does not get tighter under CI contention. a load is never ended by
+        # the request deadline (#284), so the worker is killed outright
+        slow = slow_project(root, "progorphan", 5)
+        main, body = slow.main, slow.text
+        session = LspSession(server, root, timeout)
+        try:
+            session.request(
+                "initialize",
+                {"rootUri": root.as_uri(),
+                 "capabilities": {"window": {"workDoneProgress": True}}},
+            )
+            session.notify("initialized", {})
+            # resolved before the load starts, so ending the worker is one
+            # syscall rather than a process lookup inside the window
+            worker = worker_pid(session)
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": body}},
+            )
+            begin = session.wait_for(
+                lambda item: (item.get("method") == "$/progress"
+                              and item["params"]["value"]["kind"] == "begin"),
+                "a progress report for the cold load")
+            os.kill(worker, signal.SIGKILL)
+            token = begin["params"]["token"]
 
-            session = LspSession(server, root, timeout)
-            wedged = None
-            try:
-                session.request(
-                    "initialize",
-                    {"rootUri": root.as_uri(),
-                     "capabilities": {"window": {"workDoneProgress": True}}},
-                )
-                session.notify("initialized", {})
-
-                # resolved before the load starts, so stopping the worker is one
-                # syscall rather than a process lookup inside the window
-                for _ in range(200):
-                    children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
-                                              capture_output=True, text=True).stdout.split()
-                    if children:
-                        wedged = int(children[0])
-                        break
-                    time.sleep(0.02)
-                require(wedged is not None, "no analysis worker to interrupt")
-
-                session.notify(
-                    "textDocument/didOpen",
-                    {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
-                                      "version": 1, "text": body}},
-                )
-                begin = session.wait_for(
-                    lambda item: (item.get("method") == "$/progress"
-                                  and item["params"]["value"]["kind"] == "begin"),
-                    "a progress report for the cold load")
-                os.kill(wedged, signal.SIGSTOP)
-                token = begin["params"]["token"]
-
-                # a request the stopped worker cannot read, so the deadline ends it
-                pending = session.next_id
-                session.next_id += 1
-                session._send({"jsonrpc": "2.0", "id": pending,
-                               "method": "textDocument/documentSymbol",
-                               "params": {"textDocument": {"uri": main.as_uri()}}})
-                session.wait_for(lambda item: item.get("id") == pending,
-                                 "an answer after the worker was ended")
-
-                closed = session.wait_for(
-                    lambda item: (item.get("method") == "$/progress"
-                                  and item["params"].get("token") == token
-                                  and item["params"]["value"]["kind"] == "end"),
-                    "the abandoned progress report being closed")
-                require(closed["params"]["value"].get("message"),
-                        f"an abandoned report closed without saying why: {closed!r}")
-            finally:
-                with contextlib.suppress(Exception):
-                    session.abort()
-                if wedged is not None:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.kill(wedged, signal.SIGKILL)
-    finally:
-        if previous is None:
-            os.environ.pop("MLS_REQUEST_DEADLINE_MS", None)
-        else:
-            os.environ["MLS_REQUEST_DEADLINE_MS"] = previous
+            closed = session.wait_for(
+                lambda item: (item.get("method") == "$/progress"
+                              and item["params"].get("token") == token
+                              and item["params"]["value"]["kind"] == "end"),
+                "the abandoned progress report being closed")
+            require(closed["params"]["value"].get("message"),
+                    f"an abandoned report closed without saying why: {closed!r}")
+        finally:
+            with contextlib.suppress(Exception):
+                session.abort()
 
 
 def run_trace_policy(server: Path, timeout: float) -> None:
@@ -4853,7 +5219,9 @@ def main() -> int:
         run_settings(server, args.timeout)
         run_manifest_notes(server, args.timeout)
         run_option_deadline(server, args.timeout)
+        run_deadline_spares_load(server, args.timeout)
         run_cross_module_references(server, args.timeout)
+        run_rename_validation(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)

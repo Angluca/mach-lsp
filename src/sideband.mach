@@ -1,0 +1,84 @@
+# what the worker tells the supervisor about its own work (#284)
+#
+# The request deadline exists to end a worker stuck in code that cannot be
+# interrupted. From outside, a worker loading a project, or holding a request
+# for a build (#251), looks exactly like one that is stuck: a request is
+# outstanding and nothing comes back. Only the worker knows the difference, so
+# it says so, on the stream it already writes, as notifications in a private
+# namespace. The supervisor consumes every one of them. A client never sees
+# them, which is why their shape is free to change in any release.
+#
+#   $/mls/next     {}                          the worker took up its next message
+#   $/mls/loading  {"loading": bool}           a project load started or ended
+#   $/mls/held     {"id": <id>, "held": bool}  a request was held or resumed
+#
+# The deadline bounds one message's handling while a request waits, so a
+# request queued behind other work is not charged for it, and a message stuck
+# in compiler code is still caught once a request waits behind it.
+#
+# A load is not bounded by the deadline. mach's front end reports no progress
+# while it analyses, so nothing outside it can tell a long load from a stuck
+# one, and ending a load that was about to finish is the worse mistake: the
+# replacement reloads under the same deadline and is ended too.
+
+use std.types.bool.bool;
+use std.types.string.str;
+use std.types.string.str_starts_with;
+
+use std.allocator.Allocator;
+
+use mls.json;
+use mls.transport;
+
+pub val NEXT:    str = "$/mls/next";
+pub val LOADING: str = "$/mls/loading";
+pub val HELD:    str = "$/mls/held";
+
+# the prefix every sideband method starts with
+pub val PREFIX: str = "$/mls/";
+
+# whether a method belongs to the sideband
+pub fun owns(method: str) bool {
+    ret method != nil && str_starts_with(method, PREFIX);
+}
+
+# tell the supervisor the worker took up its next piece of work
+pub fun next(alloc: *Allocator) {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+    json.buf_push(?b, NEXT);
+    json.buf_push(?b, "\"}");
+    send(?b, alloc);
+}
+
+# tell the supervisor a project load started or ended
+pub fun loading(alloc: *Allocator, on: bool) {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+    json.buf_push(?b, LOADING);
+    if (on) { json.buf_push(?b, "\",\"params\":{\"loading\":true}}"); }
+    or      { json.buf_push(?b, "\",\"params\":{\"loading\":false}}"); }
+    send(?b, alloc);
+}
+
+# tell the supervisor a request was held for a build, or resumed from one
+# ---
+# id: the request's id token as it appeared on the wire
+# on: true when held, false when resumed
+pub fun held(alloc: *Allocator, id: str, on: bool) {
+    if (id == nil) { ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+    json.buf_push(?b, HELD);
+    json.buf_push(?b, "\",\"params\":{\"id\":");
+    json.buf_push(?b, id);
+    if (on) { json.buf_push(?b, ",\"held\":true}}"); }
+    or      { json.buf_push(?b, ",\"held\":false}}"); }
+    send(?b, alloc);
+}
+
+fun send(b: *json.Buf, alloc: *Allocator) {
+    val msg: str = json.buf_str(b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(b);
+}

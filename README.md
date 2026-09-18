@@ -69,7 +69,15 @@ when it has any, and otherwise the snapshot's semantic diagnostics that avoid
 the edits.
 
 Cross-module references and rename walk the retained graph. Rename is restricted
-to project-owned declarations, so vendored dependency sources remain read-only.
+to project-owned declarations, so vendored dependency sources remain read-only,
+and renaming a dependency's symbol is refused with `RequestFailed`. A rename is
+also refused when its result would not mean what the code meant before: a new
+name that is not a mach identifier, one the grammar would read as something
+else where it is written (a call statement renamed to `ret`), or one already
+bound where the symbol is declared or used. That last check is conservative:
+a local of the new name anywhere in a top-level declaration the rename touches
+refuses it, because mach does not expose its scopes. A field cannot be renamed
+to the name of another field of its record.
 Completion offers, by prefix, every name the document's resolve table binds,
 whether or not it is in scope at the cursor. After a `.` it offers a module
 alias's public symbols, or the fields of the record or union the receiver has.
@@ -91,7 +99,7 @@ less.
 | first semantic answer after opening a project | ~26 s | the first load analyzes the whole project before any semantic request can be answered (#143) |
 | first rebuild after that load | ~26 s | a root keeps two sessions, and the second is cold until its first build (#252) |
 | every later rebuild | ~1.2-1.4 s | a rebuild still walks the whole project to find what an edit changed (#250) |
-| analysis worker memory | ~870 MiB after the first load, ~1.35 GiB once both sessions have built, ~1.7 GiB peak while the second builds for the first time; flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
+| analysis worker memory (resident plus swap) | ~860 MiB after the first load; ~1.7 GiB peak while the spare session builds for the first time; ~1.35 GiB steady once both sessions have built, flat over 30 further edits | the two sessions are the price of rebuilds that never block requests (#248) |
 
 While a rebuild runs, the edited buffer keeps answering from the snapshot it
 has (see above), so neither rebuild figure is time without answers. Syntax-only
@@ -123,7 +131,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.20.0 t=x86_64-linux
+v=0.21.0 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -145,14 +153,29 @@ The names are a contract: editor extensions download by them.
 | --- | --- |
 | `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
-| `SHA256SUMS` | the SHA-256 of every archive, in `sha256sum` format |
+| `RELEASES.json` | every mls release and the mach version it links |
+| `SHA256SUMS` | the SHA-256 of every other asset, in `sha256sum` format |
 
 `<version>` has no leading `v`. `mls --version` prints
 `mls <version> (mach <compiler version>)`. `initialize` reports the same
 `<version>` as `serverInfo.version`, and the compiler version as
-`serverInfo.mach`. Every shipped
-platform runs the full protocol suite natively in CI. `riscv64-linux` is a build
-target without a native runner and is not shipped.
+`serverInfo.mach`. Every shipped platform runs the full protocol suite natively
+in CI. `riscv64-linux` is a build target without a native runner and is not
+shipped.
+
+`RELEASES.json` is one JSON object, newest release first, mapping each mls
+version to the mach version that release links:
+
+```json
+{"0.21.0": "5.4.0", "0.20.0": "5.4.0", "0.19.0": "5.2.1"}
+```
+
+A server refuses a project whose `[project].mach` range excludes its mach, so
+an installer that cannot list releases reads the newest release's
+`RELEASES.json` to find the newest mls a project accepts. Every release
+carries the complete map. It is generated from the release tags when a release
+is cut, and the release fails if its own entry disagrees with its binary. The
+format does not change from 1.0 on.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
@@ -180,27 +203,40 @@ setting has an environment variable behind it, and the order is: the
 | `initializationOptions` key | environment | value |
 | --- | --- | --- |
 | `trace` | `MLS_TRACE` | `"off"`, `"messages"` or `"bodies"` (see [Tracing](#tracing)) |
-| `traceFile` | `MLS_TRACE_FILE` | an absolute path the trace is appended to |
+| `traceFile` | `MLS_TRACE_FILE` | the file the trace is appended to |
 | `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
+
+A relative `traceFile` is under the workspace root: the first of
+`workspaceFolders`, else `rootUri`. With neither, it is ignored. A relative
+`MLS_TRACE_FILE` is under the directory the server was started in.
 
 ```json
 { "initializationOptions": { "trace": "messages", "traceFile": "/home/me/mls.log" } }
 ```
 
 A key the server does not know, and a value it cannot use, is ignored and noted
-in the trace. Configuration never fails `initialize`, so a client written for a
-newer server still gets a working one. `workspace/didChangeConfiguration` is
-ignored.
+in the trace, whether it came from an option or from the environment.
+Configuration never fails `initialize`, so a client written for a newer server
+still gets a working one. `workspace/didChangeConfiguration` is ignored.
 
-`requestDeadlineMs` is a tuning knob. It bounds how long a request may wait on
-the analysis worker before the server answers it with an error and replaces the
-worker. Its default is not part of the interface and may change.
+`requestDeadlineMs` is a tuning knob. It bounds how long the analysis worker may
+spend on any one message while a request waits for it. Past it, the server
+answers every waiting request with `ServerCancelled` and replaces the worker.
+Loading a project does not count against it, and neither does a request held
+for a rebuild. Its default is not part of the interface and may change.
 
 ## Tracing
 
 The server speaks JSON-RPC on stdout, so it cannot log there. A trace is
-appended to `traceFile`, else `MLS_TRACE_FILE`, else `/tmp/mach-lsp.log`. With
-nothing configured, the default, the server performs no logging.
+appended to `traceFile`, else `MLS_TRACE_FILE`, else written to stderr, where
+an editor collects a server's own output. With nothing configured, the default,
+the server performs no logging.
+
+Nothing is written until `initialize` has settled where the trace goes and
+whether it is on. The lines from before it are kept and written to that
+destination, without message bodies, or dropped when the trace is off. A
+session that ends before `initialize` uses the environment alone. The trace
+names the settings in effect and where each came from.
 
 What a trace contains is a separate decision from whether it is on. A message
 body is your source code: every `didOpen` carries a whole file and every
@@ -215,8 +251,8 @@ size, timing) and no bodies.
 | `messages` | one line per message, and the server's own notes |
 | `bodies` | also message bodies, truncated at 512 bytes each |
 
-`MLS_TRACE` set to `bodies` means `bodies`, and set to any other value means
-`messages`. The LSP trace setting names the same levels `off`, `messages` and
+`MLS_TRACE` takes `off`, `messages` or `bodies`, and any other non-empty
+value means `messages`, so `MLS_TRACE=1` works. The LSP trace setting names the same levels `off`, `messages` and
 `verbose`.
 
 The level at startup is the first of these that is given:
@@ -236,7 +272,7 @@ the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`, pinned to release tags (`v5.3.1`
+declared as git dependencies in `mach.toml`, pinned to release tags (`v5.4.0`
 and `v4.0.0`), and fetched by `mach dep pull .`. The committed gitlinks under
 `dep/` are the pins; there is no lockfile. std is pinned to the release mach's
 own CI builds with, because the server and the compiler it links share one
@@ -266,7 +302,13 @@ a new mls major.
 
 | Module | Responsibility |
 |---|---|
-| `main` | entry point; page allocator + server loop |
+| `main` | entry point: `--version`, then the supervisor or, with `--worker`, the server loop |
+| `supervisor` | the client-facing process: relays frames to the analysis worker, ends a stuck one, and replaces one that dies |
+| `mirror` | the session state a replacement worker is replayed |
+| `pending` | the requests the supervisor has seen and the worker still owes |
+| `sideband` | the worker telling the supervisor when it loads or holds a request |
+| `settings` | `initialize` options over the environment and the defaults |
+| `version` | the server's version and the linked mach's, fixed at compile time |
 | `server` | lifecycle state, reading loop, and the analysis-thread dispatch |
 | `jobs` | bounded message queue feeding the single analysis thread |
 | `transport` | LSP base-protocol framing over stdin/stdout |
@@ -279,7 +321,20 @@ a new mls major.
 | `features` | offset → id → symbol query core over the resolve side tables |
 | `project` | stable per-root compiler Sessions and retained Project snapshots, overlays, routing, fingerprints, module views, and invalidation |
 | `language` | hover / definition / references / rename / documentSymbol / completion request bodies |
-| `trace` | append-only debug trace log (`/tmp/mach-lsp.log`) |
+| `build` | the single-slot worker rebuilds run on, off the analysis thread |
+| `notes` | what a project load says about the project itself, shown on `mach.toml` |
+| `progress` | work-done progress for a cold load |
+| `textedit` | applying an LSP change list to a document's text |
+| `analysis` | resolving a positional request to the document view that answers it |
+| `types` | helpers over sema's typing output |
+| `render` | one spelling per LSP value: ranges, locations, symbol kinds |
+| `signature` | signatureHelp |
+| `hints` | inlay hints naming arguments at a call |
+| `tokens` | semantic tokens, classified from resolved meaning |
+| `actions` | code actions from the compiler's own fixes |
+| `callhierarchy` | call hierarchy across modules |
+| `workspace` | workspace/symbol |
+| `trace` | the debug trace, held until `initialize` settles its destination |
 
 ## Deferred
 

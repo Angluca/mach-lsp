@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-17
+
+Fixes to the 0.20.0 surface found by the mach-zed evaluation, and the
+`RELEASES.json` asset editor extensions use to choose an mls (#270).
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
+### Added
+- feat(settings): a relative `traceFile` is resolved against the workspace
+  root, the first of `workspaceFolders`, else `rootUri` (#287). With neither it
+  is ignored with a note, as before.
+- feat(release): each release publishes `RELEASES.json`, mapping every mls
+  version to the mach version it links, so an editor extension can pick the
+  newest mls a project's `[project].mach` range accepts (#288). It is generated
+  from the tags when the release is cut, covered by `SHA256SUMS`, and checked
+  against the release's own binary. Its format is frozen at 1.0.
+
+### Fixed
+- fix(rename): a rename that would break the project, or change what it means,
+  is refused with `RequestFailed` rather than returned as edits (#286). Each
+  file the rename touches is parsed again and must produce the same tree. That
+  refuses names that are not identifiers, and names the grammar reads
+  differently where they would stand, while contextual keywords the grammar
+  accepts in every such place stay renameable. A new name already bound in a
+  touched module, a built-in type, or a local in a top-level declaration the
+  rename touches is refused too, as is a field name the record already has.
+  Renaming a dependency's symbol is now an error, from rename and from
+  prepareRename, rather than an empty edit or null.
+- fix(supervisor): `requestDeadlineMs` no longer ends the server when a project
+  load takes longer than the deadline (#284). The deadline now bounds the time
+  the worker spends on any one message while a request waits for it. A project
+  load, and a request held for a rebuild, do not count against it. The worker
+  tells the supervisor when it takes up a message, loads, or holds a request.
+  Responses the client sends to the server's own requests, such as progress
+  token creation, are no longer taken for requests.
+  That mistake left a request marked outstanding that no reply would ever
+  close, so every replacement worker was ended within a fraction of a second
+  until the server exited. When the worker dies, every request it still owed is
+  now answered, including held requests and requests with string ids.
+- fix(trace): nothing is traced before `initialize` has settled where the trace
+  goes (#285). The first lines of a session, including the `initialize` body at
+  the `bodies` level, used to go to the environment's file even when the
+  `trace` option turned tracing off or `traceFile` named another file. Those
+  lines are now held in memory, without bodies. They are written to the chosen
+  destination, or dropped when tracing is off.
+- docs: the README names the pinned mach as v5.4.0, and says the worker's
+  memory figures are resident plus swap, with the scenario each one measures
+  (#287).
+- test: the check that a request held for a rebuild outlives the deadline no
+  longer depends on how fast the machine rebuilds (#294).
+- fix(trace): with no file configured, the trace goes to stderr rather than the
+  shared `/tmp/mach-lsp.log` (#285).
+- fix(settings): `MLS_TRACE=off` turns tracing off instead of on. An unusable
+  `MLS_TRACE_FILE` or `MLS_REQUEST_DEADLINE_MS` is noted in the trace the way an
+  unusable option is. `MLS_REQUEST_DEADLINE_MS` now has the same minimum as the
+  option. The trace names the effective settings and where each came from
+  (#285, #287).
+
 ## [0.20.0] - 2026-09-17
 
 Configuration at `initialize`, project-level diagnostics on `mach.toml`,

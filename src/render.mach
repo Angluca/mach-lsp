@@ -215,6 +215,9 @@ pub fun reply_empty_array(alloc: *Allocator, id_raw: str) {
 # result, and the client should ask again
 pub val CONTENT_MODIFIED: i64 = -32801;
 
+# LSP RequestFailed: the request was valid, but what it asks cannot be done
+pub val REQUEST_FAILED: i64 = -32803;
+
 # reply with a JSON-RPC error
 # ---
 # alloc:   request allocator
