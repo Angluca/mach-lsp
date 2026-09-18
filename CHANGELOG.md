@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-17
+
+Fixes to the 0.20.0 surface found by the mach-zed evaluation, and the
+`RELEASES.json` asset editor extensions use to choose an mls (#270).
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
 ### Added
 - feat(settings): a relative `traceFile` is resolved against the workspace
   root, the first of `workspaceFolders`, else `rootUri` (#287). With neither it
