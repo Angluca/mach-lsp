@@ -265,6 +265,18 @@ fun hex_digit(v: i64) u8 {
 
 use std.allocator.page;
 
+# whether `file` equals `dir` or is a path beneath it
+#
+# Both are normalized, so `dir` ends in a separator only when it is a root.
+pub fun is_under(file: str, dir: str) bool {
+    var dl: usize = str_len(dir);
+    val fl: usize = str_len(file);
+    if (fl < dl || !str_starts_with(file, dir))      { ret false; }
+    if (fl == dl)                                    { ret true; }
+    if (dl > 0 && pathlib.is_separator(dir[dl - 1])) { dl = dl - 1; }
+    ret pathlib.is_separator(file[dl]);
+}
+
 # a POSIX-spelled path rewritten with the platform's separator
 #
 # `normalize` follows the native separator now, so a test that hard-codes
@@ -451,6 +463,27 @@ test "uris: uri and path round-trip" {
         or {
             if (!str_equals(u2, "file:///C:/src/main.mach")) { fail = true; }
         }
+    }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# an open document is found under its source directory whichever separator the
+# platform spells paths with (#273): windows paths come back from `clean` with
+# backslashes
+test "uris: a document is under its source directory with native separators" {
+    var fail: bool = false;
+    if (!is_under("/p/src/m.mach", "/p/src")) { fail = true; }
+    if (is_under("/p/srcx/m.mach", "/p/src")) { fail = true; }
+    if (!is_under("/p", "/p"))                { fail = true; }
+    if (!is_under("/x", "/"))                 { fail = true; }
+    if (is_under("/p/x", "/p/x/y"))           { fail = true; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!is_under("C:\\p\\src\\m.mach", "C:\\p\\src")) { fail = true; }
+        if (is_under("C:\\p\\srcx\\m.mach", "C:\\p\\src")) { fail = true; }
+    }
+    $or {
+        if (is_under("/p/src\\m.mach", "/p/src")) { fail = true; }
     }
     if (fail) { ret 1; }
     ret 0;

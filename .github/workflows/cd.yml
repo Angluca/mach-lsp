@@ -12,7 +12,7 @@ name: Release
 # asset names are part of the contract editor extensions download by:
 #   mls-<version>-<target>.tar.gz   (linux, darwin)
 #   mls-<version>-<target>.zip      (windows)
-#   RELEASES.json                   every mls version and the mach it links
+#   RELEASES.json                   every installable mls version and the mach it links
 #   SHA256SUMS
 
 on:
@@ -171,7 +171,9 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: RELEASES.json from the tags
+      # the release being cut is listed on trust; the asset check below is what
+      # makes that trust good
+      - name: RELEASES.json from the tags with a full release
         run: |
           set -euo pipefail
           git submodule update --init --depth 1 dep/mach

@@ -81,6 +81,8 @@ to the name of another field of its record.
 Completion offers, by prefix, every name the document's resolve table binds,
 whether or not it is in scope at the cursor. After a `.` it offers a module
 alias's public symbols, or the fields of the record or union the receiver has.
+While the buffer is ahead of the project's last analysis, the alias's module
+is taken from that analysis by name, so the list is there while you type.
 
 The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols do not pay that cost; moving semantic work
@@ -131,7 +133,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.21.0 t=x86_64-linux
+v=0.21.1 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -153,7 +155,7 @@ The names are a contract: editor extensions download by them.
 | --- | --- |
 | `mls-<version>-<platform>.tar.gz` | `mls` and `LICENSE`, for `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin` |
 | `mls-<version>-x86_64-windows.zip` | `mls.exe` and `LICENSE` |
-| `RELEASES.json` | every mls release and the mach version it links |
+| `RELEASES.json` | every installable mls release and the mach version it links |
 | `SHA256SUMS` | the SHA-256 of every other asset, in `sha256sum` format |
 
 `<version>` has no leading `v`. `mls --version` prints
@@ -172,10 +174,13 @@ version to the mach version that release links:
 
 A server refuses a project whose `[project].mach` range excludes its mach, so
 an installer that cannot list releases reads the newest release's
-`RELEASES.json` to find the newest mls a project accepts. Every release
-carries the complete map. It is generated from the release tags when a release
-is cut, and the release fails if its own entry disagrees with its binary. The
-format does not change from 1.0 on.
+`RELEASES.json` to find the newest mls a project accepts. A listed version is
+an installable one: its release carries every archive above and `SHA256SUMS`.
+A tag with no release, or a release missing an archive, is not listed, so a
+prebuilt server exists for every entry. Every release carries the complete
+map. It is generated from the release tags when a release is cut, and the
+release fails if a listed version lacks its assets or if its own entry
+disagrees with its binary. The format does not change from 1.0 on.
 
 Then point your editor's LSP client at `mls`; the server speaks the LSP base
 protocol over stdin/stdout.
@@ -206,8 +211,9 @@ setting has an environment variable behind it, and the order is: the
 | `traceFile` | `MLS_TRACE_FILE` | the file the trace is appended to |
 | `requestDeadlineMs` | `MLS_REQUEST_DEADLINE_MS` | an integer of at least `1000` |
 
-A relative `traceFile` is under the workspace root: the first of
-`workspaceFolders`, else `rootUri`. With neither, it is ignored. A relative
+A relative `traceFile` is a path under the workspace root: the first of
+`workspaceFolders`, else `rootUri`. With neither, or when the path climbs out
+of the root, it is ignored. Use an absolute path to write elsewhere. A relative
 `MLS_TRACE_FILE` is under the directory the server was started in.
 
 ```json

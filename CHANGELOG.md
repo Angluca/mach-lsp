@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-09-18
+
+Fixes found by mach-zed's re-run against 0.21.0 and by an outside report,
+all on surfaces 1.0 freezes (#270).
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
+### Fixed
+- fix(release): `RELEASES.json` lists only versions whose release carries the
+  full asset set, so every entry can be installed (#299). Tags without a
+  release, and releases without their archives, are left out. The release
+  fails if a listed version lacks its assets.
+- fix(settings): a relative `traceFile` that resolves outside the workspace
+  root, such as `../escape.log`, is ignored with a note instead of written
+  beside the project (#300).
+- fix(completion): completion after a module alias's `.` lists the module's
+  public names while the buffer is ahead of the project snapshot, which is
+  every keystroke while typing (#297). It used to be empty until a rebuild
+  landed, because the isolated single-file analysis that answers then cannot
+  resolve a `use`. The alias's module is now found in the last snapshot by
+  the name the `use` writes. A `use` of a module that snapshot has not seen
+  still offers nothing until the rebuild lands.
+
 ## [0.21.0] - 2026-09-17
 
 Fixes to the 0.20.0 surface found by the mach-zed evaluation, and the

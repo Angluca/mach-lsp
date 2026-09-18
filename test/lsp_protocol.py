@@ -1737,6 +1737,24 @@ def run_settings(server: Path, timeout: float) -> None:
         run({"initializationOptions": {"trace": "messages", "traceFile": "relative.log"}},
             {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: unrooted(s, d, envlog.parent))
 
+        # a relative path means a path under the root: one that climbs out is
+        # refused the same way, and nothing is written beside the root (#300)
+        def escaping(session: LspSession, doc: Path, root: Path) -> None:
+            symbols(session, doc)
+            text = read(envlog)
+            require("method textDocument/documentSymbol" in text, "an escaping traceFile did not fall back")
+            require("resolves outside the workspace root" in text,
+                    f"the escaping traceFile was not noted: {text[:600]!r}")
+            require(not (root.parent / "escape.log").exists(), "an escaping traceFile was written beside the root")
+
+        envlog.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="mls-settings-escape-") as outer:
+            root = Path(outer).resolve() / "root"
+            root.mkdir()
+            run({"rootUri": root.as_uri(),
+                 "initializationOptions": {"trace": "messages", "traceFile": "../escape.log"}},
+                {"MLS_TRACE_FILE": str(envlog)}, lambda s, d, _: escaping(s, d, root))
+
         # so does one too long to open
         envlog.unlink(missing_ok=True)
         run({"initializationOptions": {"trace": "messages", "traceFile": "/" + "x" * 600}},
@@ -3450,6 +3468,81 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
             rebuilt_labels = [item.get("label") for item in rebuilt.get("items", [])]
             require("live" in rebuilt_labels,
                     f"deferred rebuild lost the current member: {rebuilt_labels!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_completion_alias_while_behind(server: Path, timeout: float) -> None:
+    """Completion after a module alias's `.` lists the module while the buffer
+    is ahead of the snapshot (#297).
+
+    An isolated editor analysis cannot resolve a `use`, so before this the
+    alias was not a symbol there and the answer was empty on every keystroke.
+    The `use` names the module as text, and that text is found in the root's
+    snapshot. An `isIncomplete` answer is the isolated path's signature: a
+    fast machine that served this from a caught-up snapshot fails the check
+    instead of passing by accident. A `use` of a module the snapshot has not
+    seen yet, one whose file was written after the load, offers nothing until
+    the rebuild lands, which is stated here rather than left implied.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-compl-alias-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "complalias", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+
+            # a module that exists on disk but not in the snapshot: written after the load
+            (main.parent / "later.mach").write_text("pub val arrived: i32 = 1;\n", encoding="utf-8")
+            lines = text.splitlines()
+            lines[0:0] = ["use later: complalias.later;"]
+            lines.extend([
+                "",
+                "fun typing() i32 {",
+                "    rootmod.",
+                "    later.",
+                "    ret 0;",
+                "}",
+            ])
+            typed = "\n".join(lines) + "\n"
+            at = lambda needle: next(i for i, value in enumerate(lines) if value.strip() == needle)
+            version = 1
+            notifications = []
+            for _ in range(32):
+                version += 1
+                notifications.append((
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": typed}]},
+                ))
+
+            def behind(needle: str) -> dict[str, Any]:
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": at(needle), "character": len("    " + needle)}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                        f"completion after `{needle}` was not answered while behind, so this proves nothing: {answer!r}")
+                return result
+
+            labels = [item.get("label") for item in behind("rootmod.").get("items", [])]
+            require("answer" in labels and "take" in labels and "Box" in labels,
+                    f"a module alias offered nothing while the buffer was ahead: {labels!r}")
+            require("main" not in labels, f"the alias listed names that are not the module's: {labels!r}")
+
+            # a `use` of a module the snapshot does not have offers nothing yet
+            require(behind("later.").get("items") == [],
+                    "a use the snapshot has not seen offered names from somewhere")
 
             session.finish()
             finished = True
@@ -5240,6 +5333,7 @@ def main() -> int:
         syntax_only = run_syntax_only_latency(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
+        run_completion_alias_while_behind(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
