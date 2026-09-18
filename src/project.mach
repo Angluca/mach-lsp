@@ -127,6 +127,7 @@ rec SourceFingerprint {
 # spare:             the idle Session the next build runs into
 # spare_p:           a dead Project still held by `spare`, released by that build
 # spare_has_p:       whether spare_p is live
+# spare_cold:        the spare has never built, so its first build is a cold one
 # input_revision:    newest covered document revision mirrored into s
 # snapshot_revision: input revision captured by p
 # attempted_revision:last input revision analyzed, including a failed attempt
@@ -154,6 +155,7 @@ pub rec Root {
     spare:              *sess.Session;
     spare_p:            driver.Project;
     spare_has_p:        bool;
+    spare_cold:         bool;
     input_revision:     u64;
     snapshot_revision:  u64;
     attempted_revision: u64;
@@ -643,6 +645,7 @@ fun reset_slot(r: *Root) {
     r.s                  = nil;
     r.spare              = nil;
     r.spare_has_p        = false;
+    r.spare_cold         = true;
     r.input_revision     = 0;
     r.snapshot_revision  = 0;
     r.attempted_revision = 0;
@@ -724,6 +727,7 @@ rec BuildInput {
     sn:          *sess.Session;
     stale_p:     driver.Project;
     has_stale_p: bool;
+    warmup:      bool;
 }
 
 # one finished build, owned by whoever holds it
@@ -743,6 +747,8 @@ rec BuildInput {
 # man_mtime:        manifest mtime observed at build start
 # lock_mtime:       lockfile mtime observed at build start
 # revision:         the input revision this build covered
+# warmup:           the build repeated the serving snapshot's input to warm the
+#                   spare, so nothing it says is news to the client
 # message:          owned failure text, nil on success
 # manifest_notes:   what this build says about the project rather than a file
 rec BuildOutput {
@@ -756,6 +762,7 @@ rec BuildOutput {
     man_mtime:        i64;
     lock_mtime:       i64;
     revision:         u64;
+    warmup:           bool;
     message:          str;
     manifest_notes:   notes.Notes;
 }
@@ -785,6 +792,7 @@ fun capture_input(w: *Workspace, r: *Root) *BuildInput {
     in.revision    = r.input_revision;
     in.sn          = r.spare;
     in.has_stale_p = r.spare_has_p;
+    in.warmup      = false;
     if (r.spare_has_p) { in.stale_p = r.spare_p; }
     r.spare_has_p = false;
 
@@ -894,6 +902,7 @@ fun run_build(arg: ptr) ptr {
     o.man_mtime        = 0;
     o.lock_mtime       = 0;
     o.revision         = in.revision;
+    o.warmup           = in.warmup;
     o.message          = nil;
     o.manifest_notes   = notes.empty();
 
@@ -1052,7 +1061,10 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
         r.spare_p     = r.p;
         r.spare_has_p = true;
     }
-    r.spare = r.s;
+    # the outgoing session has built only if it was serving; at the first load
+    # it is the empty one made beside it
+    r.spare      = r.s;
+    r.spare_cold = !r.loaded;
 
     r.s                 = o.s;
     r.p                 = o.p;
@@ -1126,18 +1138,22 @@ fun try_load(w: *Workspace, r: *Root) bool {
 #
 # Refused, harmlessly, when a build is already in flight: the root stays stale
 # and `pump` schedules it again once the slot frees.
-fun schedule_build(w: *Workspace, r: *Root, index: u32) bool {
+# ---
+# warmup: build the input the snapshot already covers, to warm the spare (#252)
+fun schedule_build(w: *Workspace, r: *Root, index: u32, warmup: bool) bool {
     if (build.busy(?w.builder)) { ret false; }
     r.dirty = false;
     val in: *BuildInput = capture_input(w, r);
     if (in == nil) { ret false; }
+    in.warmup = warmup;
     if (!build.submit(?w.builder, (in)::ptr)) {
         free_build_input(in);
         ret false;
     }
     w.building      = true;
     w.building_root = index;
-    trace.logf("project: rebuilding {} off the analysis thread", r.path);
+    if (warmup) { trace.logf("project: warming the spare session of {} off the analysis thread", r.path); }
+    or          { trace.logf("project: rebuilding {} off the analysis thread", r.path); }
     ret true;
 }
 
@@ -1169,18 +1185,26 @@ pub val PUMP_SWAPPED: u8 = 1;
 # Coalescing lives here: a swap is immediately followed by at most one new build,
 # and only when input actually advanced past what the finished one covered. A
 # burst of edits during a build therefore costs one follow-up, not one per edit.
+#
+# A root's spare Session starts empty, and the first build into it is a cold
+# one, twenty times a warm rebuild on this repository (#252). When the slot is
+# free and nothing waits to be handled, the spare is warmed by building the
+# snapshot's own input into it. Real work takes the slot first, and input that
+# has already arrived is never made to wait behind a warm-up.
 # ---
-# w:   the workspace
-# ret: PUMP_SWAPPED when a snapshot changed and diagnostics must republish
-pub fun pump(w: *Workspace) u8 {
+# w:    the workspace
+# idle: no message is waiting to be handled, so a warm-up may take the slot
+# ret:  PUMP_SWAPPED when a snapshot changed and diagnostics must republish
+pub fun pump(w: *Workspace, idle: bool) u8 {
     var moved: u8 = PUMP_IDLE;
 
     val done: ptr = build.take(?w.builder);
     if (done != nil) {
-        val idx: u32 = w.building_root;
+        val idx:    u32  = w.building_root;
+        val warmup: bool = (done::*BuildOutput).warmup;
         w.building = false;
         if (idx < w.root_cap && w.roots[idx].path != nil) {
-            if (apply_build(w, ?w.roots[idx], done::*BuildOutput)) { moved = PUMP_SWAPPED; }
+            if (apply_build(w, ?w.roots[idx], done::*BuildOutput) && !warmup) { moved = PUMP_SWAPPED; }
         }
         or { free_build_output(done::*BuildOutput); }
     }
@@ -1194,7 +1218,20 @@ pub fun pump(w: *Workspace) u8 {
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && r.s != nil && r.loaded && snapshot_stale(r)) {
-            if (schedule_build(w, r, i)) { ret moved; }
+            if (schedule_build(w, r, i, false)) { ret moved; }
+        }
+        i = i + 1;
+    }
+    if (!idle) { ret moved; }
+
+    # nothing is waiting on the slot: warm a cold spare with the input the
+    # snapshot already covers, so the first edit's rebuild is as fast as every
+    # later one. the result swaps in like any other, and reports nothing
+    i = 0;
+    for (i < w.root_cap) {
+        val r: *Root = ?w.roots[i];
+        if (r.path != nil && r.s != nil && r.loaded && r.spare_cold) {
+            if (schedule_build(w, r, i, true)) { ret moved; }
         }
         i = i + 1;
     }
@@ -1500,7 +1537,7 @@ pub fun retry_failed(w: *Workspace) bool {
 fun refresh_inputs(w: *Workspace, r: *Root) res[bool, str] {
     if (!snapshot_stale(r)) { ret res[bool, str].ok{r.loaded}; }
     if (r.loaded) {
-        schedule_build(w, r, root_index(w, r));
+        schedule_build(w, r, root_index(w, r), false);
         ret res[bool, str].ok{true};
     }
     try_load(w, r);
@@ -1980,7 +2017,7 @@ pub fun document_behind(w: *Workspace, d: *documents.Document) bool {
 pub fun catch_up(w: *Workspace, d: *documents.Document) {
     val root: *Root = root_for_loaded(w, d.uri);
     if (root == nil || !root.loaded || !snapshot_stale(root)) { ret; }
-    schedule_build(w, root, root_index(w, root));
+    schedule_build(w, root, root_index(w, root), false);
 }
 
 # whether a request on `d` that needs a current root can wait for one: the root

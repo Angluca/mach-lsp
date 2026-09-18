@@ -355,7 +355,7 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 #
 # Runs on the analysis thread only.
 fun collect_rebuilds(srv: *Server) {
-    val moved: u8 = project.pump(?srv.ws);
+    val moved: u8 = project.pump(?srv.ws, jobs.depth(?srv.q) == 0);
     if (srv.status != STATUS_RUNNING) { ret; }
     if (moved == project.PUMP_SWAPPED) {
         republish_all(srv);
