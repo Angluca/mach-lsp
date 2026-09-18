@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- fix(release): `RELEASES.json` lists only versions whose release carries the
+  full asset set, so every entry can be installed (#299). Tags without a
+  release, and releases without their archives, are left out. The release
+  fails if a listed version lacks its assets.
+
 ## [0.21.0] - 2026-09-17
 
 Fixes to the 0.20.0 surface found by the mach-zed evaluation, and the
