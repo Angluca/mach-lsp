@@ -2019,6 +2019,76 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
                     os.kill(stopped, signal.SIGKILL)
 
 
+def run_spare_warmup_after_idle(server: Path, timeout: float) -> None:
+    """An idle root warms its cold spare, so the first edit after idle is not cold (#252).
+
+    A root serves from one session and keeps a spare to rebuild into. The spare's
+    first build is cold: it has never analyzed the project, so the first edit that
+    follows a load rebuilds from scratch even though the load already did that
+    work once. During idle the analysis thread has nothing to answer, so it warms
+    the cold spare with the snapshot's own input; the edit that follows then
+    rebuilds warm.
+
+    The trigger is what this locks in. The pump that schedules the warm-up runs
+    when the message queue drains, not only before the next message, so a genuinely
+    idle session -- no further traffic -- still warms. Measured against the pump
+    running only before the next message, the first post-idle edit here rebuilds in
+    warm time, a small fraction of the cold load, and within reach of a second warm
+    edit rather than dwarfing it.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-warmup-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "warm", 256)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        durations = re.compile(r"project: rebuilt .* in (\d+)ms")
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+            # the inline cold load's own time, the cost the warm-up is meant to remove
+            cold = durations.findall(builds.text())
+            require(cold, "the cold load did not report a build duration")
+            cold_ms = int(cold[-1])
+
+            # no edits follow. the pump must warm the cold spare on the analysis
+            # thread going idle; before the trigger fix this only fired at the next
+            # message, so an idle session never warmed and this would never settle.
+            eventually(lambda: "warming the spare session" in builds.text(),
+                       lambda hit: hit, "the spare to warm during idle", timeout)
+            builds.settle(1, "the spare warm-up to finish")
+
+            def edit_ms(version: int) -> int:
+                before = rebuilt(builds)
+                session.notify("textDocument/didChange", {
+                    "textDocument": {"uri": main.as_uri(), "version": version},
+                    "contentChanges": [{"text": text + f"\n# edit {version}\n"}]})
+                eventually(lambda: rebuilt(builds) > before, lambda hit: hit,
+                           f"edit {version} to rebuild")
+                return int(durations.findall(builds.text())[-1])
+
+            first_ms = edit_ms(2)
+            second_ms = edit_ms(3)
+
+            # both edits rebuild warm. a first edit that found a cold spare would
+            # rebuild in cold time and dwarf the second; the warm-up keeps it in
+            # reach of a warm rebuild instead.
+            require(first_ms <= second_ms * 3 + 50,
+                    f"first post-idle edit was cold: {first_ms}ms against {second_ms}ms warm "
+                    f"(cold load was {cold_ms}ms)")
+            require(first_ms < cold_ms,
+                    f"first post-idle edit ({first_ms}ms) was no faster than the cold load "
+                    f"({cold_ms}ms), so the warm-up did not take")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_option_deadline(server: Path, timeout: float) -> None:
     """`requestDeadlineMs` bounds a wedged request with no environment at all.
 
@@ -5433,6 +5503,7 @@ def main() -> int:
         run_manifest_notes(server, args.timeout)
         run_option_deadline(server, args.timeout)
         run_deadline_spares_load(server, args.timeout)
+        run_spare_warmup_after_idle(server, args.timeout)
         run_cross_module_references(server, args.timeout)
         run_rename_validation(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
@@ -5483,6 +5554,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  a request is answered while a project rebuild is still running")
+    print("  an idle root warms its cold spare, so the first edit after idle is warm")
     print("  a burst of edits during a build coalesces into one follow-up build")
     print("  a failed rebuild leaves the previous snapshot answering")
     print("  use / fwd import paths navigate to their declarations")
