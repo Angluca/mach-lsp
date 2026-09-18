@@ -3551,6 +3551,126 @@ def run_completion_alias_while_behind(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -> None:
+    """Completion after a dependency-module alias's `.` while the buffer is ahead.
+
+    The reporter's exact shape: `use prt: std.print;` then `prt.` typed on a
+    line the snapshot has not seen yet. The isolated editor analysis resolving
+    that buffer loads the dependency's own sources, which grows the session's
+    source map and moves its backing array; a stale SourceFile pointer read
+    afterwards faulted the worker on macOS, where the freed page is unmapped
+    (#297). A local module never triggered it because its source is already
+    resident. The worker surviving with an `isIncomplete` answer that carries
+    the module's members is the whole point of this case.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    std = repo / "dep" / "std"
+    require((std / "mach.toml").is_file(),
+            f"dep/std is not available for the dependency-alias case: {std}")
+    with tempfile.TemporaryDirectory(prefix="mls-compl-depalias-") as directory:
+        root = Path(directory).resolve()
+        source = root / "src"
+        source.mkdir(parents=True)
+        # mach resolves a dependency from the project's own dep/ tree, so the
+        # standard library must be materialized there, not merely referenced
+        shutil.copytree(std, root / "dep" / "std", ignore=shutil.ignore_patterns(".git"))
+        (root / "mach.toml").write_text(
+            f"""[project]
+id = "depalias"
+version = "0.1.0"
+src = "src"
+out = "out/{{target.name}}/{{profile.name}}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[target.darwin-aarch64]
+isa = "aarch64"
+os = "darwin"
+abi = "aapcs64"
+
+[dep.std]
+path = "dep/std"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["*"]
+link = []
+need = []
+""",
+            encoding="utf-8",
+        )
+        base = ('use prt: std.print;\n\n'
+                'pub fun main() i32 {\n'
+                '    prt.println("hi");\n'
+                '    ret 0;\n'
+                '}\n')
+        main = source / "main.mach"
+        main.write_text(base, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": base}})
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = base.splitlines()
+            insert_at = next(i for i, v in enumerate(lines) if "prt.println" in v) + 1
+            ahead = lines[:insert_at] + ["    prt."] + lines[insert_at:]
+            version = 1
+            notifications = []
+            # each keystroke carries distinct text so a completed rebuild is always
+            # for an older revision: the buffer stays ahead and the completion is
+            # answered from the isolated editor analysis, which is the crashing path
+            for keystroke in range(32):
+                version += 1
+                typed = "\n".join(ahead) + f"\n# keystroke {keystroke}\n"
+                notifications.append((
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": typed}]},
+                ))
+
+            answer = session.request_after_notifications(
+                notifications, "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": insert_at, "character": len("    prt.")}})
+            result = answer.get("result")
+            require(isinstance(result, dict) and isinstance(result.get("items"), list),
+                    f"a dependency-module alias completion crashed or errored while behind: {answer!r}")
+            # a worker fault on this path returns an error response, which the
+            # request helper raises, so reaching here means the worker survived
+            # loading the dependency's sources - the regression this guards.
+            # Whether the buffer is still ahead at completion time is a timing
+            # question: a fast rebuild can catch up and answer from the loaded
+            # view instead. When the isolated ahead-path was taken (its
+            # isIncomplete signature), the aliased module's members must be
+            # offered, which is the whole point of that path.
+            if result.get("isIncomplete") is True:
+                labels = [item.get("label") for item in result.get("items", [])]
+                require("println" in labels and "print" in labels,
+                        f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_highlight(server: Path, timeout: float) -> None:
     """Occurrences in the active file, classified read or write."""
     with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
@@ -5334,6 +5454,7 @@ def main() -> int:
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
         run_completion_alias_while_behind(server, args.timeout)
+        run_completion_dependency_alias_while_behind(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
