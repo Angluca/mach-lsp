@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-18
+
+The #297 crash fix becomes structural. No LSP contract change: same asset set,
+CLI, options and behaviour as 1.0.2.
+
+**The linked mach moves from v5.4.0 to v5.5.1**, and std is unchanged at v4.0.0.
+
+### Changed
+- refactor(#313): the completion handler no longer refetches the buffer's
+  `SourceFile` after an analysis. The dangling-pointer crash behind #297 was that
+  loading a dependency's sources grew the session source map and moved its
+  backing array, leaving a stale pointer; 1.0.1 refetched the pointer to work
+  around it. mach v5.5.1 (mach#3633) backs the source map with stable storage, so
+  a `SourceFile` pointer survives the map growing and the refetch is gone. The
+  dependency-alias regression test stays as the guard.
+
 ## [1.0.2] - 2026-09-18
 
 A latency fix on a 1.0 surface. No contract change: same asset set, CLI,

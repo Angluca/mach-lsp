@@ -1930,7 +1930,7 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         reply_empty_completion(alloc, id_raw, false);
         ret;
     }
-    var file: *src.SourceFile = fo.some;
+    val file: *src.SourceFile = fo.some;
 
     val pos:  *sj.Value = json.member(params, "position");
     val line: i64       = json.number(json.member(pos, "line"), -1);
@@ -1974,14 +1974,6 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
-        # analysis may load dependency sources, growing es.s.sources and moving
-        # its backing array, so the buffer's SourceFile pointer must be refetched
-        val fa: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-        if (sel fa.none) {
-            reply_empty_completion(alloc, id_raw, false);
-            ret;
-        }
-        file = fa.some;
         if (dot > 0 && file.text[dot - 1] == '.') {
             if (an.root != nil) {
                 if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
@@ -2000,15 +1992,6 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         reply_empty_completion(alloc, id_raw, true);
         ret;
     }
-    # the standalone frontend loads the buffer's dependency sources, growing
-    # es.s.sources and moving its backing array, so the buffer's SourceFile
-    # pointer captured above now dangles and must be refetched (issue #297)
-    val fe: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (sel fe.none) {
-        reply_empty_completion(alloc, id_raw, true);
-        ret;
-    }
-    file = fe.some;
     if (dot > 0 && file.text[dot - 1] == '.') {
         if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
         val root: *project.Root = project.root_for_loaded(ws, uri);

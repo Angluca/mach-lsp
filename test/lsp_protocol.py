@@ -1530,12 +1530,10 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
     as one that did. A stale complaint on a fixed file is the failure this
     guards.
     """
-    repo = Path(__file__).resolve().parents[1]
-    compiler = re.search(r'^version = "([^"]+)"',
-                         (repo / "dep" / "mach" / "mach.toml").read_text(encoding="utf-8"), re.M)
-    require(compiler is not None, "dep/mach/mach.toml has no version")
-    major, minor = compiler.group(1).split(".")[:2]
-    admitted = f'mach = "^{major}.{minor}"'
+    # the range the warning tells the user to add is read from the warning itself,
+    # since the compiler chooses it (the oldest release that reads the key, not the
+    # running one) and may change it across versions
+    admitted = ""
     refused = 'mach = "^99"'
 
     def notes_for(session: LspSession, uri: str, want: Callable[[list[dict[str, Any]]], bool],
@@ -1583,8 +1581,10 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
             open_doc(session, root, main, text)
             found = notes_for(session, uri, one(2, "states no compiler range"),
                               "the missing-range warning on mach.toml")
-            require(admitted in found[0]["message"],
+            suggested = re.search(r'mach = "([^"]+)"', found[0]["message"])
+            require(suggested is not None,
                     f"the warning does not name the line to add: {found[0]!r}")
+            admitted = f'mach = "{suggested.group(1)}"'
             session.diagnostics(main.as_uri(), 1)
 
             set_range(admitted)
