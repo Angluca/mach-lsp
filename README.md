@@ -133,7 +133,7 @@ the archive for your platform, check it against `SHA256SUMS`, and put `mls` on
 your `PATH`:
 
 ```sh
-v=0.21.1 t=x86_64-linux
+v=1.0.0 t=x86_64-linux
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/mls-$v-$t.tar.gz
 curl -LO https://github.com/briar-systems/mach-lsp/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
