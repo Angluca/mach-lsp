@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-18
+
+The #297 crash fix becomes structural. No LSP contract change: same asset set,
+CLI, options and behaviour as 1.0.2.
+
 **The linked mach moves from v5.4.0 to v5.5.1**, and std is unchanged at v4.0.0.
 
 ### Changed
