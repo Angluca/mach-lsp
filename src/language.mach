@@ -1994,6 +1994,8 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     }
     if (dot > 0 && file.text[dot - 1] == '.') {
         if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+        val root: *project.Root = project.root_for_loaded(ws, uri);
+        if (emit_alias_members_from_root(ws, root, an, alloc, id_raw, prefix, dot - 1)) { ret; }
         reply_empty_completion(alloc, id_raw, true);
         ret;
     }
@@ -2878,7 +2880,7 @@ fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc
             val sym: *rslv.Symbol = ?an.rr.symbols[sid];
             var mid: sess.ModuleId;
             if (module_alias_target(sym, ?mid)) {
-                ret emit_module_members(ws, an, alloc, id_raw, prefix, mid);
+                ret emit_module_members(ws, an.root, an.text.file, alloc, id_raw, prefix, mid, false);
             }
         }
     }
@@ -2887,22 +2889,33 @@ fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc
 }
 
 # offer a module's public symbols, including `fwd` re-exports
-fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, mid: sess.ModuleId) bool {
-    if (an.root == nil) { ret false; }
-    val mvo: opt[project.ModuleView] = project.module_view(ws, an.root, mid);
+#
+# The module and its names come from `root`'s snapshot. Only `prefix`, a span
+# of `file`, comes from the requesting analysis, which may be the isolated
+# editor session: nothing else of that session is joined with the snapshot.
+# ---
+# root:       the loaded root holding the module
+# file:       the source `prefix` indexes
+# prefix:     the identifier typed so far after the dot
+# mid:        the module in `root`
+# incomplete: the answer is from a snapshot the buffer has moved past
+fun emit_module_members(ws: *project.Workspace, root: *project.Root, file: *src.SourceFile, alloc: *Allocator, id_raw: str,
+    prefix: token.Span, mid: sess.ModuleId, incomplete: bool) bool {
+    if (root == nil) { ret false; }
+    val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
     if (sel mvo.none) { ret false; }
     val mv: project.ModuleView = mvo.some;
     if (mv.rr == nil) { ret false; }
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw, false);
+    push_completion_head(?b, id_raw, incomplete);
     var emitted: usize = 0;
     var i:       u32   = 0;
     for (i < mv.rr.pub_count) {
         val sym: *rslv.Symbol = ?mv.rr.symbols[i];
-        val no:  opt[str]     = intern.lookup(?an.root.s.interner, sym.name);
+        val no:  opt[str]     = intern.lookup(?root.s.interner, sym.name);
         if (sel no.some) {
             val name: str = no.some;
-            if (span_is_prefix_of(an.text.file, prefix, name)) {
+            if (span_is_prefix_of(file, prefix, name)) {
                 push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
                     features.kind_label(sym.kind), nil, emitted > 0);
                 emitted = emitted + 1;
@@ -2912,6 +2925,61 @@ fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *A
     }
     push_completion_tail(?b, alloc, id_raw);
     ret true;
+}
+
+# offer a module's public symbols after an alias the isolated editor session
+# could not resolve (#297)
+#
+# While the buffer is ahead of the snapshot, completion answers from the
+# isolated session, and that session cannot resolve a `use`, so the alias
+# before the dot is not a symbol there. The `use` declaration still says which
+# module the alias names, as text. That text is looked up in the root's
+# snapshot, the one identity that may cross sessions, and the module's public
+# names are listed from there. A `use` the snapshot does not have yet, one just
+# typed, offers nothing until the rebuild lands.
+# ---
+# root: the document's loaded root, or nil
+# an:   the isolated editor analysis of the buffer
+# dot:  offset of the `.`
+fun emit_alias_members_from_root(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize) bool {
+    if (root == nil || dot == 0) { ret false; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
+    if (eid == id.EXPR_NIL) { ret false; }
+    val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, eid);
+    if (sel eo.none)                           { ret false; }
+    if (eo.some.kind != aexpr.EXPR_KIND_IDENT) { ret false; }
+    val receiver: token.Span = eo.some.span;
+
+    var i: usize = 0;
+    for (i < an.a.decl_len) {
+        val d: *decl.Decl = ?an.a.decls[i];
+        i = i + 1;
+        if (d.kind != decl.DECL_KIND_USE) { cnt; }
+        val u:     *decl.DeclUse = ?d.data.use_;
+        var alias: token.Span    = u.alias;
+        if (alias.len == 0)                                                          { alias = path_leaf(an.text, u.path); }
+        if (!features.span_bytes_equal(an.text.file, alias, an.text.file, receiver)) { cnt; }
+        val fqn: str = positions.span_text(an.text, u.path, alloc);
+        if (fqn == nil) { ret false; }
+        val mo: opt[sess.ModuleId] = project.module_by_fqn(ws, root, fqn);
+        strutil.str_free(alloc, fqn);
+        if (sel mo.none) { ret false; }
+        ret emit_module_members(ws, root, an.text.file, alloc, id_raw, prefix, mo.some, true);
+    }
+    ret false;
+}
+
+# the last segment of a `use` path, the name a `use a.b.c;` binds
+fun path_leaf(t: positions.Text, path: token.Span) token.Span {
+    var start: usize = path.offset;
+    var i:     usize = path.offset;
+    val end:   usize = path.offset + path.len;
+    for (i < end && i < t.len) {
+        if (t.file.text[i] == '.') { start = i + 1; }
+        i = i + 1;
+    }
+    ret token.Span{offset: start, len: end - start};
 }
 
 # offer fields resolved entirely inside the isolated editor session

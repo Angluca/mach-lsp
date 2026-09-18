@@ -81,6 +81,8 @@ to the name of another field of its record.
 Completion offers, by prefix, every name the document's resolve table binds,
 whether or not it is in scope at the cursor. After a `.` it offers a module
 alias's public symbols, or the fields of the record or union the receiver has.
+While the buffer is ahead of the project's last analysis, the alias's module
+is taken from that analysis by name, so the list is there while you type.
 
 The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols do not pay that cost; moving semantic work
