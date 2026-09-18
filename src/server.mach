@@ -344,6 +344,13 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
         srv.deferred = false;
         republish_all(srv);
     }
+    # with the queue drained the analysis thread is about to idle, and the only
+    # other place it pumps is before the NEXT message. pump once more here so a
+    # cold spare's warm-up, or a rebuild an edit just made due, starts now rather
+    # than waiting for a message that idle may never bring (#252)
+    if (jobs.depth(?srv.q) == 0 && srv.status == STATUS_RUNNING) {
+        collect_rebuilds(srv);
+    }
     trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
 
     if (srv.status == STATUS_EXITED || transport.write_failed()) {
@@ -355,7 +362,7 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 #
 # Runs on the analysis thread only.
 fun collect_rebuilds(srv: *Server) {
-    val moved: u8 = project.pump(?srv.ws);
+    val moved: u8 = project.pump(?srv.ws, jobs.depth(?srv.q) == 0);
     if (srv.status != STATUS_RUNNING) { ret; }
     if (moved == project.PUMP_SWAPPED) {
         republish_all(srv);
