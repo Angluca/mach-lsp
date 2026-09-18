@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-18
+
+A latency fix on a 1.0 surface. No contract change: same asset set, CLI,
+options and behaviour as 1.0.1.
+
+**The linked mach is unchanged at v5.4.0**, and std at v4.0.0.
+
+### Changed
+- perf(#252): the first edit after an idle pause is no longer a cold build. A
+  root serves from one session and rebuilds into a spare, and that spare's first
+  build is cold, so the first edit after a load rebuilt the whole project from
+  scratch even though the load had just done that work. While the analysis
+  thread is idle it now warms the cold spare with the snapshot's own input, so
+  the edit that follows rebuilds warm. Measured against the mls project itself
+  (~28 s cold), the first edit after a 45 s pause falls from ~28.5 s to ~1.6 s.
+  A pause too short to finish the warm-up shortens proportionally, and with no
+  pause the figure is unchanged (~27.7 s against ~27.6 s): the warm-up holds the
+  single build slot, so an edit that arrives before any idle waits on that
+  in-flight build exactly as it would have waited on its own cold rebuild, with
+  no duplicated work and no second live snapshot beyond the one a rebuild always
+  makes.
+
 ## [1.0.1] - 2026-09-18
 
 A crash fix on a surface 1.0 froze. No contract change: same asset set, CLI,
