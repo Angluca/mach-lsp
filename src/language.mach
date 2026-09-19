@@ -43,6 +43,7 @@ use aexpr: mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use atype: mach.lang.fe.ast.type;
 use fedoc: mach.lang.fe.doc;
+use np:    mach.lang.fe.path;
 use rslv:  mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use mach.lang.fe.sema.typename;
@@ -1961,7 +1962,8 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         an.root     = view.root;
 
         if (dot > 0 && file.text[dot - 1] == '.') {
-            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))                   { ret; }
+            if (emit_module_alias_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
@@ -1976,7 +1978,8 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         }
         if (dot > 0 && file.text[dot - 1] == '.') {
             if (an.root != nil) {
-                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))                   { ret; }
+                if (emit_module_alias_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
             }
             or {
                 if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
@@ -1995,7 +1998,8 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (dot > 0 && file.text[dot - 1] == '.') {
         if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
         val root: *project.Root = project.root_for_loaded(ws, uri);
-        if (emit_alias_members_from_root(ws, root, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+        if (emit_module_alias_members(ws, root, an, alloc, id_raw, prefix, dot - 1, true)) { ret; }
+        if (emit_imported_field_members(ws, root, an, alloc, id_raw, prefix, dot - 1))     { ret; }
         reply_empty_completion(alloc, id_raw, true);
         ret;
     }
@@ -2927,29 +2931,29 @@ fun emit_module_members(ws: *project.Workspace, root: *project.Root, file: *src.
     ret true;
 }
 
-# offer a module's public symbols after an alias the isolated editor session
-# could not resolve (#297)
+# offer a module's public symbols after an alias resolved through `root`'s
+# snapshot rather than the requesting analysis (#297, #321)
 #
-# While the buffer is ahead of the snapshot, completion answers from the
-# isolated session, and that session cannot resolve a `use`, so the alias
-# before the dot is not a symbol there. The `use` declaration still says which
-# module the alias names, as text. That text is looked up in the root's
-# snapshot, the one identity that may cross sessions, and the module's public
-# names are listed from there. A `use` the snapshot does not have yet, one just
-# typed, offers nothing until the rebuild lands.
+# The alias before the dot is matched by the bytes it is spelled with, not by an
+# Ast node, so it resolves the same whether the alias is used as a value
+# (`vector.`) or as a type qualifier (`var v: vector.`) - the AST distinguishes
+# the two, the text does not, and completion should answer in both (#321). This
+# is the one bridge that may read the snapshot for a buffer request: while the
+# buffer is ahead, the isolated session cannot resolve a `use`, but the `use`
+# still names its module as text, and that name is found in the snapshot. Caught
+# up, the same match runs against the loaded root, which is why `incomplete` is a
+# parameter: it reports which analysis answered. A `use` the snapshot has not
+# seen yet offers nothing until the rebuild lands.
 # ---
-# root: the document's loaded root, or nil
-# an:   the isolated editor analysis of the buffer
-# dot:  offset of the `.`
-fun emit_alias_members_from_root(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
-    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize) bool {
+# root:       the loaded root the alias is resolved against, or nil
+# an:         the analysis whose buffer and `use` decls are read
+# dot:        offset of the `.`
+# incomplete: whether the snapshot the names come from is behind the buffer
+fun emit_module_alias_members(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize, incomplete: bool) bool {
     if (root == nil || dot == 0) { ret false; }
-    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
-    if (eid == id.EXPR_NIL) { ret false; }
-    val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, eid);
-    if (sel eo.none)                           { ret false; }
-    if (eo.some.kind != aexpr.EXPR_KIND_IDENT) { ret false; }
-    val receiver: token.Span = eo.some.span;
+    val receiver: token.Span = ident_prefix_before(an.text.file, dot);
+    if (receiver.len == 0) { ret false; }
 
     var i: usize = 0;
     for (i < an.a.decl_len) {
@@ -2965,9 +2969,108 @@ fun emit_alias_members_from_root(ws: *project.Workspace, root: *project.Root, an
         val mo: opt[sess.ModuleId] = project.module_by_fqn(ws, root, fqn);
         strutil.str_free(alloc, fqn);
         if (sel mo.none) { ret false; }
-        ret emit_module_members(ws, root, an.text.file, alloc, id_raw, prefix, mo.some, true);
+        ret emit_module_members(ws, root, an.text.file, alloc, id_raw, prefix, mo.some, incomplete);
     }
     ret false;
+}
+
+# offer the fields of a value whose record / union type is declared in another
+# module, read from `root`'s snapshot, while the buffer is ahead of it (#321)
+#
+# The isolated session types a value by its own file alone, so a value of an
+# imported type (`var v: vector.Vector[u8]; v.`) has no resolvable type there and
+# `emit_editor_member_completions` - which only lists a same-file record's fields
+# - answers nothing. The value still resolves to its own binding, whose written
+# type annotation names the type as text; that name is resolved against the
+# snapshot the same way an alias is, and the record's fields are listed from
+# there. This is the third receiver kind after a same-file field and a module
+# alias, and like the alias bridge it only reaches the snapshot by text.
+# ---
+# root: the loaded root the type is resolved against, or nil
+# an:   the isolated editor analysis of the buffer
+# dot:  offset of the `.`
+fun emit_imported_field_members(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize) bool {
+    if (root == nil || dot == 0) { ret false; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
+    if (eid == id.EXPR_NIL)                                                         { ret false; }
+    if (an.rr == nil || an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret false; }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[eid];
+    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret false; }
+    val sym: *rslv.Symbol = ?an.rr.symbols[sid];
+    if (sym.decl == id.DECL_NIL) { ret false; }
+
+    val do_: opt[*decl.Decl] = ast.get_decl(an.a, sym.decl);
+    if (sel do_.none) { ret false; }
+    val d: *decl.Decl = do_.some;
+    if (d.kind != decl.DECL_KIND_VAR && d.kind != decl.DECL_KIND_VAL) { ret false; }
+    val ty: id.TypeId = d.data.bind.ty;
+    if (ty == id.TYPE_NIL) { ret false; }
+    val to_: opt[*atype.Type] = ast.get_type(an.a, ty);
+    if (sel to_.none) { ret false; }
+    val t: *atype.Type = to_.some;
+    if (t.kind != atype.TYPE_KIND_NAMED) { ret false; }
+
+    val rso: opt[project.RecordSite] = record_for_type_path(ws, root, an, alloc, t.data.named.name);
+    if (sel rso.none) { ret false; }
+    ret emit_record_fields(an, alloc, id_raw, prefix, rso.some, true);
+}
+
+# resolve the written type path `name` against `root`'s snapshot to the rec / uni
+# it names, through the buffer's `use` declarations (#321)
+#
+# `name` is a type annotation as written (`vector.Vector`, or a bare `res`). A
+# qualified path's head is a module alias, so the whole `use` path is the module
+# and the path's leaf is the type. A bare name is a symbol import, so the module
+# is the `use` path without its leaf and the type is that leaf. Either way the
+# module and type names are bytes handed to the snapshot, which owns the one
+# identity a buffer request may cross into.
+fun record_for_type_path(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, name: token.Span) opt[project.RecordSite] {
+    val srctext: str        = an.text.file.text;
+    val leaf:    token.Span = np.leaf(srctext, name);
+    val qual:    token.Span = np.prefix(srctext, name);
+    if (leaf.len == 0) { ret opt[project.RecordSite].none{}; }
+
+    var i: usize = 0;
+    for (i < an.a.decl_len) {
+        val d: *decl.Decl = ?an.a.decls[i];
+        i = i + 1;
+        if (d.kind != decl.DECL_KIND_USE) { cnt; }
+        val u:     *decl.DeclUse = ?d.data.use_;
+        var bound: token.Span    = u.alias;
+        if (bound.len == 0) { bound = np.leaf(srctext, u.path); }
+
+        if (qual.len > 0) {
+            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, qual)) { cnt; }
+            ret record_in_module_owned(ws, root, alloc,
+                positions.span_text(an.text, u.path, alloc),
+                positions.span_text(an.text, leaf, alloc));
+        }
+        or {
+            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, leaf)) { cnt; }
+            ret record_in_module_owned(ws, root, alloc,
+                positions.span_text(an.text, np.prefix(srctext, u.path), alloc),
+                positions.span_text(an.text, np.leaf(srctext, u.path), alloc));
+        }
+    }
+    ret opt[project.RecordSite].none{};
+}
+
+# look up a record by module FQN and type name, freeing the two owned name
+# strings afterward. the ownership seam between `record_for_type_path`, which
+# reads them from the buffer, and `project.record_in_module`, which only borrows
+fun record_in_module_owned(ws: *project.Workspace, root: *project.Root, alloc: *Allocator,
+    module_fqn: str, type_name: str) opt[project.RecordSite] {
+    if (module_fqn == nil || type_name == nil) {
+        if (module_fqn != nil) { strutil.str_free(alloc, module_fqn); }
+        if (type_name != nil)  { strutil.str_free(alloc, type_name); }
+        ret opt[project.RecordSite].none{};
+    }
+    val rso: opt[project.RecordSite] = project.record_in_module(ws, root, module_fqn, type_name);
+    strutil.str_free(alloc, module_fqn);
+    strutil.str_free(alloc, type_name);
+    ret rso;
 }
 
 # the last segment of a `use` path, the name a `use a.b.c;` binds
