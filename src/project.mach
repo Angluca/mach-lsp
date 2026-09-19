@@ -2303,6 +2303,45 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: 
     ret record_decl(w, root, tid);
 }
 
+# the public rec / uni named `type_name` in the module whose FQN is `module_fqn`,
+# read from `root`'s snapshot
+#
+# The text bridge for member completion while the buffer is ahead of the
+# snapshot: the isolated editor session cannot resolve an imported type, so the
+# type's module and name are recovered from the buffer as text - its `use` and
+# the written annotation - and looked up here, against the snapshot, the one
+# identity that may cross sessions. The declaring module's own Ast and text back
+# the returned site, exactly as `record_decl` does for a sema-resolved nominal.
+# none when the module is not loaded or has no public rec / uni of that name.
+# ---
+# w:          the workspace
+# root:       the loaded root, or nil
+# module_fqn: the declaring module's fully-qualified name
+# type_name:  the rec / uni name to find among the module's public symbols
+# ret:        some(RecordSite), or none
+pub fun record_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: str) opt[RecordSite] {
+    if (root == nil || module_fqn == nil || type_name == nil) { ret opt[RecordSite].none{}; }
+    val mo: opt[sess.ModuleId] = module_by_fqn(w, root, module_fqn);
+    if (sel mo.none) { ret opt[RecordSite].none{}; }
+    val mvo: opt[ModuleView] = module_view(w, root, mo.some);
+    if (sel mvo.none) { ret opt[RecordSite].none{}; }
+    val mv: ModuleView = mvo.some;
+    if (mv.rr == nil) { ret opt[RecordSite].none{}; }
+    var i: u32 = 0;
+    for (i < mv.rr.pub_count) {
+        val sym: *rslv.Symbol = ?mv.rr.symbols[i];
+        val no:  opt[str]     = intern.lookup(?root.s.interner, sym.name);
+        if (sel no.some) {
+            if (str_equals(no.some, type_name)) {
+                val site: opt[RecordSite] = record_site_from(mo.some, sym.decl, mv.file_id, sym.name, mv.a, mv.text);
+                if (sel site.some) { ret site; }
+            }
+        }
+        i = i + 1;
+    }
+    ret opt[RecordSite].none{};
+}
+
 # a RecordSite for the rec / uni declaration `decl` in the active
 # buffer (`own` / `own_a` / `own_text`), or none when `decl` is not a rec / uni.
 # the buffer-side entry point for a cursor sitting on a field's own declaration
