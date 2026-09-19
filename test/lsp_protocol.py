@@ -3741,6 +3741,115 @@ need = []
                 session.abort()
 
 
+def run_completion_type_position_and_imported_members(server: Path, timeout: float) -> None:
+    """Completion resolves a receiver by what it is, not where it sits (#321).
+
+    Two shapes were empty. A module alias used as a type qualifier
+    (`var v: mod.`) offered nothing, because the receiver was found through an
+    expression node and a type position has none. And a value whose record /
+    union type is imported (`var v: mod.Rec; v.`) offered nothing while the
+    buffer was ahead of the snapshot, because the isolated session cannot type
+    an imported value and the only snapshot bridge knew module aliases, not the
+    fields of an imported type. Both are answered here, in expression and type
+    position and for the symbol-import and alias-qualified spellings of a type.
+
+    An `isIncomplete` answer is the isolated path's signature; asserting it keeps
+    a fast machine that served a case from a caught-up snapshot from passing by
+    accident. The type-position alias is also checked once caught up, since its
+    cause - the expression-only receiver pivot - was not behind-only.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-compl-recv-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "recv", 5)
+        # a public union in the snapshot, so an imported `uni` value can be probed
+        defs.write_text(defs.read_text(encoding="utf-8")
+                        + "\npub uni Tag { A: i32; B: i32; }\n", encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+
+            base = text.splitlines()
+            version = [1]
+
+            def typed_text(extra: list[str]) -> tuple[str, list[str]]:
+                edited = base + [""] + extra
+                return "\n".join(edited) + "\n", edited
+
+            def behind(extra: list[str], needle: str) -> list[str]:
+                body, edited = typed_text(extra)
+                line = next(i for i, v in enumerate(edited) if v == needle)
+                notifications = []
+                for _ in range(32):
+                    version[0] += 1
+                    notifications.append((
+                        "textDocument/didChange",
+                        {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                         "contentChanges": [{"text": body}]}))
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": len(needle)}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                        f"completion for {needle!r} was not answered while behind, so this proves nothing: {answer!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            def caught_up(extra: list[str], needle: str) -> list[str]:
+                body, edited = typed_text(extra)
+                line = next(i for i, v in enumerate(edited) if v == needle)
+                version[0] += 1
+                session.notify("textDocument/didChange", {"textDocument": {
+                    "uri": main.as_uri(), "version": version[0]}, "contentChanges": [{"text": body}]})
+                session.diagnostics(main.as_uri(), version[0])
+                result = settled_result(
+                    session, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": len(needle)}},
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                    f"project-backed completion for {needle!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            # #321.1 a module alias used as a type qualifier offers the module's symbols
+            tp_lines = ["fun probe() i32 {", "    var a: rootmod.", "    ret 0;", "}"]
+            tp = behind(tp_lines, "    var a: rootmod.")
+            require("Box" in tp and "answer" in tp and "take" in tp,
+                    f"a module alias in type position offered nothing while behind: {tp!r}")
+            require("main" not in tp, f"a type-position alias listed names that are not the module's: {tp!r}")
+            # the same, caught up: the cause was not behind-only
+            tp_ready = caught_up(tp_lines, "    var a: rootmod.")
+            require("Box" in tp_ready and "answer" in tp_ready,
+                    f"a module alias in type position offered nothing caught up: {tp_ready!r}")
+
+            # #321.2 a value of an imported record type offers its fields while behind,
+            # for both a symbol import (`Box`) and an alias-qualified annotation (`rootmod.Box`)
+            require(behind(["fun probe() i32 {", "    var c: Box[i32];", "    c.", "    ret 0;", "}"],
+                           "    c.") == ["v"],
+                    "an imported record value (symbol import) did not offer its field while behind")
+            require(behind(["fun probe() i32 {", "    var b: rootmod.Box[i32];", "    b.", "    ret 0;", "}"],
+                           "    b.") == ["v"],
+                    "an imported record value (alias-qualified) did not offer its field while behind")
+
+            # a value of an imported union offers its cases, and only those
+            uni_members = behind(
+                ["use recv.defs.Tag;", "fun probe() i32 {", "    var e: Tag;", "    e.", "    ret 0;", "}"],
+                "    e.")
+            require("A" in uni_members and "B" in uni_members,
+                    f"an imported union value did not offer its cases while behind: {uni_members!r}")
+            require("main" not in uni_members,
+                    f"an imported union value fell back to the file list: {uni_members!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_highlight(server: Path, timeout: float) -> None:
     """Occurrences in the active file, classified read or write."""
     with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
@@ -5526,6 +5635,7 @@ def main() -> int:
         run_completion_freshness(server, args.timeout)
         run_completion_alias_while_behind(server, args.timeout)
         run_completion_dependency_alias_while_behind(server, args.timeout)
+        run_completion_type_position_and_imported_members(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
