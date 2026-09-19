@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-19
+
+A completion fix on a 1.1 surface. No contract change: same asset set, CLI,
+options and behaviour as 1.1.0.
+
+**The linked mach is unchanged at v5.5.1**, and std at v4.0.0.
+
+### Fixed
+- fix(#321): completion after a `.` no longer comes back empty in two cases. A
+  module alias used as a type qualifier (`var v: vector.`) now offers the
+  module's symbols: the receiver before the dot is identified by its own text
+  rather than through an expression node, so a type position resolves like an
+  expression one. And a value whose record or union type is imported
+  (`var v: vector.Vector[u8]; v.`) now offers that type's fields while the buffer
+  is ahead of the snapshot: the value's written type annotation is read from the
+  buffer and its record resolved against the snapshot through the file's `use`
+  declarations, the third receiver kind after a same-file field and a module
+  alias. Reported by @Angluca.
+
 ## [1.1.0] - 2026-09-18
 
 The #297 crash fix becomes structural. No LSP contract change: same asset set,
